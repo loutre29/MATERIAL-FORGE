@@ -1,0 +1,24 @@
+Material Forge 0.1.0 (test build)
+=================================
+
+A PBR 3D texture painter in the spirit of Substance 3D Painter.
+
+Getting started
+- Start Material Forge, then File > New project (or drop an .fbx / .obj /
+  .gltf / .glb on the window). Each material of the mesh becomes a texture set.
+- Bake mesh maps (left tool strip) for the generators and smart materials.
+- Drag materials and smart materials from Assets onto the layer stack or
+  the mesh. Paint with 1 (brush), 2 (eraser), 4 (polygon fill), 6 (clone,
+  V sets the source).
+- Camera: Alt + left drag orbits, Alt + middle drag pans, Alt + right drag
+  or the wheel zooms. F frames the mesh.
+- File > Export textures writes the maps (presets for common engines).
+
+Requirements
+- Windows 10 / 11, 64-bit, with a DirectX 12 or Vulkan capable GPU.
+
+Where things are kept
+- Your library, layout and autosaves: %APPDATA%\SP_RETRO
+
+Please report: what you did, what you expected, what happened (a screenshot
+helps). Help > Controls and shortcuts lists every key.
