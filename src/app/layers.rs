@@ -22,21 +22,29 @@ fn uv01() -> Rect {
 }
 
 fn draw_thumb(p: &egui::Painter, r: Rect, tex: Option<egui::TextureId>, swatch: Option<[f32; 3]>, icon: Option<Icon>, outline: bool) {
-    p.rect_filled(r, 2.0, Color32::from_gray(26));
+    p.rect_filled(r, 2.0, crate::style::warm(26));
     match (tex, swatch) {
-        (Some(t), _) => {
+        (Some(t), c) => {
             p.image(t, r, uv01(), Color32::WHITE);
+            if let Some(c) = c {
+                // The exact uniform color in a corner (the eyedropper reads it).
+                let col: Color32 = egui::Rgba::from_rgb(c[0].clamp(0.0, 1.0), c[1].clamp(0.0, 1.0), c[2].clamp(0.0, 1.0)).into();
+                let sw = Rect::from_min_size(Pos2::new(r.min.x + 2.0, r.max.y - 12.0), egui::vec2(10.0, 10.0));
+                p.rect_filled(sw.expand(1.0), 2.0, Color32::from_black_alpha(200));
+                p.rect_filled(sw, 1.5, col);
+            }
         }
         (None, Some(c)) => {
-            let g = |v: f32| (v.clamp(0.0, 1.0).powf(1.0 / 2.2) * 255.0) as u8;
-            p.rect_filled(r.shrink(1.0), 2.0, Color32::from_rgb(g(c[0]), g(c[1]), g(c[2])));
+            // Exact sRGB: the eyedropper reads back the layer's color.
+            let col: Color32 = egui::Rgba::from_rgb(c[0].clamp(0.0, 1.0), c[1].clamp(0.0, 1.0), c[2].clamp(0.0, 1.0)).into();
+            p.rect_filled(r.shrink(1.0), 2.0, col);
         }
         _ => {}
     }
     if let Some(i) = icon {
         icons::paint(p, r.shrink(8.0), i, Color32::from_gray(190));
     }
-    let stroke = if outline { egui::Stroke::new(1.5f32, crate::style::ACCENT) } else { egui::Stroke::new(1.0f32, Color32::from_gray(70)) };
+    let stroke = if outline { egui::Stroke::new(1.5f32, crate::style::ACCENT) } else { egui::Stroke::new(1.0f32, crate::style::warm(70)) };
     p.rect_stroke(r.expand(if outline { 1.0 } else { 0.0 }), 3.0, stroke);
 }
 
@@ -83,14 +91,17 @@ impl RetroApp {
         let mut modified = false;
         egui::ScrollArea::vertical().id_salt("sets").auto_shrink([false, false]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
+            let names: Vec<String> = doc.sets.iter().map(|s| s.name.clone()).collect();
             for (i, s) in doc.sets.iter_mut().enumerate() {
+                let others: Vec<&String> = names.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, n)| n).collect();
                 let (r, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 24.0), Sense::click());
                 let sel = doc.active == i;
                 let p = ui.painter();
-                p.rect_filled(r, 0.0, if sel { crate::style::ROW_SELECTED } else if resp.hovered() { Color32::from_gray(56) } else { crate::style::PANEL });
-                p.line_segment([r.left_bottom(), r.right_bottom()], egui::Stroke::new(1.0f32, crate::style::SEPARATOR));
+                let card = r.shrink2(egui::vec2(6.0, 1.0));
                 if sel {
-                    p.rect_stroke(r.shrink(0.5), 0.0, egui::Stroke::new(1.0f32, crate::style::ACCENT));
+                    p.rect(card, crate::style::R_CONTROL, crate::style::ROW_SELECTED, egui::Stroke::new(1.0f32, crate::style::ACCENT.gamma_multiply(0.7)));
+                } else if resp.hovered() {
+                    p.rect_filled(card, crate::style::R_CONTROL, crate::style::FIELD);
                 }
                 let eye = Rect::from_center_size(Pos2::new(r.min.x + 14.0, r.center().y), egui::vec2(16.0, 16.0));
                 let eresp = ui.interact(eye, ui.id().with(("seteye", i)), Sense::click()).on_hover_text("Show in the viewport");
@@ -114,13 +125,10 @@ impl RetroApp {
                     if sel { Color32::WHITE } else { Color32::from_gray(205) },
                 );
                 let res = s.resolution();
-                // Columns collapse on narrow docks: shader, then resolution.
-                let res_x = if w > 300.0 { r.min.x + w * 0.46 } else { r.max.x - 8.0 };
-                if w > 300.0 {
-                    p.text(Pos2::new(r.max.x - 8.0, r.center().y), egui::Align2::RIGHT_CENTER, "Main shader", egui::FontId::proportional(11.5), Color32::from_gray(200));
-                }
+                // The resolution column hides on narrow docks.
+                let res_x = r.max.x - 8.0;
                 if w > 190.0 {
-                    let align = if w > 300.0 { egui::Align2::LEFT_CENTER } else { egui::Align2::RIGHT_CENTER };
+                    let align = egui::Align2::RIGHT_CENTER;
                     let tr = p.text(Pos2::new(res_x, r.center().y), align, format!("{res}"), egui::FontId::proportional(11.5), Color32::from_gray(200));
                     if !s.baked {
                         // Small amber dot: mesh maps not baked yet.
@@ -139,8 +147,15 @@ impl RetroApp {
                     }
                     ui.separator();
                     ui.label(RichText::new("Name").size(11.0).color(Color32::from_gray(140)));
-                    if ui.text_edit_singleline(&mut s.name).changed() {
-                        modified = true;
+                    // Empty or duplicate names would break reimport matching
+                    // and export file names: they are kept only when valid.
+                    let mut name = s.name.clone();
+                    if ui.text_edit_singleline(&mut name).changed() {
+                        let n = name.trim();
+                        if !n.is_empty() && !others.iter().any(|o| o.as_str() == n) {
+                            s.name = n.to_string();
+                            modified = true;
+                        }
                     }
                 });
             }
@@ -152,6 +167,39 @@ impl RetroApp {
 
     fn layer_stack(&mut self, ui: &mut Ui, cmds: &mut Vec<Cmd>) {
         self.layers_rect = ui.max_rect();
+        // The texture set being edited (when the list panel is not shown):
+        // a menu, its visibility, its settings.
+        if !self.tab_open(super::dock::Tab::TextureSets) {
+            ui.add_space(6.0);
+            let mut open_settings = false;
+            let settings_on = self.tab_open(super::dock::Tab::SetSettings);
+            if let Some(doc) = &mut self.doc {
+                let names: Vec<String> = doc.sets.iter().map(|s| format!("{}  ({} px)", s.name, s.resolution())).collect();
+                ui.horizontal(|ui| {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("Texture set").size(11.5).color(Color32::from_gray(150)));
+                    let w = (ui.available_width() - 70.0).max(80.0);
+                    egui::ComboBox::from_id_salt("set menu").width(w).selected_text(names[doc.active].clone()).show_ui(ui, |ui| {
+                        for (i, n) in names.iter().enumerate() {
+                            ui.selectable_value(&mut doc.active, i, n);
+                        }
+                    });
+                    let s = &mut doc.sets[doc.active];
+                    let vis = s.settings.visible;
+                    if icons::button(ui, if vis { Icon::Eye } else { Icon::EyeOff }, false, 24.0, "Show / hide this texture set").clicked() {
+                        s.settings.visible = !vis;
+                        doc.modified = true;
+                    }
+                    let g = icons::button(ui, Icon::Gear, settings_on, 24.0, "Texture set settings (resolution, channels, bake)");
+                    super::mark(ui.ctx(), "setsettings:gear", g.rect);
+                    open_settings = g.clicked();
+                });
+            }
+            if open_settings {
+                self.toggle_tab(super::dock::Tab::SetSettings);
+            }
+            ui.add_space(2.0);
+        }
         // Toolbar: channel shown in the rows, then the add / delete icons.
         ui.add_space(4.0);
         // On narrow docks the channel menu gets its own line.
@@ -216,9 +264,23 @@ impl RetroApp {
                 if m.clicked() {
                     ui.memory_mut(|mem| mem.toggle_popup(mid));
                 }
+                // The selected layer's mask state (Toggle / Invert items).
+                let masked = self.doc.as_ref().and_then(|d| {
+                    let l = d.sets[d.active].selected_layer()?;
+                    Some((l.desc.id, l.desc.mask.as_ref().map(|m| m.enabled)))
+                });
                 super::widgets::popup_below(ui, mid, &m, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
                     ui.set_min_width(180.0);
                     mask_menu(ui, cmds);
+                    ui.separator();
+                    let (lid, state) = masked.map_or((0, None), |(i, s)| (i, s));
+                    let mut on = state.unwrap_or(false);
+                    if ui.add_enabled(state.is_some(), egui::Checkbox::new(&mut on, "Toggle mask")).clicked() {
+                        cmds.push(Cmd::ToggleMask(lid));
+                    }
+                    if ui.add_enabled(state.is_some(), egui::Button::new("Invert mask background")).clicked() {
+                        cmds.push(Cmd::InvertMaskBase(lid));
+                    }
                     if !cmds.is_empty() {
                         ui.memory_mut(|mem| mem.close_popup());
                     }
@@ -295,6 +357,7 @@ impl RetroApp {
     fn set_settings_tab(&mut self, ui: &mut Ui) {
         let mut res_change = None;
         let mut bake = false;
+        let baking = self.bake_job.is_some();
         let doc = self.doc.as_mut().unwrap();
         let s = &mut doc.sets[doc.active];
         egui::ScrollArea::vertical().id_salt("setsettings").auto_shrink([false, false]).show(ui, |ui| {
@@ -308,13 +371,17 @@ impl RetroApp {
                 egui::Grid::new("set grid").num_columns(2).spacing([10.0, 5.0]).show(ui, |ui| {
                     let cur = s.resolution();
                     ui.label("Size");
-                    egui::ComboBox::from_id_salt("set res").selected_text(format!("{cur}")).show_ui(ui, |ui| {
-                        for r in [256u32, 512, 1024, 2048, 4096] {
-                            if ui.selectable_label(r == cur, format!("{r}")).clicked() && r != cur {
-                                res_change = Some(r);
+                    ui.add_enabled_ui(!baking, |ui| {
+                        egui::ComboBox::from_id_salt("set res").selected_text(format!("{cur}")).show_ui(ui, |ui| {
+                            for r in [256u32, 512, 1024, 2048, 4096] {
+                                if ui.selectable_label(r == cur, format!("{r}")).clicked() && r != cur {
+                                    res_change = Some(r);
+                                }
                             }
-                        }
-                    });
+                        });
+                    })
+                    .response
+                    .on_disabled_hover_text("Wait for the bake to finish");
                     ui.end_row();
                     let st = &mut s.settings;
                     ui.label("Shader alpha");
@@ -335,26 +402,26 @@ impl RetroApp {
                     ui.end_row();
                     if st.alpha_mode == AlphaMode::AlphaTest {
                         ui.label("Alpha cutoff");
-                        ui.add(egui::Slider::new(&mut st.alpha_cutoff, 0.0..=1.0));
+                        super::widgets::slide(ui, &mut st.alpha_cutoff, 0.0..=1.0, false, "");
                         ui.end_row();
                     }
                     ui.label("Emissive intensity");
-                    ui.add(egui::Slider::new(&mut st.emissive_intensity, 0.0..=20.0).logarithmic(true));
+                    super::widgets::slide(ui, &mut st.emissive_intensity, 0.0..=20.0, true, "");
                     ui.end_row();
                     ui.label("Height to normal");
-                    ui.add(egui::Slider::new(&mut st.height_scale, 0.0..=0.2));
+                    super::widgets::slide(ui, &mut st.height_scale, 0.0..=0.2, false, "");
                     ui.end_row();
                     ui.label("Baked AO strength");
-                    ui.add(egui::Slider::new(&mut st.ao_strength, 0.0..=1.0));
+                    super::widgets::slide(ui, &mut st.ao_strength, 0.0..=1.0, false, "");
                     ui.end_row();
                     ui.label("Base color");
                     color_edit(ui, &mut st.base_color);
                     ui.end_row();
                     ui.label("Base roughness");
-                    ui.add(egui::Slider::new(&mut st.base_values[0], 0.0..=1.0));
+                    super::widgets::slide(ui, &mut st.base_values[0], 0.0..=1.0, false, "");
                     ui.end_row();
                     ui.label("Base metallic");
-                    ui.add(egui::Slider::new(&mut st.base_values[1], 0.0..=1.0));
+                    super::widgets::slide(ui, &mut st.base_values[1], 0.0..=1.0, false, "");
                     ui.end_row();
                 });
                 ui.weak("Changing the size resamples every layer (history is cleared).");
@@ -461,8 +528,13 @@ fn layer_row(ui: &mut Ui, s: &TextureSet, l: &Layer, depth: usize, ch: usize, cm
     let p = ui.painter().clone();
     let content_sel = selected && s.target == Target::Content;
     let mask_sel = selected && s.target.is_mask();
-    p.rect_filled(r, 0.0, if in_selection { crate::style::ROW_SELECTED } else if row.hovered() { Color32::from_gray(56) } else { crate::style::PANEL });
-    p.line_segment([r.left_bottom(), r.right_bottom()], egui::Stroke::new(1.0f32, crate::style::SEPARATOR));
+    // Rounded rows (design system): the selection is a soft orange card.
+    let card = r.shrink2(egui::vec2(6.0, 1.5));
+    if in_selection {
+        p.rect_filled(card, crate::style::R_CONTROL, crate::style::ROW_SELECTED);
+    } else if row.hovered() {
+        p.rect_filled(card, crate::style::R_CONTROL, crate::style::FIELD);
+    }
     if l.desc.tag > 0 {
         let c = TAG_COLORS[(l.desc.tag as usize).min(TAG_COLORS.len() - 1)];
         p.rect_filled(Rect::from_min_size(r.min + egui::vec2(0.0, 2.0), egui::vec2(3.0, r.height() - 4.0)), 0.0, c);
@@ -472,7 +544,7 @@ fn layer_row(ui: &mut Ui, s: &TextureSet, l: &Layer, depth: usize, ch: usize, cm
 
     // Visibility.
     let eye = Rect::from_center_size(Pos2::new(x + 9.0, cy), egui::vec2(18.0, 18.0));
-    let eresp = ui.interact(eye, ui.id().with(("eye", id)), Sense::click()).on_hover_text("Visibility");
+    let eresp = ui.interact(eye, ui.id().with(("eye", id)), Sense::click()).on_hover_text("Visibility (Alt + click: this layer alone)");
     icons::paint(
         &p,
         eye,
@@ -480,7 +552,7 @@ fn layer_row(ui: &mut Ui, s: &TextureSet, l: &Layer, depth: usize, ch: usize, cm
         if eresp.hovered() { Color32::WHITE } else if l.desc.visible { Color32::from_gray(200) } else { Color32::from_gray(110) },
     );
     if eresp.clicked() {
-        cmds.push(Cmd::ToggleVisible(id));
+        cmds.push(if ui.input(|i| i.modifiers.alt) { Cmd::Solo(id) } else { Cmd::ToggleVisible(id) });
     }
     x += 24.0;
 
@@ -502,15 +574,31 @@ fn layer_row(ui: &mut Ui, s: &TextureSet, l: &Layer, depth: usize, ch: usize, cm
     let tr = Rect::from_min_size(Pos2::new(x, cy - THUMB / 2.0 - 3.0), egui::vec2(THUMB, THUMB));
     let (tex, swatch, icon) = match &l.desc.kind {
         LayerKind::Paint => (thumbs.get(&(id, false)).copied(), None, None),
-        LayerKind::Fill(f) => (
-            thumbs.get(&(id, false)).copied(),
-            Some(if f.channels[CH_COLOR].enabled { f.channels[CH_COLOR].value } else { [0.3; 3] }),
-            None,
-        ),
+        // A fill shows its material on a ball lit like the scene, so metal
+        // reads as metal; a uniform base color also shows exact in a corner
+        // (it can be eyedropped). A fill of nothing but a uniform color (and
+        // opacity) is a flat swatch.
+        LayerKind::Fill(f) => {
+            let ch = &f.channels[CH_COLOR];
+            let uniform = ch.enabled && ch.source == crate::document::SourceKind::Uniform;
+            let only_color = f.channels.iter().enumerate().all(|(c, x)| !x.enabled || c == CH_COLOR || c == crate::document::CH_OPACITY) && f.ext.iter().all(|x| !x.enabled);
+            let flat = only_color && (uniform || !ch.enabled);
+            (
+                if flat { None } else { thumbs.get(&(id, false)).copied() },
+                if flat { Some(if ch.enabled { ch.value } else { [0.3; 3] }) } else if uniform { Some(ch.value) } else { None },
+                None,
+            )
+        }
         LayerKind::Filter(_) => (None, None, Some(Icon::Effect)),
         LayerKind::Folder => (None, None, Some(Icon::Folder)),
     };
     draw_thumb(&p, tr, tex, swatch, icon, content_sel);
+    if l.desc.paths.is_some() {
+        // Path layer: painted from its paths.
+        let br = Rect::from_min_size(tr.max - egui::vec2(13.0, 13.0), egui::vec2(13.0, 13.0));
+        p.rect_filled(br, 2.0, Color32::from_black_alpha(190));
+        icons::paint(&p, br.shrink(1.5), Icon::Path, crate::style::ACCENT);
+    }
     effects_bar(&p, tr, false);
     x += THUMB + 8.0;
 
@@ -585,7 +673,7 @@ fn layer_row(ui: &mut Ui, s: &TextureSet, l: &Layer, depth: usize, ch: usize, cm
         mask_menu_for(&mresp, id, l, cmds);
     } else if matches!(l.desc.kind, LayerKind::Paint | LayerKind::Fill(_) | LayerKind::Folder | LayerKind::Filter(_)) {
         let mresp = ui.interact(mr, ui.id().with(("maskslot", id)), Sense::click()).on_hover_text("Add a mask");
-        let c = if mresp.hovered() { Color32::from_gray(200) } else { Color32::from_gray(95) };
+        let c = if mresp.hovered() { Color32::from_gray(200) } else { crate::style::warm(95) };
         dashed_rect(&p, mr, c);
         let mid = ui.id().with(("mask slot popup", id));
         if mresp.clicked() {
@@ -659,7 +747,7 @@ fn layer_row(ui: &mut Ui, s: &TextureSet, l: &Layer, depth: usize, ch: usize, cm
     }
 
     if in_selection {
-        p.rect_stroke(r.shrink(0.5), 0.0, egui::Stroke::new(1.0f32, crate::style::ACCENT));
+        p.rect_stroke(card, crate::style::R_CONTROL, egui::Stroke::new(1.0f32, crate::style::ACCENT.gamma_multiply(0.7)));
     }
     let clicked_sub = eresp.clicked() || mask_clicked || arrow_clicked || bresp.clicked() || oresp.clicked();
     if row.clicked() && !clicked_sub {
@@ -678,7 +766,15 @@ fn layer_row(ui: &mut Ui, s: &TextureSet, l: &Layer, depth: usize, ch: usize, cm
     // onto another one; drop assets on a row to insert / apply them there.
     if row.drag_started() {
         let ids = if in_selection { s.selection() } else { vec![id] };
+        // The ghost row that follows the pointer (`layer_drag_ghost`).
+        let grab = ui.input(|i| i.pointer.press_origin()).map_or(egui::Vec2::ZERO, |q| q - r.min);
+        let ghost = LayerGhost { name: l.desc.name.clone(), thumb: thumbs.get(&(id, false)).copied(), count: ids.len(), size: r.size(), grab };
+        ui.data_mut(|d| d.insert_temp(egui::Id::new("layer ghost"), ghost));
         row.dnd_set_drag_payload(super::panels::LayerDrag(ids));
+    }
+    // Rows being dragged are dimmed in place.
+    if egui::DragAndDrop::payload::<super::panels::LayerDrag>(ui.ctx()).is_some_and(|d| d.0.contains(&id)) {
+        p.rect_filled(r, 0.0, Color32::from_black_alpha(110));
     }
     // Upper half: above, lower half: below; the middle of a folder row: into it.
     let place = {
@@ -742,9 +838,17 @@ fn layer_row(ui: &mut Ui, s: &TextureSet, l: &Layer, depth: usize, ch: usize, cm
         let o = &mut ctx_cmds;
         item(ui, o, "Add white mask", "", !has_mask, vec![Cmd::AddMask(true)]);
         item(ui, o, "Add black mask", "", !has_mask, vec![Cmd::AddMask(false)]);
-        item(ui, o, "Add bitmap mask", "", !has_mask, vec![Cmd::AddMask(false)]);
+        // Bitmap mask: a black mask with a fill effect waiting for a bitmap.
+        let bitmap = MaskEffectKind::Fill {
+            value: 1.0,
+            source: SourceKind::Texture,
+            texture: None,
+            procedural: ProcParams::default(),
+            projection: Projection::default(),
+            range: [0.0, 1.0],
+        };
+        item(ui, o, "Add bitmap mask", "", !has_mask, vec![Cmd::AddMask(false), Cmd::AddEffect(bitmap)]);
         item(ui, o, "Add mask with color selection", "", !has_mask, vec![Cmd::AddMask(false), Cmd::AddEffect(MaskEffectKind::ColorSelect { colors: Vec::new(), tolerance: 0.05 })]);
-        item(ui, o, "Add mask with height combination", "", !has_mask, vec![Cmd::AddMask(true)]);
         ui.separator();
         item(ui, o, "Toggle mask", "Shift + click", has_mask, vec![Cmd::ToggleMask(id)]);
         item(ui, o, "Invert mask background", "", has_mask, vec![Cmd::InvertMaskBase(id)]);
@@ -758,7 +862,7 @@ fn layer_row(ui: &mut Ui, s: &TextureSet, l: &Layer, depth: usize, ch: usize, cm
         ui.separator();
         item(ui, o, "Copy layer", "Ctrl+C", true, vec![Cmd::CopyLayer(id)]);
         item(ui, o, "Paste layer", "Ctrl+V", true, vec![Cmd::PasteLayer]);
-        item(ui, o, "Duplicate layer", "Ctrl+D", true, vec![Cmd::Duplicate]);
+        item(ui, o, "Duplicate layer", "Ctrl+J", true, vec![Cmd::Duplicate]);
         item(ui, o, "Delete layer", "Del", true, vec![Cmd::Delete]);
         item(ui, o, "Group layers", "Ctrl+G", true, vec![Cmd::Group]);
         item(ui, o, "Move into folder below", "", true, vec![Cmd::IntoFolder]);
@@ -815,27 +919,12 @@ fn layer_row(ui: &mut Ui, s: &TextureSet, l: &Layer, depth: usize, ch: usize, cm
     // one of its effects) is selected.
     if selected && !s.target.is_mask() && !l.desc.effects.is_empty() {
         for e in l.desc.effects.iter().rev() {
-            let (er, eresp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 26.0), Sense::click());
             let sel = s.target == Target::ContentEffect(e.id);
-            ui.painter().rect_filled(er, 0.0, if sel { crate::style::ROW_SELECTED } else if eresp.hovered() { Color32::from_gray(56) } else { Color32::from_gray(46) });
-            if sel {
-                ui.painter().rect_stroke(er.shrink(0.5), 0.0, egui::Stroke::new(1.0f32, crate::style::ACCENT));
-            }
-            let ex = er.min.x + 30.0 + depth as f32 * 16.0;
-            // Orange bar on the left: these effects belong to the content.
-            ui.painter().rect_filled(Rect::from_min_size(Pos2::new(ex - 8.0, er.min.y + 3.0), egui::vec2(2.0, er.height() - 6.0)), 0.0, Color32::from_rgb(255, 137, 34));
-            let eye = Rect::from_center_size(Pos2::new(ex + 8.0, er.center().y), egui::vec2(16.0, 16.0));
-            let vresp = ui.interact(eye, ui.id().with(("cfxeye", e.id)), Sense::click());
-            icons::paint(ui.painter(), eye, if e.enabled { Icon::Eye } else { Icon::EyeOff }, Color32::from_gray(if e.enabled { 190 } else { 110 }));
+            let fx = EffectRow { key: ("cfx", e.id), depth, mask: false, sel, enabled: e.enabled, icon: Icon::Effect, name: e.filter.kind.name().to_string(), blend: None, opacity: e.opacity };
+            let (eresp, vresp, xresp) = effect_row(ui, &fx);
             if vresp.clicked() {
                 cmds.push(Cmd::ToggleContentEffect(id, e.id));
             }
-            icons::paint(ui.painter(), Rect::from_center_size(Pos2::new(ex + 30.0, er.center().y), egui::vec2(14.0, 14.0)), Icon::Effect, Color32::from_gray(170));
-            ui.painter().text(Pos2::new(ex + 44.0, er.center().y), egui::Align2::LEFT_CENTER, format!("Filter - {}", e.filter.kind.name()), egui::FontId::proportional(12.0), Color32::from_gray(215));
-            ui.painter().text(Pos2::new(er.max.x - 10.0, er.center().y), egui::Align2::RIGHT_CENTER, format!("{:.0}", e.opacity * 100.0), egui::FontId::proportional(11.0), Color32::from_gray(150));
-            let xr = Rect::from_center_size(Pos2::new(er.max.x - 50.0, er.center().y), egui::vec2(14.0, 14.0));
-            let xresp = ui.interact(xr, ui.id().with(("cfxdel", e.id)), Sense::click()).on_hover_text("Remove effect (Del)");
-            icons::paint(ui.painter(), xr.shrink(2.0), Icon::Close, if xresp.hovered() { Color32::WHITE } else { Color32::from_gray(120) });
             if xresp.clicked() {
                 cmds.push(Cmd::Select(id, Target::ContentEffect(e.id)));
                 cmds.push(Cmd::RemoveContentEffect(e.id));
@@ -874,45 +963,15 @@ fn layer_row(ui: &mut Ui, s: &TextureSet, l: &Layer, depth: usize, ch: usize, cm
     // its effects) is selected, like the real application.
     if selected && s.target.is_mask() {
         if let Some(m) = &l.desc.mask {
-            let (hr, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 18.0), Sense::hover());
-            let hx = hr.min.x + 30.0 + depth as f32 * 16.0;
-            ui.painter().rect_filled(hr, 0.0, Color32::from_gray(40));
-            icons::paint(ui.painter(), Rect::from_center_size(Pos2::new(hx + 8.0, hr.center().y), egui::vec2(12.0, 12.0)), Icon::Mask, crate::style::ACCENT);
-            ui.painter().text(
-                Pos2::new(hx + 20.0, hr.center().y),
-                egui::Align2::LEFT_CENTER,
-                format!("MASK EFFECTS ({})", m.effects.len()),
-                crate::style::bold(10.5),
-                Color32::from_gray(180),
-            );
             for e in m.effects.iter().rev() {
-                let (er, eresp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 26.0), Sense::click());
                 let sel = s.target == Target::MaskEffect(e.id);
-                ui.painter().rect_filled(er, 0.0, if sel { crate::style::ROW_SELECTED } else if eresp.hovered() { Color32::from_gray(56) } else { Color32::from_gray(46) });
-                if sel {
-                    ui.painter().rect_stroke(er.shrink(0.5), 0.0, egui::Stroke::new(1.0f32, crate::style::ACCENT));
-                }
-                let ex = er.min.x + 30.0 + depth as f32 * 16.0;
-                let eye = Rect::from_center_size(Pos2::new(ex + 8.0, er.center().y), egui::vec2(16.0, 16.0));
-                let vresp = ui.interact(eye, ui.id().with(("effeye", e.id)), Sense::click());
-                icons::paint(ui.painter(), eye, if e.enabled { Icon::Eye } else { Icon::EyeOff }, Color32::from_gray(if e.enabled { 190 } else { 110 }));
+                let (icon, name) = effect_look(&e.kind);
+                let blends = !matches!(e.kind, MaskEffectKind::Levels { .. } | MaskEffectKind::Invert | MaskEffectKind::Threshold { .. } | MaskEffectKind::Blur { .. });
+                let fx = EffectRow { key: ("mfx", e.id), depth, mask: true, sel, enabled: e.enabled, icon, name, blend: blends.then(|| short_mask_blend(e.blend)), opacity: e.opacity };
+                let (eresp, vresp, xresp) = effect_row(ui, &fx);
                 if vresp.clicked() {
                     cmds.push(Cmd::ToggleEffect(id, e.id));
                 }
-                icons::paint(ui.painter(), Rect::from_center_size(Pos2::new(ex + 30.0, er.center().y), egui::vec2(14.0, 14.0)), Icon::Mask, Color32::from_gray(150));
-                ui.painter().text(Pos2::new(ex + 44.0, er.center().y), egui::Align2::LEFT_CENTER, e.kind.label(), egui::FontId::proportional(12.0), Color32::from_gray(215));
-                ui.painter().text(
-                    Pos2::new(er.max.x - 10.0, er.center().y),
-                    egui::Align2::RIGHT_CENTER,
-                    format!("{}   {:.0}", e.blend.name(), e.opacity * 100.0),
-                    egui::FontId::proportional(11.0),
-                    Color32::from_gray(150),
-                );
-                // Mask-colored bar on the left: these effects belong to the mask.
-                ui.painter().rect_filled(Rect::from_min_size(Pos2::new(ex - 8.0, er.min.y + 3.0), egui::vec2(2.0, er.height() - 6.0)), 0.0, crate::style::ACCENT.linear_multiply(0.7));
-                let xr = Rect::from_center_size(Pos2::new(er.max.x - 104.0, er.center().y), egui::vec2(14.0, 14.0));
-                let xresp = ui.interact(xr, ui.id().with(("effdel", e.id)), Sense::click()).on_hover_text("Remove effect (Del)");
-                icons::paint(ui.painter(), xr.shrink(2.0), Icon::Close, if xresp.hovered() { Color32::WHITE } else { Color32::from_gray(120) });
                 if xresp.clicked() {
                     cmds.push(Cmd::RemoveEffect(e.id));
                 }
@@ -953,6 +1012,81 @@ fn layer_row(ui: &mut Ui, s: &TextureSet, l: &Layer, depth: usize, ch: usize, cm
     }
 }
 
+/// One effect row under a layer, like Painter's: indented to the
+/// thumbnail column, eye, type icon, name, blending and opacity, remove.
+struct EffectRow {
+    key: (&'static str, u64),
+    depth: usize,
+    /// Mask effects are tinted red, content effects gray.
+    mask: bool,
+    sel: bool,
+    enabled: bool,
+    icon: Icon,
+    name: String,
+    blend: Option<&'static str>,
+    opacity: f32,
+}
+
+/// Draws an effect row; returns the row, eye and remove responses.
+fn effect_row(ui: &mut Ui, fx: &EffectRow) -> (egui::Response, egui::Response, egui::Response) {
+    let (er, eresp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 25.0), Sense::click());
+    let ex = er.min.x + 30.0 + fx.depth as f32 * 16.0;
+    let body = Rect::from_min_max(Pos2::new(ex - 4.0, er.min.y), er.max);
+    let p = ui.painter();
+    let bg = match (fx.mask, fx.sel, eresp.hovered()) {
+        (true, true, _) => Color32::from_rgb(132, 40, 38),
+        (true, false, true) => Color32::from_rgb(70, 40, 40),
+        (true, false, false) => Color32::from_rgb(54, 34, 34),
+        (false, true, _) => crate::style::ROW_SELECTED,
+        (false, false, true) => crate::style::warm(58),
+        (false, false, false) => crate::style::warm(44),
+    };
+    p.rect_filled(body, 0.0, bg);
+    p.line_segment([body.left_bottom(), body.right_bottom()], egui::Stroke::new(1.0f32, crate::style::warm(30)));
+    let eye = Rect::from_center_size(Pos2::new(ex + 8.0, er.center().y), egui::vec2(16.0, 16.0));
+    let vresp = ui.interact(eye, ui.id().with((fx.key, "eye")), Sense::click());
+    icons::paint(ui.painter(), eye, if fx.enabled { Icon::Eye } else { Icon::EyeOff }, Color32::from_gray(if fx.enabled { 200 } else { 110 }));
+    let p = ui.painter();
+    icons::paint(p, Rect::from_center_size(Pos2::new(ex + 30.0, er.center().y), egui::vec2(15.0, 15.0)), fx.icon, Color32::from_gray(235));
+    let text = if fx.enabled { Color32::from_gray(225) } else { Color32::from_gray(130) };
+    let xr = Rect::from_center_size(Pos2::new(er.max.x - 12.0, er.center().y), egui::vec2(14.0, 14.0));
+    let mut right = xr.min.x - 8.0;
+    p.text(Pos2::new(right, er.center().y), egui::Align2::RIGHT_CENTER, format!("{:.0}", fx.opacity * 100.0), egui::FontId::proportional(11.5), text);
+    right -= 30.0;
+    if let Some(b) = fx.blend {
+        p.text(Pos2::new(right, er.center().y), egui::Align2::RIGHT_CENTER, b, egui::FontId::proportional(11.5), text);
+        right -= 34.0;
+    }
+    let name_rect = Rect::from_min_max(Pos2::new(ex + 44.0, er.min.y), Pos2::new(right.max(ex + 60.0), er.max.y));
+    let galley = p.layout_no_wrap(fx.name.clone(), egui::FontId::proportional(12.0), text);
+    p.with_clip_rect(name_rect).galley(Pos2::new(name_rect.min.x, er.center().y - galley.size().y / 2.0), galley, text);
+    let xresp = ui.interact(xr, ui.id().with((fx.key, "del")), Sense::click()).on_hover_text("Remove effect (Del)");
+    icons::paint(ui.painter(), xr.shrink(2.0), Icon::Close, if xresp.hovered() { Color32::WHITE } else { Color32::from_gray(170) });
+    (eresp, vresp, xresp)
+}
+
+/// Icon and row name of a mask effect (Painter shows the generator's name).
+fn effect_look(k: &MaskEffectKind) -> (Icon, String) {
+    match k {
+        MaskEffectKind::Paint => (Icon::Brush, "Paint".into()),
+        MaskEffectKind::Fill { .. } => (Icon::Fill, "Fill".into()),
+        MaskEffectKind::Generator(g) => (Icon::Generator, g.kind.name().into()),
+        MaskEffectKind::Levels { .. } => (Icon::Levels, "Levels".into()),
+        MaskEffectKind::Blur { .. } => (Icon::Effect, "Blur".into()),
+        MaskEffectKind::Invert => (Icon::Effect, "Invert".into()),
+        MaskEffectKind::Threshold { .. } => (Icon::Effect, "Threshold".into()),
+        MaskEffectKind::ColorSelect { .. } => (Icon::Picker, "Color selection".into()),
+    }
+}
+
+fn short_mask_blend(b: crate::document::MaskBlend) -> &'static str {
+    let n = b.name();
+    match n.len() {
+        0..=4 => n,
+        _ => &n[..4],
+    }
+}
+
 /// Right click on a mask thumbnail (the row menu cannot open there: the
 /// thumbnail takes the click).
 fn mask_menu_for(resp: &egui::Response, id: u64, l: &Layer, cmds: &mut Vec<Cmd>) {
@@ -970,14 +1104,12 @@ fn mask_menu_for(resp: &egui::Response, id: u64, l: &Layer, cmds: &mut Vec<Cmd>)
         item(ui, &mut picked, id, if enabled { "Disable mask" } else { "Enable mask" }, "Shift + click", Cmd::ToggleMask(id));
         item(ui, &mut picked, id, "Invert mask background", "", Cmd::InvertMaskBase(id));
         ui.separator();
-        super::widgets::sub_menu(ui, "Add effect", |ui| {
-            let mut sub = Vec::new();
-            effect_menu(ui, &mut sub);
-            if !sub.is_empty() {
-                picked.push(Cmd::Select(id, Target::Mask));
-                picked.extend(sub);
-            }
-        });
+        let mut sub = Vec::new();
+        effect_menu(ui, &mut sub);
+        if !sub.is_empty() {
+            picked.push(Cmd::Select(id, Target::Mask));
+            picked.extend(sub);
+        }
         ui.separator();
         item(ui, &mut picked, id, "Copy mask", "", Cmd::CopyMask(id));
         item(ui, &mut picked, id, "Paste into mask", "", Cmd::PasteMask(id));
@@ -989,9 +1121,50 @@ fn mask_menu_for(resp: &egui::Response, id: u64, l: &Layer, cmds: &mut Vec<Cmd>)
     cmds.extend(picked);
 }
 
-/// Thin bar under a thumbnail: orange when that stack has effects.
+/// What a dragged layer row looks like under the pointer.
+#[derive(Clone)]
+struct LayerGhost {
+    name: String,
+    thumb: Option<egui::TextureId>,
+    /// Layers dragged (the multi-selection).
+    count: usize,
+    size: egui::Vec2,
+    /// Pointer offset from the row's corner when the drag began.
+    grab: egui::Vec2,
+}
+
+/// The dragged layer row following the pointer, like Painter's.
+pub(super) fn layer_drag_ghost(ctx: &egui::Context) {
+    let gid = egui::Id::new("layer ghost");
+    if egui::DragAndDrop::payload::<super::panels::LayerDrag>(ctx).is_none() {
+        ctx.data_mut(|d| d.remove::<LayerGhost>(gid));
+        return;
+    }
+    let (Some(g), Some(pos)) = (ctx.data(|d| d.get_temp::<LayerGhost>(gid)), ctx.pointer_interact_pos()) else { return };
+    let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("layer drag ghost")));
+    let r = Rect::from_min_size(pos - g.grab, g.size);
+    // A second card behind for a multi-selection.
+    if g.count > 1 {
+        p.rect_filled(r.translate(egui::vec2(5.0, 5.0)), 3.0, Color32::from_rgba_unmultiplied(48, 48, 52, 170));
+    }
+    p.rect_filled(r, 3.0, Color32::from_rgba_unmultiplied(58, 58, 62, 215));
+    p.rect_stroke(r, 3.0, egui::Stroke::new(1.0f32, crate::style::ACCENT));
+    let t = Rect::from_min_size(Pos2::new(r.min.x + 30.0, r.center().y - THUMB / 2.0), egui::vec2(THUMB, THUMB));
+    match g.thumb {
+        Some(tex) => {
+            p.image(tex, t, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::from_white_alpha(230));
+        }
+        None => {
+            p.rect_filled(t, 2.0, crate::style::warm(80));
+        }
+    }
+    let label = if g.count > 1 { format!("{}  (+{})", g.name, g.count - 1) } else { g.name.clone() };
+    p.text(Pos2::new(t.max.x + 8.0, r.center().y), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(12.0), Color32::WHITE);
+}
+
+/// Thin bar under a thumbnail: red when that stack has effects (Painter).
 fn effects_bar(p: &egui::Painter, thumb: Rect, has_effects: bool) {
-    let c = if has_effects { Color32::from_rgb(255, 137, 34) } else { Color32::from_gray(74) };
+    let c = if has_effects { crate::style::MASK } else { crate::style::warm(74) };
     p.rect_filled(Rect::from_min_size(Pos2::new(thumb.min.x + 2.0, thumb.max.y + 3.0), egui::vec2(thumb.width() - 4.0, 3.0)), 1.0, c);
 }
 
@@ -1015,82 +1188,23 @@ const TAG_COLORS: [Color32; 8] = [
     Color32::from_rgb(130, 80, 170),
 ];
 
-/// The "Add ..." effect items of the real application: on a mask they add
-/// mask effects, on content they add content effects (filters, levels).
+/// The "Add ..." effect items: on a mask they add mask effects, on content
+/// they add content effects (filters, levels). Only what exists is listed.
 fn add_effect_items(ui: &mut Ui, cmds: &mut Vec<Cmd>, on_mask: bool) {
-    let unavailable = "Not available on layer content";
     if on_mask {
-        super::widgets::sub_menu(ui, "Add generator", |ui| {
-            for g in Generator::ALL {
-                if ui.button(g.name()).clicked() {
-                    cmds.push(Cmd::AddEffect(MaskEffectKind::Generator(GeneratorDesc::of(*g))));
-                    ui.close_menu();
-                }
-            }
-        });
-        if ui.button("Add paint").clicked() {
-            cmds.push(Cmd::AddEffect(MaskEffectKind::Paint));
-            ui.close_menu();
-        }
-        super::widgets::sub_menu(ui, "Add fill", |ui| {
-            if ui.button("Uniform / texture").clicked() {
-                cmds.push(Cmd::AddEffect(MaskEffectKind::Fill {
-                    value: 1.0,
-                    source: SourceKind::Uniform,
-                    texture: None,
-                    procedural: ProcParams::default(),
-                    projection: Projection::default(),
-                    range: [0.0, 1.0],
-                }));
+        effect_menu(ui, cmds);
+        return;
+    }
+    if ui.button("Add levels").clicked() {
+        cmds.push(Cmd::AddContentEffect(FilterKind::Levels));
+        ui.close_menu();
+    }
+    super::widgets::sub_menu(ui, "Add filter", |ui| {
+        for k in FilterKind::ALL {
+            if ui.button(k.name()).clicked() {
+                cmds.push(Cmd::AddContentEffect(*k));
                 ui.close_menu();
             }
-            ui.separator();
-            for p in ProcKind::ALL {
-                if ui.button(p.name()).clicked() {
-                    cmds.push(Cmd::AddEffect(MaskEffectKind::fill_procedural(*p)));
-                    ui.close_menu();
-                }
-            }
-        });
-        if ui.button("Add levels").clicked() {
-            cmds.push(Cmd::AddEffect(MaskEffectKind::levels()));
-            ui.close_menu();
         }
-        ui.add_enabled(false, egui::Button::new("Add compare mask"));
-        super::widgets::sub_menu(ui, "Add filter", |ui| {
-            for (n, k) in [
-                ("Blur", MaskEffectKind::Blur { radius: 4.0 }),
-                ("Invert", MaskEffectKind::Invert),
-                ("Threshold", MaskEffectKind::Threshold { value: 0.5 }),
-            ] {
-                if ui.button(n).clicked() {
-                    cmds.push(Cmd::AddEffect(k));
-                    ui.close_menu();
-                }
-            }
-        });
-        if ui.button("Add color selection").clicked() {
-            cmds.push(Cmd::AddEffect(MaskEffectKind::ColorSelect { colors: Vec::new(), tolerance: 0.05 }));
-            ui.close_menu();
-        }
-    } else {
-        ui.add_enabled(false, egui::Button::new("Add generator")).on_disabled_hover_text(unavailable);
-        ui.add_enabled(false, egui::Button::new("Add paint")).on_disabled_hover_text(unavailable);
-        ui.add_enabled(false, egui::Button::new("Add fill")).on_disabled_hover_text(unavailable);
-        if ui.button("Add levels").clicked() {
-            cmds.push(Cmd::AddContentEffect(FilterKind::Levels));
-            ui.close_menu();
-        }
-        ui.add_enabled(false, egui::Button::new("Add compare mask")).on_disabled_hover_text("Masks only");
-        super::widgets::sub_menu(ui, "Add filter", |ui| {
-            for k in FilterKind::ALL {
-                if ui.button(k.name()).clicked() {
-                    cmds.push(Cmd::AddContentEffect(*k));
-                    ui.close_menu();
-                }
-            }
-        });
-        ui.add_enabled(false, egui::Button::new("Add color selection")).on_disabled_hover_text("Masks only");
-    }
-    ui.add_enabled(false, egui::Button::new("Add anchor point")).on_disabled_hover_text("Not available yet");
+    });
 }

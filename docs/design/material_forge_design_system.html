@@ -1,0 +1,746 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Material Forge Design System</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root {
+  /* Surfaces: neutral graphite with a hint of warmth, lighter as they rise. */
+  --canvas: #141416;
+  --surface-0: #1b1b1e;
+  --surface-1: #222226;
+  --surface-2: #2a2a2f;
+  --surface-3: #34343a;
+  --surface-4: #3f3f46;
+  --line: rgba(255, 255, 255, 0.07);
+  --line-strong: rgba(255, 255, 255, 0.12);
+  /* Text. */
+  --text-1: #f1f1f4;
+  --text-2: #b4b4bd;
+  --text-3: #7c7c86;
+  /* Brand: the forge orange of the logo. */
+  --accent: #f26b1d;
+  --accent-hover: #ff7d33;
+  --accent-soft: rgba(242, 107, 29, 0.16);
+  --accent-line: rgba(242, 107, 29, 0.55);
+  /* Meaning. */
+  --mask: #e5484d;
+  --mask-soft: rgba(229, 72, 77, 0.16);
+  --success: #3dd68c;
+  --warning: #ffb224;
+  --info: #5b9dff;
+  --select: #ffffff;
+  /* Shape. */
+  --r-xs: 4px;
+  --r-sm: 6px;
+  --r-md: 8px;
+  --r-lg: 12px;
+  --r-xl: 16px;
+  --r-pill: 999px;
+  /* Depth. */
+  --e1: 0 1px 0 rgba(255,255,255,0.04) inset, 0 8px 24px rgba(0, 0, 0, 0.35);
+  --e2: 0 1px 0 rgba(255,255,255,0.05) inset, 0 16px 48px rgba(0, 0, 0, 0.55);
+  --e3: 0 24px 80px rgba(0, 0, 0, 0.6);
+  /* Type. */
+  --font: "Inter", "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, monospace;
+  --t-xs: 11px;
+  --t-sm: 12px;
+  --t-md: 13px;
+  --t-lg: 15px;
+  --t-xl: 20px;
+  --t-2xl: 32px;
+  /* Motion. */
+  --ease: cubic-bezier(.2, .8, .2, 1);
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--canvas); color: var(--text-1); font-family: var(--font); font-size: var(--t-md); -webkit-font-smoothing: antialiased; }
+a { color: var(--accent); }
+svg { display: block; }
+* { scrollbar-width: thin; scrollbar-color: var(--surface-4) transparent; }
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: var(--surface-4); border-radius: 8px; border: 2px solid transparent; background-clip: padding-box; }
+::-webkit-scrollbar-track { background: transparent; }
+.wrap { max-width: 1480px; margin: 0 auto; padding: 32px 24px 96px; }
+
+/* ------------------------------------------------------------ page */
+.hero { display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; margin-bottom: 20px; flex-wrap: wrap; }
+.hero h1 { font-size: var(--t-2xl); font-weight: 700; letter-spacing: -0.02em; margin: 0 0 6px; }
+.hero p { margin: 0; color: var(--text-2); max-width: 720px; line-height: 1.55; font-size: var(--t-lg); }
+.logo-tile { width: 44px; height: 44px; border-radius: 12px; background: linear-gradient(145deg, #ff8a3d, #e2560f); display: grid; place-items: center; font-weight: 800; font-size: 18px; color: #fff; box-shadow: 0 6px 20px rgba(242,107,29,.35); flex: none; }
+.brand { display: flex; gap: 14px; align-items: center; }
+.tag { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: var(--r-pill); background: var(--surface-2); color: var(--text-2); font-size: var(--t-xs); border: 1px solid var(--line); }
+section { margin-top: 64px; }
+section > h2 { font-size: var(--t-xl); margin: 0 0 6px; font-weight: 650; letter-spacing: -0.01em; }
+section > p.lead { color: var(--text-2); margin: 0 0 24px; max-width: 760px; line-height: 1.55; }
+.grid { display: grid; gap: 16px; }
+.g2 { grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+.g3 { grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+.g4 { grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); }
+.card { background: var(--surface-0); border: 1px solid var(--line); border-radius: var(--r-xl); padding: 20px; }
+.card h3 { margin: 0 0 12px; font-size: var(--t-md); font-weight: 600; color: var(--text-1); }
+.card p { color: var(--text-2); margin: 0; line-height: 1.55; }
+.muted { color: var(--text-3); }
+.mono { font-family: var(--mono); font-size: var(--t-xs); color: var(--text-3); }
+
+/* ------------------------------------------------------------ app mock */
+.stage { position: relative; width: 100%; aspect-ratio: 16 / 10; min-height: 560px; border-radius: 20px; overflow: hidden; border: 1px solid var(--line-strong); box-shadow: var(--e3); background: radial-gradient(1200px 700px at 50% 38%, #3a3a40 0%, #26262b 40%, #18181b 75%); user-select: none; }
+.stage .floor { position: absolute; left: 0; right: 0; bottom: 0; height: 38%; background: radial-gradient(60% 80% at 50% 0%, rgba(255,255,255,0.05), transparent 70%); }
+.ball { position: absolute; left: 50%; top: 46%; width: min(34%, 360px); aspect-ratio: 1; transform: translate(-50%, -50%); border-radius: 50%;
+  background:
+    radial-gradient(circle at 34% 28%, rgba(255,255,255,0.55) 0 3%, rgba(255,255,255,0) 14%),
+    radial-gradient(circle at 70% 78%, rgba(0,0,0,0.6), rgba(0,0,0,0) 55%),
+    repeating-radial-gradient(circle at 40% 40%, rgba(0,0,0,0.08) 0 2px, rgba(0,0,0,0) 2px 7px),
+    radial-gradient(circle at 38% 34%, #d9884a 0%, #a5522a 38%, #5c2a16 72%, #2a120a 100%);
+  box-shadow: 0 40px 80px rgba(0,0,0,.55); }
+.ball::after { content: ""; position: absolute; inset: 18% 14% 30% 30%; border: 1.5px dashed rgba(255,255,255,.9); border-radius: 46% 54% 40% 60%; mix-blend-mode: normal; outline: 1.5px dashed rgba(0,0,0,.6); outline-offset: -3px; animation: ants 1.2s linear infinite; }
+@keyframes ants { to { transform: rotate(0.6deg); } }
+.shadow-blob { position: absolute; left: 50%; top: 74%; width: 26%; height: 4%; transform: translateX(-50%); background: radial-gradient(closest-side, rgba(0,0,0,.55), transparent); }
+
+.panel { position: absolute; background: rgba(27, 27, 30, 0.92); backdrop-filter: blur(16px); border: 1px solid var(--line); border-radius: var(--r-lg); box-shadow: var(--e1); display: flex; flex-direction: column; overflow: hidden; transition: opacity .2s var(--ease), transform .25s var(--ease); }
+.stage.hidden-ui .panel, .stage.hidden-ui .dock, .stage.hidden-ui .ctx, .stage.hidden-ui .viewbar, .stage.hidden-ui .export { opacity: 0; pointer-events: none; transform: scale(.98); }
+.p-head { display: flex; align-items: center; gap: 8px; padding: 10px 12px; border-bottom: 1px solid var(--line); min-height: 44px; }
+.p-title { font-weight: 600; font-size: var(--t-sm); letter-spacing: .01em; }
+.p-sub { color: var(--text-3); font-size: var(--t-xs); }
+.spacer { flex: 1; }
+.ib { width: 28px; height: 28px; border-radius: var(--r-md); display: grid; place-items: center; color: var(--text-2); background: transparent; border: 0; cursor: pointer; transition: background .15s, color .15s; }
+.ib:hover { background: var(--surface-3); color: var(--text-1); }
+.ib.on { background: var(--accent-soft); color: var(--accent); }
+.ib svg { width: 16px; height: 16px; }
+
+/* Left: project + layers */
+.p-left { left: 10px; top: 10px; bottom: 10px; width: 272px; }
+.proj { display: flex; align-items: center; gap: 10px; padding: 10px 10px 10px 12px; }
+.proj .logo-tile { width: 28px; height: 28px; border-radius: 8px; font-size: 12px; box-shadow: none; }
+.proj .name { font-weight: 600; font-size: var(--t-sm); }
+.proj .file { color: var(--text-3); font-size: var(--t-xs); }
+.chev { color: var(--text-3); }
+.setswitch { margin: 0 10px 8px; display: flex; align-items: center; gap: 8px; padding: 7px 10px; border-radius: var(--r-md); background: var(--surface-1); border: 1px solid var(--line); font-size: var(--t-sm); cursor: pointer; }
+.setswitch .sw { width: 14px; height: 14px; border-radius: 4px; background: linear-gradient(135deg, #c9773d, #6d3219); }
+.setswitch .res { margin-left: auto; color: var(--text-3); font-size: var(--t-xs); font-family: var(--mono); }
+.tabs { display: flex; gap: 2px; padding: 3px; margin: 0 10px 6px; background: var(--surface-1); border-radius: var(--r-md); }
+.tabs button { flex: 1; border: 0; background: transparent; color: var(--text-2); font: inherit; font-size: var(--t-xs); padding: 6px 0; border-radius: 6px; cursor: pointer; }
+.tabs button.on { background: var(--surface-3); color: var(--text-1); box-shadow: 0 1px 2px rgba(0,0,0,.3); }
+.layers { flex: 1; overflow: auto; padding: 4px 6px 8px; }
+.lrow { display: flex; align-items: center; gap: 8px; padding: 6px 6px; border-radius: var(--r-md); cursor: pointer; position: relative; }
+.lrow:hover { background: var(--surface-2); }
+.lrow.sel { background: var(--accent-soft); box-shadow: inset 0 0 0 1px var(--accent-line); }
+.lrow .eye { color: var(--text-3); width: 18px; display: grid; place-items: center; }
+.lrow .eye svg { width: 14px; height: 14px; }
+.lrow.off { opacity: .45; }
+.thumb { width: 30px; height: 30px; border-radius: 7px; flex: none; border: 1px solid var(--line-strong); }
+.mthumb { width: 30px; height: 30px; border-radius: 7px; flex: none; background: #000; border: 1px solid var(--line-strong); position: relative; overflow: hidden; }
+.mthumb.sel { box-shadow: 0 0 0 1.5px var(--mask); }
+.lname { flex: 1; min-width: 0; }
+.lname b { display: block; font-weight: 500; font-size: var(--t-sm); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.lname span { font-size: var(--t-xs); color: var(--text-3); }
+.op { font-family: var(--mono); font-size: 10.5px; color: var(--text-3); }
+.indent { padding-left: 26px; }
+.fx { display: flex; align-items: center; gap: 6px; margin: 0 6px 2px 54px; padding: 4px 8px; border-radius: var(--r-sm); color: var(--text-2); font-size: var(--t-xs); background: var(--mask-soft); }
+.fx i { width: 6px; height: 6px; border-radius: 50%; background: var(--mask); }
+.l-foot { display: flex; gap: 4px; padding: 8px; border-top: 1px solid var(--line); }
+.l-foot .ib { flex: 1; width: auto; }
+
+/* Right top: library */
+.p-lib { right: 10px; top: 58px; width: 312px; height: calc(46% - 30px); }
+.search { margin: 10px; display: flex; align-items: center; gap: 8px; padding: 7px 10px; border-radius: var(--r-md); background: var(--surface-1); border: 1px solid var(--line); color: var(--text-3); font-size: var(--t-sm); }
+.search svg { width: 14px; height: 14px; }
+.chips { display: flex; gap: 6px; padding: 0 10px 10px; flex-wrap: wrap; }
+.chip { padding: 4px 10px; border-radius: var(--r-pill); background: var(--surface-1); color: var(--text-2); font-size: var(--t-xs); border: 1px solid var(--line); cursor: pointer; }
+.chip.on { background: var(--text-1); color: #111; border-color: transparent; font-weight: 600; }
+.assets { flex: 1; overflow: auto; display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; padding: 0 10px 10px; align-content: start; }
+.asset { border-radius: var(--r-md); background: var(--surface-1); border: 1px solid var(--line); padding: 6px; cursor: grab; transition: transform .15s var(--ease), border-color .15s; }
+.asset:hover { transform: translateY(-2px); border-color: var(--line-strong); }
+.asset .sph { aspect-ratio: 1; border-radius: 50%; margin: 4px auto 6px; width: 78%; box-shadow: 0 6px 12px rgba(0,0,0,.4); }
+.asset .n { font-size: 10.5px; color: var(--text-2); text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* Right bottom: properties */
+.p-props { right: 10px; bottom: 10px; width: 312px; top: calc(46% + 38px); }
+.props { flex: 1; overflow: auto; padding: 6px 12px 12px; }
+.grp { padding: 10px 0; border-bottom: 1px solid var(--line); }
+.grp:last-child { border-bottom: 0; }
+.grp-h { display: flex; align-items: center; justify-content: space-between; font-size: var(--t-xs); font-weight: 600; color: var(--text-2); text-transform: uppercase; letter-spacing: .06em; margin-bottom: 8px; }
+.row { display: grid; grid-template-columns: 92px 1fr 44px; align-items: center; gap: 8px; margin: 6px 0; font-size: var(--t-sm); color: var(--text-2); }
+.slider { position: relative; height: 22px; border-radius: var(--r-pill); background: var(--surface-1); border: 1px solid var(--line); overflow: hidden; cursor: ew-resize; }
+.slider .fill { position: absolute; inset: 0 auto 0 0; background: linear-gradient(90deg, rgba(242,107,29,.35), rgba(242,107,29,.55)); border-radius: var(--r-pill); }
+.slider .knob { position: absolute; top: 3px; width: 14px; height: 14px; border-radius: 50%; background: #fff; box-shadow: 0 1px 4px rgba(0,0,0,.5); transform: translateX(-50%); }
+.num { font-family: var(--mono); font-size: 11px; color: var(--text-1); background: var(--surface-1); border: 1px solid var(--line); border-radius: var(--r-sm); padding: 3px 6px; text-align: right; }
+.matslot { display: flex; align-items: center; gap: 10px; padding: 8px; border-radius: var(--r-md); background: var(--surface-1); border: 1px solid var(--line); }
+.matslot .sph { width: 38px; height: 38px; border-radius: 50%; flex: none; }
+.matslot b { font-size: var(--t-sm); font-weight: 600; display: block; }
+.matslot span { font-size: var(--t-xs); color: var(--text-3); }
+.chan { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.chan span { font-size: 10.5px; padding: 3px 8px; border-radius: var(--r-pill); background: var(--surface-2); color: var(--text-2); border: 1px solid var(--line); }
+.chan span.on { background: var(--accent-soft); color: var(--accent); border-color: var(--accent-line); }
+.swatch-row { display: flex; gap: 6px; }
+.swatch-row i { width: 22px; height: 22px; border-radius: 6px; border: 1px solid var(--line-strong); display: block; }
+
+/* Top center: view bar */
+.viewbar { position: absolute; top: 10px; left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: 4px; padding: 4px; border-radius: var(--r-lg); background: rgba(27,27,30,.92); border: 1px solid var(--line); box-shadow: var(--e1); backdrop-filter: blur(16px); transition: opacity .2s var(--ease); }
+.seg { display: flex; padding: 2px; border-radius: var(--r-md); background: var(--surface-1); gap: 2px; }
+.seg button { border: 0; background: transparent; color: var(--text-2); font: inherit; font-size: var(--t-xs); padding: 5px 10px; border-radius: 6px; cursor: pointer; }
+.seg button.on { background: var(--surface-3); color: var(--text-1); }
+.dd { display: flex; align-items: center; gap: 6px; padding: 6px 10px; border-radius: var(--r-md); color: var(--text-1); font-size: var(--t-xs); cursor: pointer; }
+.dd:hover { background: var(--surface-2); }
+.vsep { width: 1px; height: 20px; background: var(--line-strong); margin: 0 2px; }
+
+/* Top right: export */
+.export { position: absolute; top: 10px; right: 10px; display: flex; gap: 6px; align-items: center; transition: opacity .2s var(--ease); }
+.btn { display: inline-flex; align-items: center; gap: 8px; height: 34px; padding: 0 14px; border-radius: var(--r-md); border: 1px solid var(--line-strong); background: var(--surface-2); color: var(--text-1); font: inherit; font-size: var(--t-sm); font-weight: 500; cursor: pointer; transition: background .15s, transform .1s; }
+.btn:hover { background: var(--surface-3); }
+.btn:active { transform: translateY(1px); }
+.btn.primary { background: var(--accent); border-color: transparent; color: #fff; font-weight: 600; box-shadow: 0 6px 16px rgba(242,107,29,.35); }
+.btn.primary:hover { background: var(--accent-hover); }
+.btn.ghost { background: transparent; border-color: transparent; color: var(--text-2); }
+.btn.ghost:hover { background: var(--surface-2); color: var(--text-1); }
+.btn.danger { background: rgba(229,72,77,.14); border-color: rgba(229,72,77,.4); color: #ff8a8d; }
+.btn.sm { height: 28px; padding: 0 10px; font-size: var(--t-xs); border-radius: var(--r-sm); }
+.btn svg { width: 15px; height: 15px; }
+.kbd { font-family: var(--mono); font-size: 10.5px; padding: 1px 6px; border-radius: 5px; background: var(--surface-3); color: var(--text-2); border: 1px solid var(--line-strong); border-bottom-width: 2px; }
+
+/* Bottom: tool dock + context options */
+.dock { position: absolute; left: 50%; bottom: 12px; transform: translateX(-50%); display: flex; align-items: center; gap: 2px; padding: 6px; border-radius: 18px; background: rgba(27,27,30,.94); border: 1px solid var(--line-strong); box-shadow: var(--e2); backdrop-filter: blur(18px); transition: opacity .2s var(--ease); }
+.tool { position: relative; width: 38px; height: 38px; border-radius: 12px; display: grid; place-items: center; color: var(--text-2); cursor: pointer; border: 0; background: transparent; transition: background .15s, color .15s; }
+.tool:hover { background: var(--surface-3); color: var(--text-1); }
+.tool.on { background: var(--accent); color: #fff; box-shadow: 0 4px 14px rgba(242,107,29,.4); }
+.tool svg { width: 19px; height: 19px; }
+.tool .more { position: absolute; right: 4px; bottom: 4px; width: 0; height: 0; border-left: 4px solid transparent; border-top: 4px solid currentColor; opacity: .55; transform: rotate(-45deg); }
+.tool .tip { position: absolute; bottom: 48px; left: 50%; transform: translateX(-50%) translateY(4px); white-space: nowrap; background: #0d0d0f; color: var(--text-1); font-size: var(--t-xs); padding: 6px 8px; border-radius: 8px; opacity: 0; pointer-events: none; transition: opacity .12s, transform .12s; border: 1px solid var(--line-strong); }
+.tool:hover .tip { opacity: 1; transform: translateX(-50%) translateY(0); }
+.tip .kbd { margin-left: 6px; }
+.dsep { width: 1px; height: 24px; background: var(--line-strong); margin: 0 6px; }
+.flyout { position: absolute; bottom: 58px; left: 0; display: none; flex-direction: column; gap: 2px; padding: 6px; border-radius: 14px; background: #1d1d20; border: 1px solid var(--line-strong); box-shadow: var(--e2); min-width: 236px; }
+.flyout.open { display: flex; }
+.fitem { display: flex; align-items: center; gap: 10px; padding: 7px 8px; border-radius: 8px; color: var(--text-1); font-size: var(--t-sm); cursor: pointer; }
+.fitem:hover { background: var(--surface-3); }
+.fitem svg { width: 16px; height: 16px; color: var(--text-2); }
+.fitem .kbd { margin-left: auto; }
+.fitem.on { background: var(--accent-soft); }
+.fitem.on svg { color: var(--accent); }
+.ctx { position: absolute; left: 50%; bottom: 66px; transform: translateX(-50%); display: flex; align-items: center; gap: 10px; padding: 6px 10px; border-radius: 14px; background: rgba(27,27,30,.9); border: 1px solid var(--line); box-shadow: var(--e1); backdrop-filter: blur(16px); font-size: var(--t-xs); color: var(--text-2); white-space: nowrap; transition: opacity .2s var(--ease); }
+.mini { display: flex; align-items: center; gap: 8px; }
+.mini .slider { width: 92px; height: 18px; }
+.mini .slider .knob { top: 2px; width: 12px; height: 12px; }
+.mini b { color: var(--text-1); font-family: var(--mono); font-weight: 500; font-size: 11px; min-width: 30px; }
+.modes { display: flex; gap: 2px; padding: 2px; background: var(--surface-1); border-radius: 8px; }
+.modes button { width: 26px; height: 24px; border: 0; border-radius: 6px; background: transparent; color: var(--text-2); display: grid; place-items: center; cursor: pointer; }
+.modes button.on { background: var(--surface-3); color: var(--text-1); }
+.modes svg { width: 14px; height: 14px; }
+
+.status { position: absolute; left: 294px; bottom: 16px; font-family: var(--mono); font-size: 10.5px; color: rgba(255,255,255,.35); transition: opacity .2s; }
+.badge-sel { position: absolute; left: 294px; top: 14px; display: flex; align-items: center; gap: 8px; padding: 5px 10px; border-radius: var(--r-pill); background: rgba(14,14,16,.75); border: 1px dashed rgba(255,255,255,.45); font-size: var(--t-xs); color: var(--text-1); transition: opacity .2s; }
+.stage.hidden-ui .status, .stage.hidden-ui .badge-sel { opacity: 0; }
+.hint-tab { position: absolute; right: 336px; bottom: 16px; font-size: var(--t-xs); color: rgba(255,255,255,.45); display: flex; gap: 6px; align-items: center; }
+
+/* ------------------------------------------------------------ tokens */
+.swatches { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; }
+.sw-card { border-radius: var(--r-lg); overflow: hidden; border: 1px solid var(--line); background: var(--surface-0); }
+.sw-card .c { height: 64px; }
+.sw-card .m { padding: 10px 12px; }
+.sw-card .m b { display: block; font-size: var(--t-sm); font-weight: 600; }
+.radius-row { display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-end; }
+.radius-row div { width: 84px; height: 84px; background: var(--surface-2); border: 1px solid var(--line-strong); display: grid; place-items: center; font-size: var(--t-xs); color: var(--text-2); }
+.space-row { display: flex; gap: 14px; align-items: flex-end; flex-wrap: wrap; }
+.space-row div { background: var(--accent-soft); border: 1px solid var(--accent-line); border-radius: 4px; }
+.space-row span { display: block; text-align: center; font-size: 10.5px; color: var(--text-3); margin-top: 6px; font-family: var(--mono); }
+.type-row { display: flex; align-items: baseline; gap: 16px; padding: 10px 0; border-bottom: 1px solid var(--line); }
+.type-row:last-child { border: 0; }
+.type-row .mono { width: 110px; flex: none; }
+.elev { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 24px; }
+.elev div { height: 96px; border-radius: var(--r-lg); background: var(--surface-1); border: 1px solid var(--line); display: grid; place-items: center; color: var(--text-2); font-size: var(--t-sm); }
+
+/* ------------------------------------------------------------ components */
+.comp { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+.toggle { width: 34px; height: 20px; border-radius: var(--r-pill); background: var(--surface-3); position: relative; cursor: pointer; border: 1px solid var(--line-strong); transition: background .15s; }
+.toggle::after { content: ""; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: #fff; transition: transform .2s var(--ease); box-shadow: 0 1px 3px rgba(0,0,0,.5); }
+.toggle.on { background: var(--accent); border-color: transparent; }
+.toggle.on::after { transform: translateX(14px); }
+.select { display: inline-flex; align-items: center; gap: 8px; height: 30px; padding: 0 10px; border-radius: var(--r-md); background: var(--surface-1); border: 1px solid var(--line-strong); color: var(--text-1); font-size: var(--t-sm); cursor: pointer; }
+.input { height: 30px; padding: 0 10px; border-radius: var(--r-md); background: var(--surface-1); border: 1px solid var(--line-strong); color: var(--text-1); font: inherit; font-size: var(--t-sm); outline: none; }
+.input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.menu { width: 248px; padding: 6px; border-radius: 12px; background: #1d1d20; border: 1px solid var(--line-strong); box-shadow: var(--e2); }
+.menu .fitem .sub { margin-left: auto; color: var(--text-3); }
+.menu hr { border: 0; border-top: 1px solid var(--line); margin: 5px 4px; }
+.toast { display: inline-flex; align-items: center; gap: 10px; padding: 10px 14px; border-radius: 12px; background: #1d1d20; border: 1px solid var(--line-strong); box-shadow: var(--e2); font-size: var(--t-sm); }
+.toast i { width: 8px; height: 8px; border-radius: 50%; background: var(--success); }
+.pop { width: 240px; padding: 12px; border-radius: 14px; background: #1d1d20; border: 1px solid var(--line-strong); box-shadow: var(--e2); }
+.sv { height: 120px; border-radius: 10px; background: linear-gradient(to top, #000, transparent), linear-gradient(to right, #fff, #f26b1d); position: relative; }
+.sv i { position: absolute; left: 70%; top: 22%; width: 12px; height: 12px; border-radius: 50%; border: 2px solid #fff; box-shadow: 0 0 0 1px rgba(0,0,0,.5); }
+.hue { height: 12px; border-radius: var(--r-pill); margin: 10px 0; background: linear-gradient(90deg, red, #ff0, lime, cyan, blue, #f0f, red); }
+
+table { width: 100%; border-collapse: collapse; font-size: var(--t-sm); }
+th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--text-3); font-weight: 500; font-size: var(--t-xs); text-transform: uppercase; letter-spacing: .06em; }
+td:first-child { color: var(--text-2); width: 32%; }
+.legend { display: flex; gap: 18px; flex-wrap: wrap; margin-top: 14px; color: var(--text-2); font-size: var(--t-sm); }
+.legend b { color: var(--text-1); }
+.callout { display: flex; gap: 12px; padding: 14px 16px; border-radius: var(--r-lg); background: var(--accent-soft); border: 1px solid var(--accent-line); color: var(--text-1); line-height: 1.5; margin-top: 16px; }
+
+@media (max-width: 900px) {
+  .stage { aspect-ratio: auto; height: 760px; }
+  .p-lib, .p-props { display: none; }
+  .p-left { width: 220px; }
+  .status, .badge-sel { left: 240px; }
+  .ctx { display: none; }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="hero">
+    <div class="brand">
+      <div class="logo-tile">Mf</div>
+      <div>
+        <h1>Material Forge, design proposition</h1>
+        <p>A canvas-first layout in the spirit of Figma: the 3D view fills the window, the panels float over it with rounded corners, the tools live in one dock at the bottom. Click the tools, press <span class="kbd">Tab</span> to hide the interface.</p>
+      </div>
+    </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <span class="tag">v0.1 proposal</span><span class="tag">Dark theme</span><span class="tag">egui implementable</span>
+    </div>
+  </div>
+
+  <!-- ============================================================ APP MOCK -->
+  <div class="stage" id="stage">
+    <div class="floor"></div>
+    <div class="ball"></div>
+    <div class="shadow-blob"></div>
+
+    <!-- Left: project + layers -->
+    <div class="panel p-left">
+      <div class="proj">
+        <div class="logo-tile">Mf</div>
+        <div style="min-width:0">
+          <div class="name">Luljeta armor</div>
+          <div class="file">luljeta.sprp, saved</div>
+        </div>
+        <div class="spacer"></div>
+        <button class="ib" title="Menu"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
+      </div>
+      <div class="setswitch"><span class="sw"></span>Armor<span class="res">2048</span><svg class="chev" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"/></svg></div>
+      <div class="tabs"><button class="on">Layers</button><button>Texture sets</button><button>History</button></div>
+      <div class="layers" id="layers">
+        <div class="lrow"><div class="eye"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></svg></div>
+          <div class="thumb" style="background:repeating-linear-gradient(45deg,#333 0 4px,#2a2a2a 4px 8px)"></div>
+          <div class="lname"><b>Stitches</b><span>Paint</span></div><span class="op">100</span></div>
+        <div class="lrow sel"><div class="eye"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></svg></div>
+          <div class="thumb" style="background:radial-gradient(circle at 35% 30%,#e5a46c,#8a3f1c 60%,#3b1a0c)"></div>
+          <div class="mthumb sel"><div style="position:absolute;inset:0;background:radial-gradient(circle at 60% 40%,#fff 0 18%,transparent 40%),radial-gradient(circle at 30% 70%,#bbb 0 10%,transparent 30%)"></div></div>
+          <div class="lname"><b>Rust edges</b><span>Fill, mask</span></div><span class="op">100</span></div>
+        <div class="fx"><i></i>Edges generator</div>
+        <div class="fx"><i></i>Paint</div>
+        <div class="lrow"><div class="eye"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></svg></div>
+          <div class="thumb" style="background:#2c2c31;display:grid;place-items:center"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#b4b4bd" stroke-width="1.8"><path d="M3 7h7l2 2h9v10H3Z"/></svg></div>
+          <div class="lname"><b>Paint scheme</b><span>Group, 3 layers</span></div><span class="op">100</span></div>
+        <div class="lrow indent"><div class="eye"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></svg></div>
+          <div class="thumb" style="background:linear-gradient(135deg,#3a6ea8,#1f3a5c)"></div>
+          <div class="lname"><b>Blue enamel</b><span>Fill</span></div><span class="op">80</span></div>
+        <div class="lrow indent off"><div class="eye"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 3l18 18M10.6 5.1A10.4 10.4 0 0 1 12 5c6.5 0 10 7 10 7a17 17 0 0 1-3.2 4.2M6.6 6.6A17 17 0 0 0 2 12s3.5 7 10 7c1.6 0 3-.4 4.3-1"/></svg></div>
+          <div class="thumb" style="background:linear-gradient(135deg,#d8c48a,#7d6a33)"></div>
+          <div class="lname"><b>Gold trim</b><span>Fill, hidden</span></div><span class="op">100</span></div>
+        <div class="lrow indent"><div class="eye"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></svg></div>
+          <div class="thumb" style="background:conic-gradient(from 45deg,#9aa0a8,#5b6068,#c8ccd2,#5b6068,#9aa0a8)"></div>
+          <div class="lname"><b>Brushed steel</b><span>Fill</span></div><span class="op">100</span></div>
+        <div class="lrow"><div class="eye"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></svg></div>
+          <div class="thumb" style="background:linear-gradient(135deg,#4b4b50,#26262a)"></div>
+          <div class="lname"><b>Base</b><span>Fill</span></div><span class="op">100</span></div>
+      </div>
+      <div class="l-foot">
+        <button class="ib" title="Paint layer"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M14 4l6 6-9 9H5v-6z"/></svg></button>
+        <button class="ib" title="Fill layer"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="4" y="4" width="16" height="16" rx="4"/><path d="M4 14l5-4 5 4 6-5"/></svg></button>
+        <button class="ib" title="Mask"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="4" y="4" width="16" height="16" rx="4"/><circle cx="12" cy="12" r="4" fill="currentColor"/></svg></button>
+        <button class="ib" title="Effect"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 3v4M12 17v4M3 12h4M17 12h4M6 6l2.5 2.5M15.5 15.5 18 18M6 18l2.5-2.5M15.5 8.5 18 6"/></svg></button>
+        <button class="ib" title="Group"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 7h7l2 2h9v10H3Z"/></svg></button>
+        <button class="ib" title="Delete"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/></svg></button>
+      </div>
+    </div>
+
+    <!-- Top center: view bar -->
+    <div class="viewbar">
+      <div class="dd">Material<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"/></svg></div>
+      <div class="vsep"></div>
+      <div class="seg"><button class="on">3D</button><button>Split</button><button>UV</button></div>
+      <div class="vsep"></div>
+      <button class="ib" title="Perspective / orthographic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3 3 8l9 5 9-5zM3 8v8l9 5 9-5V8"/></svg></button>
+      <button class="ib" title="Lighting and environment"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5 19 19M5 19l1.5-1.5M17.5 6.5 19 5"/></svg></button>
+      <button class="ib" title="Render (path traced)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="8"/><path d="M12 4a8 8 0 0 0 0 16" fill="currentColor"/></svg></button>
+    </div>
+
+    <!-- Top right: export -->
+    <div class="export">
+      <button class="btn ghost sm" title="History"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M3 12a9 9 0 1 0 3-6.7L3 8M3 3v5h5M12 7v5l3 2"/></svg></button>
+      <button class="btn primary"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 3v12M7 10l5 5 5-5M5 21h14"/></svg>Export</button>
+    </div>
+
+    <!-- Right top: library -->
+    <div class="panel p-lib">
+      <div class="p-head"><span class="p-title">Library</span><span class="p-sub">Materials</span><div class="spacer"></div>
+        <button class="ib" title="Import"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg></button></div>
+      <div class="search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>Search materials, brushes, stamps</div>
+      <div class="chips" id="libchips"><span class="chip on">Materials</span><span class="chip">Smart</span><span class="chip">Brushes</span><span class="chip">Alphas</span><span class="chip">Textures</span><span class="chip">Masks</span><span class="chip">Lighting</span></div>
+      <div class="assets">
+        <div class="asset"><div class="sph" style="background:radial-gradient(circle at 35% 30%,#e0a06a,#9a4b22 55%,#3b170a)"></div><div class="n">Rusted iron</div></div>
+        <div class="asset"><div class="sph" style="background:radial-gradient(circle at 35% 30%,#f5e6a8,#b8902e 55%,#4d3a0c)"></div><div class="n">Polished gold</div></div>
+        <div class="asset"><div class="sph" style="background:radial-gradient(circle at 35% 30%,#7fa7c9,#3c5f84 55%,#16263a)"></div><div class="n">Blue denim</div></div>
+        <div class="asset"><div class="sph" style="background:radial-gradient(circle at 35% 30%,#d9d1c3,#8f8576 55%,#2e2a24)"></div><div class="n">White marble</div></div>
+        <div class="asset"><div class="sph" style="background:radial-gradient(circle at 35% 30%,#a07450,#5a3a22 55%,#22140a)"></div><div class="n">Oak wood</div></div>
+        <div class="asset"><div class="sph" style="background:radial-gradient(circle at 35% 30%,#7b7b80,#3e3e42 55%,#141416)"></div><div class="n">Concrete</div></div>
+        <div class="asset"><div class="sph" style="background:radial-gradient(circle at 35% 30%,#c84b3a,#7c2418 55%,#2b0a06)"></div><div class="n">Red leather</div></div>
+        <div class="asset"><div class="sph" style="background:radial-gradient(circle at 35% 30%,#bfe3c0,#4e8a52 55%,#163018)"></div><div class="n">Green plastic</div></div>
+        <div class="asset"><div class="sph" style="background:radial-gradient(circle at 35% 30%,#d6d9de,#8a9099 55%,#2b2e33)"></div><div class="n">Brushed alu</div></div>
+      </div>
+    </div>
+
+    <!-- Right bottom: properties -->
+    <div class="panel p-props">
+      <div class="p-head"><span class="p-title" id="propTitle">Brush</span><span class="p-sub" id="propSub">on Rust edges, mask</span><div class="spacer"></div>
+        <button class="ib" title="Presets"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="5" cy="12" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="19" cy="12" r="1.5"/></svg></button></div>
+      <div class="props" id="props">
+        <div class="grp">
+          <div class="grp-h">Material<span class="kbd">C</span></div>
+          <div class="matslot"><div class="sph" style="background:radial-gradient(circle at 35% 30%,#e0a06a,#9a4b22 55%,#3b170a)"></div><div><b>Rusted iron</b><span>Drop a material or pick one</span></div></div>
+          <div class="chan"><span class="on">Color</span><span class="on">Roughness</span><span class="on">Metal</span><span class="on">Height</span><span>Normal</span><span>Emissive</span><span>Opacity</span></div>
+        </div>
+        <div class="grp">
+          <div class="grp-h">Stroke</div>
+          <div class="row">Spacing<div class="slider"><div class="fill" style="width:12%"></div><div class="knob" style="left:12%"></div></div><span class="num">12 %</span></div>
+          <div class="row">Angle<div class="slider"><div class="fill" style="width:50%"></div><div class="knob" style="left:50%"></div></div><span class="num">0</span></div>
+          <div class="row">Jitter<div class="slider"><div class="fill" style="width:20%"></div><div class="knob" style="left:20%"></div></div><span class="num">20 %</span></div>
+        </div>
+        <div class="grp">
+          <div class="grp-h">Alpha</div>
+          <div class="swatch-row"><i style="background:radial-gradient(circle,#fff 0 30%,#000 70%)"></i><i style="background:radial-gradient(circle,#fff 0 50%,#000 52%)"></i><i style="background:repeating-linear-gradient(90deg,#fff 0 3px,#000 3px 6px)"></i><i style="background:radial-gradient(circle at 40% 40%,#fff 0 12%,transparent 13%),radial-gradient(circle at 70% 65%,#ddd 0 10%,#000 11%)"></i><i style="background:conic-gradient(#fff 0 25%,#000 0 50%,#fff 0 75%,#000 0)"></i></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Selection badge, status -->
+    <div class="badge-sel">Selection active <span class="kbd">Ctrl D</span></div>
+    <div class="status">60 fps, 41 230 tris, VRAM 2.1 GB, RTX 4060</div>
+    <div class="hint-tab"><span class="kbd">Tab</span> hide interface</div>
+
+    <!-- Context options above the dock -->
+    <div class="ctx" id="ctx"></div>
+
+    <!-- Bottom: the tool dock -->
+    <div class="dock" id="dock"></div>
+  </div>
+
+  <div class="legend">
+    <span><b>Left</b>: project, texture set, layers</span>
+    <span><b>Top right</b>: library</span>
+    <span><b>Bottom right</b>: properties of the tool or layer</span>
+    <span><b>Bottom</b>: tool dock and its options</span>
+    <span><b>Top center</b>: view (display, 3D / UV, camera, light, render)</span>
+  </div>
+
+  <!-- ============================================================ PRINCIPLES -->
+  <section>
+    <h2>Principles</h2>
+    <p class="lead">What changes compared to Painter, and why artists will feel it.</p>
+    <div class="grid g3">
+      <div class="card"><h3>The model is the canvas</h3><p>The 3D view fills the whole window. Panels float above it with an 8 to 10 px gap, so the model is never boxed in by docks. Tab hides everything.</p></div>
+      <div class="card"><h3>One dock for every tool</h3><p>All tools sit in a single dock at the bottom, grouped: select, paint, fill, path, utilities. The options of the active tool appear right above it, where the eye already is.</p></div>
+      <div class="card"><h3>Layers where Figma has them</h3><p>Project, texture set and layers on the left, in one column you read top to bottom. Library top right, properties bottom right: drag from the library, tune below it.</p></div>
+      <div class="card"><h3>Rounded, soft, quiet</h3><p>12 px panels, 8 px controls, pill sliders and chips. Few borders, depth from soft shadows. Color only where it means something: orange is action and selection, red is mask.</p></div>
+      <div class="card"><h3>One place per action</h3><p>Every command has one home and one shortcut. No duplicated menus, no disabled placeholders. Advanced options fold away instead of crowding the panel.</p></div>
+      <div class="card"><h3>Photoshop muscle memory</h3><p>B, E, M, L, W, G, Q, I, S, R: the keys painters already know. Hover any tool to see its key.</p></div>
+    </div>
+  </section>
+
+  <!-- ============================================================ TOKENS -->
+  <section>
+    <h2>Color</h2>
+    <p class="lead">Neutral graphite surfaces that rise in lightness, the forge orange of the logo as the only brand color, and a few meaning colors.</p>
+    <div class="swatches">
+      <div class="sw-card"><div class="c" style="background:var(--canvas)"></div><div class="m"><b>Canvas</b><span class="mono">#141416</span></div></div>
+      <div class="sw-card"><div class="c" style="background:var(--surface-0)"></div><div class="m"><b>Surface 0</b><span class="mono">#1B1B1E panels</span></div></div>
+      <div class="sw-card"><div class="c" style="background:var(--surface-1)"></div><div class="m"><b>Surface 1</b><span class="mono">#222226 fields</span></div></div>
+      <div class="sw-card"><div class="c" style="background:var(--surface-2)"></div><div class="m"><b>Surface 2</b><span class="mono">#2A2A2F buttons</span></div></div>
+      <div class="sw-card"><div class="c" style="background:var(--surface-3)"></div><div class="m"><b>Surface 3</b><span class="mono">#34343A hover</span></div></div>
+      <div class="sw-card"><div class="c" style="background:var(--surface-4)"></div><div class="m"><b>Surface 4</b><span class="mono">#3F3F46 pressed</span></div></div>
+      <div class="sw-card"><div class="c" style="background:var(--accent)"></div><div class="m"><b>Forge orange</b><span class="mono">#F26B1D action</span></div></div>
+      <div class="sw-card"><div class="c" style="background:var(--mask)"></div><div class="m"><b>Mask red</b><span class="mono">#E5484D masks</span></div></div>
+      <div class="sw-card"><div class="c" style="background:var(--success)"></div><div class="m"><b>Success</b><span class="mono">#3DD68C</span></div></div>
+      <div class="sw-card"><div class="c" style="background:var(--warning)"></div><div class="m"><b>Warning</b><span class="mono">#FFB224</span></div></div>
+      <div class="sw-card"><div class="c" style="background:var(--info)"></div><div class="m"><b>Info</b><span class="mono">#5B9DFF</span></div></div>
+      <div class="sw-card"><div class="c" style="background:linear-gradient(90deg,var(--text-1) 0 33%,var(--text-2) 0 66%,var(--text-3) 0)"></div><div class="m"><b>Text 1 / 2 / 3</b><span class="mono">#F1F1F4 #B4B4BD #7C7C86</span></div></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Shape, space, depth</h2>
+    <p class="lead">Radii grow with the size of the element. Everything sits on a 4 px grid. Shadows replace most borders.</p>
+    <div class="grid g2">
+      <div class="card"><h3>Radius</h3>
+        <div class="radius-row">
+          <div style="border-radius:4px">4 xs<br>tags</div>
+          <div style="border-radius:6px">6 sm<br>small</div>
+          <div style="border-radius:8px">8 md<br>controls</div>
+          <div style="border-radius:12px">12 lg<br>panels</div>
+          <div style="border-radius:16px">16 xl<br>dialogs</div>
+          <div style="border-radius:999px">pill<br>sliders</div>
+        </div>
+      </div>
+      <div class="card"><h3>Spacing (4 px grid)</h3>
+        <div class="space-row">
+          <div><div style="width:4px;height:4px"></div><span>4</span></div>
+          <div><div style="width:8px;height:8px"></div><span>8</span></div>
+          <div><div style="width:12px;height:12px"></div><span>12</span></div>
+          <div><div style="width:16px;height:16px"></div><span>16</span></div>
+          <div><div style="width:24px;height:24px"></div><span>24</span></div>
+          <div><div style="width:32px;height:32px"></div><span>32</span></div>
+          <div><div style="width:48px;height:48px"></div><span>48</span></div>
+        </div>
+        <p class="muted" style="margin-top:14px">Panel padding 12, row height 28 (controls) or 42 (layers), gap between floating panels and the window edge 10.</p>
+      </div>
+    </div>
+    <div class="card" style="margin-top:16px"><h3>Elevation</h3>
+      <div class="elev">
+        <div style="box-shadow:none">0, flat<br>inside panels</div>
+        <div style="box-shadow:var(--e1)">1, panels</div>
+        <div style="box-shadow:var(--e2)">2, dock, menus, popovers</div>
+        <div style="box-shadow:var(--e3)">3, dialogs</div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Type</h2>
+    <p class="lead">Inter (open font license, shipped with the app) for the interface, JetBrains Mono for numbers that change while you drag.</p>
+    <div class="card">
+      <div class="type-row"><span class="mono">32 / 700</span><span style="font-size:32px;font-weight:700;letter-spacing:-.02em">Start a new project</span></div>
+      <div class="type-row"><span class="mono">20 / 650</span><span style="font-size:20px;font-weight:650">Export textures</span></div>
+      <div class="type-row"><span class="mono">15 / 500</span><span style="font-size:15px;font-weight:500">Dialog body and empty states</span></div>
+      <div class="type-row"><span class="mono">13 / 500</span><span style="font-size:13px;font-weight:500">Default interface text, layer names</span></div>
+      <div class="type-row"><span class="mono">12 / 400</span><span style="font-size:12px;color:var(--text-2)">Labels, menu items, property names</span></div>
+      <div class="type-row"><span class="mono">11 / 600 caps</span><span style="font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--text-2)">Group headers</span></div>
+      <div class="type-row"><span class="mono">11 mono</span><span style="font-family:var(--mono);font-size:11px">Size 48 px, flow 80 %, 2048</span></div>
+    </div>
+  </section>
+
+  <!-- ============================================================ COMPONENTS -->
+  <section>
+    <h2>Components</h2>
+    <p class="lead">The full set the egui implementation needs. Every control is 28 to 34 px tall with an 8 px radius; hover lightens one surface step, pressed two.</p>
+    <div class="grid g2">
+      <div class="card"><h3>Buttons</h3>
+        <div class="comp">
+          <button class="btn primary">Export</button>
+          <button class="btn">Bake mesh maps</button>
+          <button class="btn ghost">Cancel</button>
+          <button class="btn danger">Delete layer</button>
+          <button class="btn sm">Small</button>
+          <button class="ib on" title="Icon on"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></svg></button>
+          <button class="ib" title="Icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/></svg></button>
+        </div>
+      </div>
+      <div class="card"><h3>Inputs</h3>
+        <div class="comp">
+          <input class="input" value="Rust edges" style="width:160px">
+          <span class="select">Multiply<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"/></svg></span>
+          <span class="toggle on" onclick="this.classList.toggle('on')"></span>
+          <span class="toggle" onclick="this.classList.toggle('on')"></span>
+          <div class="seg"><button class="on">Linear</button><button>Radial</button><button>Reflected</button></div>
+        </div>
+        <div class="row" style="margin-top:14px">Hardness<div class="slider"><div class="fill" style="width:65%"></div><div class="knob" style="left:65%"></div></div><span class="num">65 %</span></div>
+      </div>
+      <div class="card"><h3>Chips, keys, badges</h3>
+        <div class="comp">
+          <span class="chip on">Materials</span><span class="chip">Brushes</span><span class="chip">Alphas</span>
+          <span class="kbd">Ctrl</span><span class="kbd">Shift</span><span class="kbd">G</span>
+          <span class="tag">2048</span>
+          <span class="tag" style="background:var(--mask-soft);color:#ff8a8d;border-color:rgba(229,72,77,.35)">Mask</span>
+          <span class="tag" style="background:var(--accent-soft);color:var(--accent);border-color:var(--accent-line)">Selected</span>
+        </div>
+      </div>
+      <div class="card"><h3>Toast and selection badge</h3>
+        <div class="comp">
+          <span class="toast"><i></i>Saved luljeta.sprp</span>
+          <span class="toast"><i style="background:var(--warning)"></i>Select a layer to paint on</span>
+          <span class="badge-sel" style="position:static">Selection active <span class="kbd">Ctrl D</span></span>
+        </div>
+      </div>
+      <div class="card"><h3>Context menu</h3>
+        <div class="menu">
+          <div class="fitem">Add mask<span class="sub">&#8250;</span></div>
+          <div class="fitem">Add effect<span class="sub">&#8250;</span></div>
+          <hr>
+          <div class="fitem">Duplicate<span class="kbd">Ctrl J</span></div>
+          <div class="fitem">Group<span class="kbd">Ctrl G</span></div>
+          <div class="fitem">Solo<span class="kbd">Alt click</span></div>
+          <hr>
+          <div class="fitem" style="color:#ff8a8d">Delete<span class="kbd">Del</span></div>
+        </div>
+      </div>
+      <div class="card"><h3>Color popover</h3>
+        <div class="pop">
+          <div class="sv"><i></i></div>
+          <div class="hue"></div>
+          <div class="comp"><input class="input" value="#F26B1D" style="width:96px;font-family:var(--mono)"><div class="swatch-row"><i style="background:#f26b1d"></i><i style="background:#2b2b2f"></i><i style="background:#c9773d"></i><i style="background:#e8e2d6"></i><i style="background:#3a6ea8"></i></div></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ TOOLS -->
+  <section>
+    <h2>The tool dock</h2>
+    <p class="lead">Five groups. A group shows its last used tool; a small corner mark means a flyout with the others. Each tool's options appear in the floating bar above the dock and in the properties panel.</p>
+    <div class="grid g3" id="toolCards"></div>
+  </section>
+
+  <!-- ============================================================ MAPPING -->
+  <section>
+    <h2>From today's layout to this one</h2>
+    <p class="lead">Nothing is lost; everything gets one home.</p>
+    <div class="card" style="padding:4px 8px">
+      <table>
+        <tr><th>Today</th><th>Proposal</th></tr>
+        <tr><td>Menu bar (File, Edit, Select, Window, Viewport, Help)</td><td>The project button (logo, top left): one menu with the same entries. Select stays one click away in the dock's select group.</td></tr>
+        <tr><td>Left tool strip (18 icons)</td><td>Bottom dock, 5 groups with flyouts, options right above it.</td></tr>
+        <tr><td>Context bar above the views</td><td>Floating options bar above the dock (size, flow, hardness, modes).</td></tr>
+        <tr><td>Library on the left</td><td>Top right panel with chips instead of the icon row.</td></tr>
+        <tr><td>Layers and Properties stacked on the right</td><td>Layers on the left (with the texture set switcher and History as tabs); Properties bottom right.</td></tr>
+        <tr><td>Right icon strip (display, shadows, history, log, panels)</td><td>View bar at the top center (display, 3D / UV, camera, lighting popover, render) and History as a tab. The strip disappears.</td></tr>
+        <tr><td>Status bar</td><td>Faint text in the bottom left corner of the canvas.</td></tr>
+        <tr><td>Export button in the menu bar</td><td>Top right corner, the only orange button on screen.</td></tr>
+        <tr><td>Square panels with dark separators</td><td>Floating, 12 px radius, soft shadow, 10 px from the window edge; can be docked flush by double clicking a header.</td></tr>
+      </table>
+    </div>
+    <div class="callout"><b>Open questions for you</b>&nbsp; Floating panels over the model (as shown) or docked flush at the edges? Keep a thin menu bar for discoverability, or only the project menu? Do you want a light theme later?</div>
+  </section>
+
+</div>
+
+<script>
+// ------------------------------------------------------------ icons
+const I = {
+  rect: '<rect x="4" y="5" width="16" height="14" rx="1.5" stroke-dasharray="3 2.2"/>',
+  ellipse: '<ellipse cx="12" cy="12" rx="8.5" ry="6.5" stroke-dasharray="3 2.2"/>',
+  lasso: '<path d="M5 10c0-3 3.5-5 7.5-5S20 7 20 10s-3.5 5-7.5 5c-1.3 0-2.6-.2-3.6-.6" stroke-dasharray="3 2.2"/><path d="M8.5 14.5 7 18l3 2"/>',
+  poly: '<path d="M5 8l8-3 6 6-5 3-2 5-6-4Z" stroke-dasharray="3 2.2"/>',
+  wand: '<path d="M4 20 15 9"/><path d="M17 3v3M17 9v3M13.5 6.5h-3M23 6.5h-3"/>',
+  selbrush: '<circle cx="10" cy="14" r="6" stroke-dasharray="3 2.2"/><path d="m13 11 7-7"/>',
+  faces: '<path d="M4 8l8-4 8 4-8 4z"/><path d="M4 8v8l8 4V12M20 8v8l-8 4"/>',
+  bymap: '<circle cx="12" cy="12" r="8"/><path d="M5 9c3 2 11 2 14 0M5 15c3-2 11-2 14 0"/>',
+  brush: '<path d="M9.5 14.5c-2 0-3.5 1.5-3.5 3.5 0 1-1 2-2 2 4 1 7 0 7-3.5"/><path d="M11 13 20 4l1 1-9 9"/>',
+  eraser: '<path d="M7 20h12M5.5 14.5 14 6l5 5-8.5 8.5H8Z"/>',
+  smudge: '<path d="M8 21c0-5-2-7-2-11a3 3 0 0 1 6 0v3l1-4a2 2 0 0 1 4 1l-1 4 1-1a2 2 0 0 1 3 2l-3 6"/>',
+  clone: '<circle cx="8" cy="15" r="4"/><path d="M12 15h6M15 6v6M15 6a3 3 0 1 1 0 0"/><path d="M8 11V7h4"/>',
+  bucket: '<path d="M4 11 11 4l7 7-7 7z"/><path d="M11 4v5M19 13s2 2.5 2 4a2 2 0 0 1-4 0c0-1.5 2-4 2-4"/>',
+  gradient: '<rect x="4" y="5" width="16" height="14" rx="3"/><path d="M8 5v14M12 5v14" opacity=".55"/><path d="M16 5v14" opacity=".25"/>',
+  polyfill: '<path d="M4 9l8-5 8 5-8 5z" fill="currentColor" fill-opacity=".3"/><path d="M4 9v7l8 5 8-5V9"/>',
+  path: '<path d="M4 18c4 0 4-12 8-12s4 12 8 12"/><circle cx="4" cy="18" r="1.6" fill="currentColor"/><circle cx="12" cy="6" r="1.6" fill="currentColor"/><circle cx="20" cy="18" r="1.6" fill="currentColor"/>',
+  picker: '<path d="M14 4l6 6M12.5 5.5l6 6M17 8 7 18l-3 1 1-3L15 6"/>',
+  hide: '<path d="M3 3l18 18M10.6 5.1A10 10 0 0 1 12 5c6.5 0 10 7 10 7a17 17 0 0 1-3.2 4.2M6.6 6.6A17 17 0 0 0 2 12s3.5 7 10 7c1.6 0 3-.4 4.3-1"/>',
+  add: '<rect x="3" y="7" width="11" height="11" rx="2"/><rect x="10" y="4" width="11" height="11" rx="2"/>',
+  sub: '<rect x="3" y="7" width="11" height="11" rx="2"/><rect x="10" y="4" width="11" height="11" rx="2" stroke-dasharray="2 2"/>',
+  inter: '<rect x="3" y="7" width="11" height="11" rx="2" stroke-dasharray="2 2"/><rect x="10" y="4" width="11" height="11" rx="2" stroke-dasharray="2 2"/><rect x="10" y="7" width="4" height="8" fill="currentColor" stroke="none"/>',
+  repl: '<rect x="5" y="5" width="14" height="14" rx="2" fill="currentColor" fill-opacity=".3"/>',
+};
+const svg = (k, w = 1.8) => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="${w}" stroke-linecap="round" stroke-linejoin="round">${I[k]}</svg>`;
+
+// ------------------------------------------------------------ tools
+const groups = [
+  { name: "Select", tools: [
+    ["rect", "Rectangle select", "M"], ["ellipse", "Ellipse select", "Shift M"], ["lasso", "Lasso", "L"], ["poly", "Polygonal lasso", "Shift L"],
+    ["wand", "Magic wand", "W"], ["selbrush", "Selection brush", "Q"], ["faces", "Select faces", "U"], ["bymap", "Select by mesh map", ""] ] },
+  { name: "Paint", tools: [["brush", "Brush", "B"], ["eraser", "Eraser", "E"], ["smudge", "Smudge", "R"], ["clone", "Clone", "S"]] },
+  { name: "Fill", tools: [["bucket", "Paint bucket", "G"], ["gradient", "Gradient", "Shift G"], ["polyfill", "Polygon fill", "U"]] },
+  { name: "Path", tools: [["path", "Path (stitches, seams)", "P"]] },
+  { name: "Utilities", tools: [["picker", "Color picker", "I"], ["hide", "Hide faces", "H"]] },
+];
+const options = {
+  select: () => `<div class="modes">${["repl","add","sub","inter"].map((m,i)=>`<button class="${i==0?'on':''}" title="${["New","Add (Shift)","Subtract (Ctrl)","Intersect"][i]}">${svg(m,1.6)}</button>`).join("")}</div>
+    <span>Through</span><span class="toggle"></span><button class="btn sm ghost">All</button><button class="btn sm ghost">Invert</button><button class="btn sm">Fill</button>`,
+  wand: () => `<div class="modes">${["repl","add","sub","inter"].map((m,i)=>`<button class="${i==0?'on':''}">${svg(m,1.6)}</button>`).join("")}</div>${mini("Tolerance", 0.13, "32")}<span>Contiguous</span><span class="toggle on"></span><span>All layers</span><span class="toggle on"></span>`,
+  paint: () => `${mini("Size", 0.3, "48")}${mini("Flow", 0.8, "80 %")}${mini("Hardness", 0.65, "65 %")}<span>Lazy</span><span class="toggle"></span><span>Symmetry</span><span class="toggle"></span>`,
+  fill: () => `${mini("Tolerance", 0.13, "32")}<span>Contiguous</span><span class="toggle on"></span><div class="seg"><button class="on">Linear</button><button>Radial</button><button>Reflected</button></div>`,
+  path: () => `<div class="seg"><button class="on">Stitches</button><button>Seam</button><button>Zipper</button><button>Rivets</button></div>${mini("Spacing", 0.4, "140 %")}<span>Closed</span><span class="toggle"></span><button class="btn sm primary">Paint path</button>`,
+  util: () => `<span>Click the mesh to pick its material</span>`,
+};
+function mini(label, v, txt) {
+  return `<div class="mini">${label}<div class="slider"><div class="fill" style="width:${v*100}%"></div><div class="knob" style="left:${v*100}%"></div></div><b>${txt}</b></div>`;
+}
+const optionOf = { Select: (k) => k === "wand" ? "wand" : "select", Paint: () => "paint", Fill: () => "fill", Path: () => "path", Utilities: () => "util" };
+const state = { group: 1, tool: { 0: "rect", 1: "brush", 2: "bucket", 3: "path", 4: "picker" } };
+
+function renderDock() {
+  const dock = document.getElementById("dock");
+  dock.innerHTML = "";
+  groups.forEach((g, gi) => {
+    if (gi) dock.insertAdjacentHTML("beforeend", '<div class="dsep"></div>');
+    const k = state.tool[gi];
+    const t = g.tools.find(t => t[0] === k);
+    const b = document.createElement("button");
+    b.className = "tool" + (state.group === gi ? " on" : "");
+    b.innerHTML = svg(k) + (g.tools.length > 1 ? '<span class="more"></span>' : "") + `<span class="tip">${t[1]}${t[2] ? `<span class="kbd">${t[2]}</span>` : ""}</span>`;
+    b.onclick = (e) => {
+      if (state.group === gi && g.tools.length > 1) { toggleFly(gi, b); }
+      else { state.group = gi; closeFly(); renderDock(); renderCtx(); }
+      e.stopPropagation();
+    };
+    const wrap = document.createElement("div");
+    wrap.style.position = "relative";
+    wrap.appendChild(b);
+    if (g.tools.length > 1) {
+      const fly = document.createElement("div");
+      fly.className = "flyout";
+      fly.dataset.g = gi;
+      fly.innerHTML = `<div class="p-sub" style="padding:4px 8px 6px">${g.name}</div>` + g.tools.map(t => `<div class="fitem ${t[0] === k ? 'on' : ''}" data-k="${t[0]}">${svg(t[0])}${t[1]}${t[2] ? `<span class="kbd">${t[2]}</span>` : ""}</div>`).join("");
+      fly.querySelectorAll(".fitem").forEach(it => it.onclick = (e) => { state.tool[gi] = it.dataset.k; state.group = gi; closeFly(); renderDock(); renderCtx(); e.stopPropagation(); });
+      wrap.appendChild(fly);
+    }
+    dock.appendChild(wrap);
+  });
+}
+function toggleFly(gi) {
+  document.querySelectorAll(".flyout").forEach(f => f.classList.toggle("open", f.dataset.g == gi && !f.classList.contains("open")));
+}
+function closeFly() { document.querySelectorAll(".flyout").forEach(f => f.classList.remove("open")); }
+document.addEventListener("click", closeFly);
+
+function renderCtx() {
+  const g = groups[state.group];
+  const k = state.tool[state.group];
+  document.getElementById("ctx").innerHTML = `<b style="color:var(--text-1);font-weight:600">${g.tools.find(t => t[0] === k)[1]}</b><span class="vsep"></span>` + options[optionOf[g.name](k)]();
+  document.getElementById("propTitle").textContent = g.tools.find(t => t[0] === k)[1];
+  document.getElementById("propSub").textContent = g.name === "Select" ? "on Armor" : "on Rust edges, mask";
+  document.querySelectorAll("#ctx .toggle").forEach(t => t.onclick = () => t.classList.toggle("on"));
+}
+
+// Tool cards (section).
+const tc = document.getElementById("toolCards");
+groups.forEach(g => {
+  tc.insertAdjacentHTML("beforeend", `<div class="card"><h3>${g.name}</h3>${g.tools.map(t => `<div class="fitem" style="cursor:default">${svg(t[0])}${t[1]}${t[2] ? `<span class="kbd">${t[2]}</span>` : ""}</div>`).join("")}</div>`);
+});
+
+// Layers: click selects, eye toggles.
+document.querySelectorAll(".lrow").forEach(r => {
+  r.onclick = (e) => {
+    if (e.target.closest(".eye")) { r.classList.toggle("off"); return; }
+    document.querySelectorAll(".lrow").forEach(x => x.classList.remove("sel"));
+    r.classList.add("sel");
+  };
+});
+document.querySelectorAll("#libchips .chip, .tabs button, .seg button").forEach(c => c.addEventListener("click", () => {
+  [...c.parentElement.children].forEach(x => x.classList.remove("on"));
+  c.classList.add("on");
+}));
+
+// Tab hides the interface.
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Tab") { e.preventDefault(); document.getElementById("stage").classList.toggle("hidden-ui"); }
+});
+
+renderDock();
+renderCtx();
+</script>
+</body>
+</html>

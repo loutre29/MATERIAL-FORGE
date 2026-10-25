@@ -3,7 +3,7 @@
 ; Output: dist\MaterialForge-Setup-<version>.exe
 
 #define AppName "Material Forge"
-#define AppVersion "0.1.0"
+#define AppVersion "0.2.0"
 #define AppExe "material_forge.exe"
 
 [Setup]
@@ -35,6 +35,10 @@ Name: "assoc"; Description: "Open Material Forge projects (.sprp) with {#AppName
 [Files]
 Source: "..\target\release\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "TESTERS.txt"; DestDir: "{app}"; Flags: ignoreversion isreadme
+; Texture materials of the Assets shelf (CC0, Poly Haven and ambientCG).
+Source: "..\starter_assets\*"; DestDir: "{app}\starter_assets"; Flags: ignoreversion recursesubdirs createallsubdirs
+; Intel Open Image Denoise (Apache 2.0): the render mode denoiser, loaded at runtime.
+Source: "..\third_party\oidn\*"; DestDir: "{app}\oidn"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExe}"

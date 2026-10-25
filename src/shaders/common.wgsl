@@ -138,13 +138,17 @@ fn levels(v: f32, in_lo: f32, in_hi: f32, gamma: f32, out_lo: f32, out_hi: f32) 
 
 // ---------------------------------------------------------------- layer blending
 
-// Accumulated material: col = (base rgb, opacity), mrh = (rough, metal, height, 0),
-// emi = (emissive rgb, 0), nrm = (tangent normal xyz, 0).
+// Accumulated material: col = (base rgb, opacity), mrh = (rough, metal, height,
+// specular level), emi = (emissive rgb, transmission), nrm = (tangent normal
+// xyz, hidden height: the part of the height whose relief a Replace above
+// hid; finalize derives the normal from height - hidden), x = the other
+// optional channels, four per group (`document::EXT_NAMES` from the third).
 struct Acc {
     col: vec4<f32>,
     mrh: vec4<f32>,
     emi: vec4<f32>,
     nrm: vec4<f32>,
+    x: array<vec4<f32>, 3>,
 };
 
 // Straight layer values with per-channel coverage.
@@ -160,9 +164,12 @@ struct Sample {
     nrm: vec3<f32>,
     a_nrm: f32,
     opa: f32,
-    // Optional channels: specular level, transmission (normal blending).
+    // Optional channels: specular level, transmission (normal blending),
+    // then the groups of the others with their coverage.
     ext: vec2<f32>,
     a_ext: vec2<f32>,
+    x: array<vec4<f32>, 3>,
+    a_x: array<vec4<f32>, 3>,
 };
 
 // Blends one layer sample over the accumulator. mode/op: color, rough,
@@ -186,11 +193,31 @@ fn blend_layer(a: Acc, s: Sample, m: f32, mode_a: vec4<u32>, mode_b: vec4<u32>, 
         mix(a.mrh.w, s.ext.x, clamp(s.a_ext.x * m * op_b.w, 0.0, 1.0))
     );
     o.emi = vec4<f32>(mix(a.emi.rgb, blend3(mode_b.x, a.emi.rgb, s.emi), w4), mix(a.emi.w, s.ext.y, clamp(s.a_ext.y * m * op_b.w, 0.0, 1.0)));
-    var n = a.nrm.xyz;
-    if w6 > 0.0 {
-        n = blend_normal(mode_b.z, a.nrm.xyz, s.nrm, w6);
+    // Replace hides the relief below, whichever of its two channels made
+    // it: Replace on the height flattens the normals below, Replace on the
+    // normal hides the height below (its relief, not its value).
+    var nb = a.nrm.xyz;
+    if mode_a.w == 1u && w3 > 0.0 {
+        nb = safe_normalize(mix(nb, vec3<f32>(0.0, 0.0, 1.0), w3));
     }
-    o.nrm = vec4<f32>(n, a.nrm.w);
+    var n = nb;
+    if w6 > 0.0 {
+        n = blend_normal(mode_b.z, nb, s.nrm, w6);
+    }
+    var hidden = a.nrm.w;
+    if mode_b.z == 1u {
+        hidden = mix(hidden, a.mrh.z, w6);
+    }
+    // A height that replaces takes the hidden part away with it.
+    if mode_a.w <= 1u {
+        hidden = hidden * (1.0 - w3);
+    }
+    o.nrm = vec4<f32>(n, hidden);
+    // (Value arrays take constant indices only.)
+    let wx = clamp(m * op_b.w, 0.0, 1.0);
+    o.x[0] = mix(a.x[0], s.x[0], clamp(s.a_x[0] * wx, vec4<f32>(0.0), vec4<f32>(1.0)));
+    o.x[1] = mix(a.x[1], s.x[1], clamp(s.a_x[1] * wx, vec4<f32>(0.0), vec4<f32>(1.0)));
+    o.x[2] = mix(a.x[2], s.x[2], clamp(s.a_x[2] * wx, vec4<f32>(0.0), vec4<f32>(1.0)));
     return o;
 }
 

@@ -14,6 +14,8 @@ struct Camera {
     light_view_proj: mat4x4<f32>,
     // xyz direction toward the key light, w intensity
     light: vec4<f32>,
+    // wireframe color (linear), opacity
+    wire: vec4<f32>,
 };
 
 struct SetParams {
@@ -26,6 +28,8 @@ struct SetParams {
 @group(0) @binding(2) var env_samp: sampler;
 @group(0) @binding(3) var shadow_map: texture_depth_2d;
 @group(0) @binding(4) var shadow_samp: sampler_comparison;
+// GGX-prefiltered environment: mip = roughness * 5 (env.rs SPEC_LEVELS).
+@group(0) @binding(5) var env_spec: texture_2d<f32>;
 
 @group(1) @binding(0) var t_base: texture_2d<f32>;
 @group(1) @binding(1) var t_orm: texture_2d<f32>;
@@ -51,6 +55,23 @@ fn equirect_uv(d: vec3<f32>) -> vec2<f32> {
 
 fn sample_env(d: vec3<f32>, lod: f32) -> vec3<f32> {
     return textureSampleLevel(env_tex, env_samp, equirect_uv(env_space(normalize(d))), lod).rgb;
+}
+
+// Transmission (fs_transmit): the opaque scene already drawn behind the
+// surface, copied after the opaque pass.
+@group(2) @binding(0) var scene_tex: texture_2d<f32>;
+@group(2) @binding(1) var scene_samp: sampler;
+// Depth (0..1) of the opaque scene, resolved from the MSAA depth.
+@group(2) @binding(2) var scene_depth: texture_2d<f32>;
+// Back faces of the transmissive sets: outward normal, distance from the
+// eye (0: none).
+@group(2) @binding(3) var back_tex: texture_2d<f32>;
+var<private> g_through: vec3<f32>;
+var<private> g_scene: bool;
+
+// Reflection of roughness `rough` in direction `d`.
+fn sample_spec(d: vec3<f32>, rough: f32) -> vec3<f32> {
+    return textureSampleLevel(env_spec, env_samp, equirect_uv(env_space(normalize(d))), clamp(rough, 0.0, 1.0) * 5.0).rgb;
 }
 
 fn sh_diffuse(n_world: vec3<f32>) -> vec3<f32> {
@@ -149,16 +170,46 @@ fn shadow(world: vec3<f32>, n: vec3<f32>) -> f32 {
     return mix(1.0, s / 9.0, cam.display.z);
 }
 
+// High quality magnification: a cubic B-spline from four bilinear taps
+// (texels never show as squares when the camera is close), faded in only
+// where a texel covers more than a screen pixel.
+fn sample_hq(t: texture_2d<f32>, uv: vec2<f32>, mag: f32) -> vec4<f32> {
+    let lin = textureSample(t, mat_samp, uv);
+    let dims = vec2<f32>(textureDimensions(t));
+    let p = uv * dims - 0.5;
+    let f = fract(p);
+    let i = p - f;
+    let f2 = f * f;
+    let f3 = f2 * f;
+    let w0 = (1.0 - 3.0 * f + 3.0 * f2 - f3) / 6.0;
+    let w1 = (4.0 - 6.0 * f2 + 3.0 * f3) / 6.0;
+    let w2 = (1.0 + 3.0 * f + 3.0 * f2 - 3.0 * f3) / 6.0;
+    let w3 = f3 / 6.0;
+    let g0 = w0 + w1;
+    let g1 = w2 + w3;
+    let h0 = (w1 / g0 - 1.0 + i + 0.5) / dims;
+    let h1 = (w3 / g1 + 1.0 + i + 0.5) / dims;
+    let ddx = dpdx(uv);
+    let ddy = dpdy(uv);
+    let c = g0.y * (g0.x * textureSampleGrad(t, mat_samp, vec2<f32>(h0.x, h0.y), ddx, ddy) + g1.x * textureSampleGrad(t, mat_samp, vec2<f32>(h1.x, h0.y), ddx, ddy))
+        + g1.y * (g0.x * textureSampleGrad(t, mat_samp, vec2<f32>(h0.x, h1.y), ddx, ddy) + g1.x * textureSampleGrad(t, mat_samp, vec2<f32>(h1.x, h1.y), ddx, ddy));
+    return mix(lin, c, mag);
+}
+
 fn shade(in: VsOut, front: bool) -> vec4<f32> {
-    let base4 = textureSample(t_base, mat_samp, in.uv);
+    // Texels per screen pixel: below 1 the texture is magnified.
+    let tpp = max(length(dpdx(in.uv)), length(dpdy(in.uv))) * f32(textureDimensions(t_base).x);
+    let mag = 1.0 - smoothstep(0.6, 1.0, tpp);
+    let base4 = sample_hq(t_base, in.uv, mag);
     let base = base4.rgb;
-    let orm = textureSample(t_orm, mat_samp, in.uv);
-    let nts = textureSample(t_normal, mat_samp, in.uv).xyz;
-    let emi4 = textureSample(t_emi, mat_samp, in.uv);
+    let orm = sample_hq(t_orm, in.uv, mag);
+    let n4 = sample_hq(t_normal, in.uv, mag);
+    let nts = n4.xyz;
+    let emi4 = sample_hq(t_emi, in.uv, mag);
     let emi = emi4.rgb;
     // Optional channels (spare .w of the finals).
     let spec_level = emi4.a;
-    let transmission = textureSample(t_normal, mat_samp, in.uv).a;
+    let transmission = n4.a;
     let disp = textureSample(t_disp, mat_samp, in.uv);
 
     var ng = normalize(in.normal);
@@ -193,13 +244,21 @@ fn shade(in: VsOut, front: bool) -> vec4<f32> {
             let kind = u32(S.k.w + 0.5);
             if kind == 1u { return as_data(disp.rgb); }
             if kind == 2u { return as_data(normalize(disp.xyz) * 0.5 + 0.5); }
+            // An optional channel: one component of its group's final.
+            if kind >= 3u { return as_data(vec3<f32>(disp[min(kind - 3u, 3u)])); }
             return as_data(vec3<f32>(disp.r));
         }
         default: {}
     }
 
     let v = normalize(cam.eye.xyz - in.world);
-    let rough = clamp(orm.g, 0.03, 1.0);
+    // Specular anti-aliasing (Toksvig): bumps smaller than a pixel average
+    // into a shorter normal in the mips; their spread becomes roughness,
+    // so a bumpy surface seen from afar (or in a thumbnail) keeps its look.
+    let nl = length(n4.xyz);
+    let nvar = clamp((1.0 - nl) / max(nl, 1e-3), 0.0, 1.0);
+    let r0 = clamp(orm.g, 0.03, 1.0);
+    let rough = clamp(sqrt(sqrt(min(r0 * r0 * r0 * r0 + nvar * 2.0, 1.0))), 0.03, 1.0);
     let metal = clamp(orm.b, 0.0, 1.0);
     let ao = orm.r;
     let f0 = mix(vec3<f32>(0.08 * spec_level), base, metal);
@@ -214,9 +273,8 @@ fn shade(in: VsOut, front: bool) -> vec4<f32> {
     let spec_color = f0 * ab.x + ab.y;
 
     let refl = reflect(-v, n);
-    let lod = sqrt(rough) * cam.env.w;
     let sh = shadow(in.world, ng);
-    let spec = sample_env(refl, lod) * spec_color;
+    let spec = sample_spec(refl, rough) * spec_color;
     let diffuse = base * (1.0 - metal) * sh_diffuse(n);
     let spec_occ = clamp(pow(ndv + ao, exp2(-16.0 * rough - 1.0)) - 1.0 + ao, 0.0, 1.0);
 
@@ -238,7 +296,11 @@ fn shade(in: VsOut, front: bool) -> vec4<f32> {
     // base color, where the surface does not reflect.
     if transmission > 0.001 {
         let fr = clamp(spec_color.g, 0.0, 1.0);
-        let through = sample_env(refract(-v, n, 1.0 / 1.45), lod) * base;
+        var through = sample_spec(refract(-v, n, 1.0 / 1.45), rough) * base;
+        if g_scene {
+            // What is really behind the surface, tinted by the base color.
+            through = g_through * base;
+        }
         color = mix(color, through * (1.0 - fr) + spec * spec_occ, transmission * (1.0 - metal));
     }
     color += emi * S.k.z;
@@ -254,6 +316,119 @@ fn fs_mesh(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f
     let amode = u32(S.k.x + 0.5);
     if amode == 1u && textureSample(t_base, mat_samp, in.uv).a < S.k.y { discard; }
     return c;
+}
+
+// Normal-mapped shading normal facing the viewer (as in `shade`).
+fn surface_normal(in: VsOut, front: bool) -> vec3<f32> {
+    let nts = textureSample(t_normal, mat_samp, in.uv).xyz;
+    var ng = normalize(in.normal);
+    if !front { ng = -ng; }
+    var t = in.tangent.xyz - ng * dot(ng, in.tangent.xyz);
+    if dot(t, t) < 1e-12 {
+        t = select(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), abs(ng.x) > 0.9);
+        t = t - ng * dot(ng, t);
+    }
+    t = normalize(t);
+    let b = cross(ng, t) * select(1.0, -1.0, in.tangent.w < 0.0);
+    return normalize(t * nts.x + b * nts.y + ng * max(nts.z, 0.0001));
+}
+
+// World position of screen uv at depth `z` (0..1).
+fn unproject(uv: vec2<f32>, z: f32) -> vec3<f32> {
+    let w = cam.inv_view_proj * vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, z, 1.0);
+    return w.xyz / w.w;
+}
+
+// Back faces of transmissive sets for the two-sided refraction.
+@fragment
+fn fs_backface(in: VsOut) -> @location(0) vec4<f32> {
+    return vec4<f32>(surface_normal(in, true), distance(in.world, cam.eye.xyz));
+}
+
+fn screen_uv(q: vec3<f32>) -> vec2<f32> {
+    let c = cam.view_proj * vec4<f32>(q, 1.0);
+    if c.w <= 1e-5 { return vec2<f32>(-1.0); }
+    return vec2<f32>(c.x / c.w * 0.5 + 0.5, 0.5 - c.y / c.w * 0.5);
+}
+
+// The opaque scene seen along ray (o, d): its color where the ray meets it
+// (screen space, from the pixel `uv` the ray leaves at), or the environment
+// when nothing but sky lies behind. Blurred by `spread` (frosted glass).
+fn scene_along(o: vec3<f32>, d: vec3<f32>, uv: vec2<f32>, rough: f32) -> vec3<f32> {
+    let dims = vec2<f32>(textureDimensions(scene_tex));
+    let pix = vec2<i32>(clamp(uv, vec2<f32>(0.0), vec2<f32>(0.9999)) * dims);
+    let zo = textureLoad(scene_depth, pix, 0).r;
+    if zo >= 0.99999 {
+        return sample_spec(d, rough);
+    }
+    let po = unproject(uv, zo);
+    let dist = distance(o, po);
+    let uvq = screen_uv(o + d * dist);
+    if any(uvq < vec2<f32>(0.0)) || any(uvq > vec2<f32>(1.0)) {
+        return sample_spec(d, rough);
+    }
+    let spread = rough * rough * (0.02 + 0.25 * dist / cam.eye.w);
+    var acc = textureSampleLevel(scene_tex, scene_samp, uvq, 0.0).rgb;
+    for (var i = 0; i < 12; i++) {
+        let a = f32(i) * 2.39996;
+        let k = sqrt((f32(i) + 0.5) / 12.0);
+        acc += textureSampleLevel(scene_tex, scene_samp, clamp(uvq + vec2<f32>(cos(a), sin(a)) * spread * k, vec2<f32>(0.0), vec2<f32>(1.0)), 0.0).rgb;
+    }
+    return acc / 13.0;
+}
+
+// Transmission (two-sided refraction, IOR 1.45): the view ray refracts into
+// the surface, crosses the volume to the back face recorded for this pixel
+// region, refracts out with that face's normal (total internal reflection
+// reflects) and continues to the opaque scene or the environment. A
+// surface with no back face (a sheet) passes the scene straight through.
+@fragment
+fn fs_transmit(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
+    let dims = vec2<f32>(textureDimensions(scene_tex));
+    let uv0 = in.clip.xy / dims;
+    let pix = vec2<i32>(in.clip.xy);
+    let n = surface_normal(in, front);
+    let v = normalize(cam.eye.xyz - in.world);
+    let rough = clamp(textureSample(t_orm, mat_samp, in.uv).g, 0.0, 1.0);
+    let ior = 1.45;
+    var through: vec3<f32>;
+    let back0 = textureLoad(back_tex, pix, 0);
+    let rd1 = refract(-v, n, 1.0 / ior);
+    if dot(rd1, rd1) < 1e-6 {
+        through = sample_spec(reflect(-v, n), rough);
+    } else if back0.w <= 0.0 || !front {
+        // Thin sheet (or seen from inside): straight through.
+        through = scene_along(in.world, -v, uv0, rough);
+    } else {
+        // Exit point: along the refracted ray as far as the back face is
+        // behind this pixel, then snapped onto the back face there.
+        let d0 = max(back0.w - distance(in.world, cam.eye.xyz), 0.0);
+        var p1 = in.world + rd1 * d0;
+        var uv1 = screen_uv(p1);
+        var nb = back0.xyz;
+        if all(uv1 >= vec2<f32>(0.0)) && all(uv1 <= vec2<f32>(1.0)) {
+            let b1 = textureLoad(back_tex, vec2<i32>(uv1 * dims), 0);
+            if b1.w > 0.0 {
+                p1 = cam.eye.xyz + normalize(p1 - cam.eye.xyz) * b1.w;
+                nb = b1.xyz;
+            }
+        } else {
+            uv1 = uv0;
+        }
+        // Leaving the glass: the normal must face the ray.
+        let nin = -normalize(nb);
+        var rd2 = refract(rd1, nin, ior);
+        if dot(rd2, rd2) < 1e-6 {
+            rd2 = reflect(rd1, nin);
+        }
+        through = scene_along(p1, normalize(rd2), uv1, rough);
+    }
+    g_through = through;
+    g_scene = true;
+    let c = shade(in, front);
+    // Alpha blend mode: the opacity mixes over what is behind.
+    let behind = textureSampleLevel(scene_tex, scene_samp, uv0, 0.0).rgb;
+    return vec4<f32>(mix(behind, c.rgb, clamp(c.a, 0.0, 1.0)), 1.0);
 }
 
 // Depth of the (nearly) opaque texels of an alpha-blended set.
@@ -279,5 +454,5 @@ fn vs_wire(v: VsIn) -> @builtin(position) vec4<f32> {
 
 @fragment
 fn fs_wire() -> @location(0) vec4<f32> {
-    return vec4<f32>(0.85, 0.85, 0.9, 0.35);
+    return cam.wire;
 }

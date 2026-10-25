@@ -32,7 +32,12 @@ struct FillParams {
     n0: vec4<f32>,
     n1: vec4<f32>,
     n2: vec4<f32>,
-    ch: array<ChanSrc, 9>,
+    // UV projection: stretch u, v, wrap (0 repeat, 1 none, 2 horizontal,
+    // 3 vertical), filter (0 bilinear HQ, 1 sharp, 2 nearest); pivot u, v
+    uvx: vec4<f32>,
+    uvp: vec4<f32>,
+    // The seven core channels, then the optional ones (`document::NEXT`).
+    ch: array<ChanSrc, 21>,
 };
 @group(0) @binding(0) var<uniform> F: FillParams;
 @group(0) @binding(1) var t0: texture_2d<f32>;
@@ -54,6 +59,12 @@ struct FillParams {
 @group(0) @binding(17) var o_mrh: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(18) var o_emi: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(19) var o_nrm: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(20) var a_x0: texture_2d<f32>;
+@group(0) @binding(21) var a_x1: texture_2d<f32>;
+@group(0) @binding(22) var a_x2: texture_2d<f32>;
+@group(0) @binding(23) var o_x0: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(24) var o_x1: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(25) var o_x2: texture_storage_2d<rgba16float, write>;
 
 fn tex_at(slot: u32, uv: vec2<f32>, lod: f32) -> vec4<f32> {
     switch slot {
@@ -73,7 +84,45 @@ fn fill_mirror() -> vec2<f32> {
 }
 
 fn uv_xform(uv: vec2<f32>) -> vec2<f32> {
-    return rotate2((uv - 0.5) * fill_mirror(), F.proj.z) * F.proj.y + 0.5 + F.offs.xy;
+    let st = select(vec2<f32>(1.0), F.uvx.xy, abs(F.uvx.x) > 1e-6);
+    return rotate2((uv - F.uvp.xy) * fill_mirror(), F.proj.z) * F.proj.y * st + F.uvp.xy + F.offs.xy;
+}
+
+// UV Wrap: whether the projected point is covered (outside the single
+// tile of a non-repeating axis it is not).
+fn uv_wrap_inside(t: vec2<f32>) -> bool {
+    let inu = t.x >= 0.0 && t.x <= 1.0;
+    let inv = t.y >= 0.0 && t.y <= 1.0;
+    switch u32(F.uvx.z + 0.5) {
+        case 1u: { return inu && inv; }
+        case 2u: { return inv; }
+        case 3u: { return inu; }
+        default: { return true; }
+    }
+}
+
+fn tex_dims(slot: u32) -> vec2<f32> {
+    switch slot {
+        case 0u: { return vec2<f32>(textureDimensions(t0)); }
+        case 1u: { return vec2<f32>(textureDimensions(t1)); }
+        case 2u: { return vec2<f32>(textureDimensions(t2)); }
+        case 3u: { return vec2<f32>(textureDimensions(t3)); }
+        case 4u: { return vec2<f32>(textureDimensions(t4)); }
+        case 5u: { return vec2<f32>(textureDimensions(t5)); }
+        default: { return vec2<f32>(textureDimensions(t6)); }
+    }
+}
+
+// UV projection sample with the layer's filtering.
+fn tex_uv(slot: u32, t: vec2<f32>, lod: f32) -> vec4<f32> {
+    switch u32(F.uvx.w + 0.5) {
+        case 1u: { return tex_at(slot, t, max(lod - 1.0, 0.0)); }
+        case 2u: {
+            let d = tex_dims(slot);
+            return tex_at(slot, (floor(fract(t) * d) + 0.5) / d, 0.0);
+        }
+        default: { return tex_at(slot, t, lod); }
+    }
 }
 
 fn tri_weights(n: vec3<f32>) -> vec3<f32> {
@@ -98,7 +147,7 @@ fn sample_proj(slot: u32, lod: f32, uv: vec2<f32>, pos_in: vec3<f32>, wn_in: vec
     let pos = proj_pos(pos_in);
     let wn = proj_nrm(wn_in);
     switch mode {
-        case 0u: { return tex_at(slot, uv_xform(uv), lod); }
+        case 0u: { return tex_uv(slot, uv_xform(uv), lod); }
         case 2u: { return tex_at(slot, pos.zy * s + F.offs.xy, lod); }
         case 3u: { return tex_at(slot, pos.xz * s + F.offs.xy, lod); }
         case 4u: { return tex_at(slot, pos.xy * s + F.offs.xy, lod); }
@@ -128,6 +177,10 @@ fn proc_coords(uv: vec2<f32>, pos_in: vec3<f32>) -> vec3<f32> {
 fn channel(c: u32, uv: vec2<f32>, pos: vec3<f32>, wn: vec3<f32>) -> vec4<f32> {
     let src = F.ch[c];
     if src.k.w == 0u { return vec4<f32>(0.0); }
+    // UV Wrap: nothing outside a non-repeated tile.
+    if src.k.x != 0u && u32(F.proj.x + 0.5) == 0u && !uv_wrap_inside(uv_xform(uv)) {
+        return vec4<f32>(0.0);
+    }
     switch src.k.x {
         case 1u: {
             var t = sample_proj(u32(src.t.y), src.t.x, uv, pos, wn);
@@ -142,11 +195,16 @@ fn channel(c: u32, uv: vec2<f32>, pos: vec3<f32>, wn: vec3<f32>) -> vec4<f32> {
                 if c == 6u { return vec4<f32>(0.0, 0.0, 1.0, 1.0); }
                 return vec4<f32>(mix(src.a.rgb, src.b.rgb, t.r), 1.0);
             }
-            if c == 0u || c == 4u { return vec4<f32>(t.rgb * src.a.rgb, 1.0); }
+            // Color images keep their transparency (a decal, a logo).
+            if c == 0u || c == 4u { return vec4<f32>(t.rgb * src.a.rgb, t.a); }
             return vec4<f32>(mix(src.a.x, src.b.x, t.r), 0.0, 0.0, 1.0);
         }
         case 2u: {
             let p = proc_coords(uv, pos) * select(1.0, src.t.w, src.t.w > 0.0);
+            // Normal generators give the normal channel its own normals.
+            if c == 6u && src.k.y == 27u {
+                return vec4<f32>(flake(p, ProcParams(src.pa, src.pb)).xyz, 1.0);
+            }
             let v = proc_eval(src.k.y, p, ProcParams(src.pa, src.pb));
             if c == 6u { return vec4<f32>(0.0, 0.0, 1.0, 1.0); }
             return vec4<f32>(mix(src.a.rgb, src.b.rgb, v), 1.0);
@@ -173,29 +231,48 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {
     let e = channel(4u, uv, pos, wn);
     let o = channel(5u, uv, pos, wn);
     let n = channel(6u, uv, pos, wn);
+    // Where a base color image is transparent the whole layer is: its
+    // other channels too.
+    let c0 = F.ch[0];
+    let cut = select(1.0, col.w, c0.k.w != 0u && c0.k.x == 1u && (c0.k.z & 4u) == 0u);
     var smp: Sample;
     smp.col = col.rgb;
     smp.a_col = col.w;
     smp.val = vec3<f32>(r.x, m.x, h.x);
-    smp.a_val = vec4<f32>(r.w, m.w, h.w, o.w);
+    smp.a_val = vec4<f32>(r.w, m.w, h.w, o.w) * cut;
     smp.emi = e.rgb;
-    smp.a_emi = e.w;
+    smp.a_emi = e.w * cut;
     smp.nrm = n.xyz;
-    smp.a_nrm = n.w;
+    smp.a_nrm = n.w * cut;
     smp.opa = o.x;
     let x0 = channel(7u, uv, pos, wn);
     let x1 = channel(8u, uv, pos, wn);
     smp.ext = vec2<f32>(x0.x, x1.x);
-    smp.a_ext = vec2<f32>(x0.w, x1.w);
+    smp.a_ext = vec2<f32>(x0.w, x1.w) * cut;
+    for (var gi = 0u; gi < 3u; gi++) {
+        var v = vec4<f32>(0.0);
+        var w = vec4<f32>(0.0);
+        for (var k = 0u; k < 4u; k++) {
+            let q = channel(9u + gi * 4u + k, uv, pos, wn);
+            v[k] = q.x;
+            w[k] = q.w;
+        }
+        smp.x[gi] = v;
+        smp.a_x[gi] = w * cut;
+    }
     let md = vec2<i32>(textureDimensions(mask));
     var mk = 1.0;
     if F.mode_b.w == 1u && md.x > 1 { mk = textureLoad(mask, id, 0).r; }
-    let acc = Acc(textureLoad(a_col, id, 0), textureLoad(a_mrh, id, 0), textureLoad(a_emi, id, 0), textureLoad(a_nrm, id, 0));
+    let ax = array<vec4<f32>, 3>(textureLoad(a_x0, id, 0), textureLoad(a_x1, id, 0), textureLoad(a_x2, id, 0));
+    let acc = Acc(textureLoad(a_col, id, 0), textureLoad(a_mrh, id, 0), textureLoad(a_emi, id, 0), textureLoad(a_nrm, id, 0), ax);
     let res_acc = blend_layer(acc, smp, mk, F.mode_a, F.mode_b, F.op_a, F.op_b);
     textureStore(o_col, id, res_acc.col);
     textureStore(o_mrh, id, res_acc.mrh);
     textureStore(o_emi, id, res_acc.emi);
     textureStore(o_nrm, id, res_acc.nrm);
+    textureStore(o_x0, id, res_acc.x[0]);
+    textureStore(o_x1, id, res_acc.x[1]);
+    textureStore(o_x2, id, res_acc.x[2]);
 }
 
 //// ENTRY mask

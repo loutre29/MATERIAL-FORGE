@@ -1,6 +1,7 @@
 // Embeds the Material Forge icon in the Windows executable.
 fn main() {
     println!("cargo:rerun-if-changed=assets/material_forge.ico");
+    println!("cargo:rerun-if-changed=assets/material_forge_logo.png");
     #[cfg(windows)]
     {
         if std::path::Path::new("assets/material_forge.ico").exists() {

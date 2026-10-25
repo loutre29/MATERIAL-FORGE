@@ -2,9 +2,9 @@
 // "//// ENTRY" markers: each section becomes its own module (one entry point
 // per module so automatic bind group layouts include every binding).
 //
-// Accumulator slot (4 x rgba16f): col = (base rgb, opacity), mrh =
-// (roughness, metallic, height, 0), emi = (emissive rgb, 0), nrm = (tangent
-// normal xyz, 0).
+// Accumulator slot (7 x rgba16f, see `Acc` in common.wgsl): col, mrh, emi,
+// nrm, then x0..x2, the optional channel groups (1x1 while the set uses
+// none of them: their reads and writes then do nothing that matters).
 // Layer content (paint textures or a fill evaluation): col = (rgb*a, a),
 // val = (r, m, h premultiplied, 0), alp = (a_r, a_m, a_h, a_o),
 // emi = (rgb*a, a), nrm = (xyz*a, a), opa = (opacity * a_o).
@@ -13,12 +13,15 @@
 // masks) are tile local, set textures (paint, mesh maps, finals) global.
 
 //// ENTRY clear
-struct ClearParams { col: vec4<f32>, mrh: vec4<f32>, emi: vec4<f32>, nrm: vec4<f32> };
+struct ClearParams { col: vec4<f32>, mrh: vec4<f32>, emi: vec4<f32>, nrm: vec4<f32>, x0: vec4<f32>, x1: vec4<f32>, x2: vec4<f32> };
 @group(0) @binding(0) var<uniform> C: ClearParams;
 @group(0) @binding(1) var o_col: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(2) var o_mrh: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(3) var o_emi: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(4) var o_nrm: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(5) var o_x0: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(6) var o_x1: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(7) var o_x2: texture_storage_2d<rgba16float, write>;
 
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) g: vec3<u32>) {
@@ -28,6 +31,9 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {
     textureStore(o_mrh, id, C.mrh);
     textureStore(o_emi, id, C.emi);
     textureStore(o_nrm, id, C.nrm);
+    textureStore(o_x0, id, C.x0);
+    textureStore(o_x1, id, C.x1);
+    textureStore(o_x2, id, C.x2);
 }
 
 //// ENTRY blend
@@ -53,6 +59,12 @@ struct BlendParams {
 @group(0) @binding(13) var o_mrh: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(14) var o_emi: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(15) var o_nrm: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(16) var a_x0: texture_2d<f32>;
+@group(0) @binding(17) var a_x1: texture_2d<f32>;
+@group(0) @binding(18) var a_x2: texture_2d<f32>;
+@group(0) @binding(19) var o_x0: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(20) var o_x1: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(21) var o_x2: texture_storage_2d<rgba16float, write>;
 
 fn load_opt(t: texture_2d<f32>, id: vec2<i32>) -> vec4<f32> {
     let d = vec2<i32>(textureDimensions(t));
@@ -88,11 +100,16 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {
     smp.nrm = cn.xyz / max(cn.a, EPS);
     smp.a_nrm = cn.a;
     smp.opa = co / max(ca.w, EPS);
-    let o = blend_layer(Acc(ac, am, ae, an), smp, m, P.mode_a, P.mode_b, P.op_a, P.op_b);
+    // Paint layers do not write the optional groups (smp.a_x stays 0).
+    let ax = array<vec4<f32>, 3>(textureLoad(a_x0, id, 0), textureLoad(a_x1, id, 0), textureLoad(a_x2, id, 0));
+    let o = blend_layer(Acc(ac, am, ae, an, ax), smp, m, P.mode_a, P.mode_b, P.op_a, P.op_b);
     textureStore(o_col, id, o.col);
     textureStore(o_mrh, id, o.mrh);
     textureStore(o_emi, id, o.emi);
     textureStore(o_nrm, id, o.nrm);
+    textureStore(o_x0, id, o.x[0]);
+    textureStore(o_x1, id, o.x[1]);
+    textureStore(o_x2, id, o.x[2]);
 }
 
 //// ENTRY folder
@@ -111,6 +128,15 @@ struct FolderParams { op_a: vec4<f32>, op_b: vec4<f32>, flags: vec4<u32> };
 @group(0) @binding(11) var o_mrh: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(12) var o_emi: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(13) var o_nrm: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(14) var b_x0: texture_2d<f32>;
+@group(0) @binding(15) var b_x1: texture_2d<f32>;
+@group(0) @binding(16) var b_x2: texture_2d<f32>;
+@group(0) @binding(17) var f_x0: texture_2d<f32>;
+@group(0) @binding(18) var f_x1: texture_2d<f32>;
+@group(0) @binding(19) var f_x2: texture_2d<f32>;
+@group(0) @binding(20) var o_x0: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(21) var o_x1: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(22) var o_x2: texture_storage_2d<rgba16float, write>;
 
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) g: vec3<u32>) {
@@ -119,6 +145,10 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {
     var m = 1.0;
     let md = vec2<i32>(textureDimensions(mask));
     if P.flags.x == 1u && md.x > 1 { m = textureLoad(mask, id, 0).r; }
+    let wx = clamp(P.op_b.w * m, 0.0, 1.0);
+    textureStore(o_x0, id, mix(textureLoad(b_x0, id, 0), textureLoad(f_x0, id, 0), wx));
+    textureStore(o_x1, id, mix(textureLoad(b_x1, id, 0), textureLoad(f_x1, id, 0), wx));
+    textureStore(o_x2, id, mix(textureLoad(b_x2, id, 0), textureLoad(f_x2, id, 0), wx));
     let bc = textureLoad(b_col, id, 0);
     let bm = textureLoad(b_mrh, id, 0);
     let be = textureLoad(b_emi, id, 0);
@@ -138,7 +168,7 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {
     let we = clamp(P.op_b.w * m, 0.0, 1.0);
     textureStore(o_mrh, id, vec4<f32>(r, mt, h, mix(bm.w, fm.w, we)));
     textureStore(o_emi, id, vec4<f32>(e, mix(be.w, fe.w, we)));
-    textureStore(o_nrm, id, vec4<f32>(n, bn.w));
+    textureStore(o_nrm, id, vec4<f32>(n, mix(bn.w, fnn.w, clamp(P.op_a.w * m, 0.0, 1.0))));
 }
 
 //// ENTRY filter
@@ -166,6 +196,12 @@ struct FilterParams {
 @group(0) @binding(11) var o_mrh: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(12) var o_emi: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(13) var o_nrm: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(14) var a_x0: texture_2d<f32>;
+@group(0) @binding(15) var a_x1: texture_2d<f32>;
+@group(0) @binding(16) var a_x2: texture_2d<f32>;
+@group(0) @binding(17) var o_x0: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(18) var o_x1: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(19) var o_x2: texture_storage_2d<rgba16float, write>;
 
 // Filter on a color value. `blurred` is the low-passed value (blur/sharpen).
 fn f_color(c: vec3<f32>, blurred: vec3<f32>) -> vec3<f32> {
@@ -255,6 +291,10 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {
     let lm = textureLoad(l_mrh, id, 0);
     let le = textureLoad(l_emi, id, 0);
     let ln = textureLoad(l_nrm, id, 0);
+    // Filters leave the optional groups as they are.
+    textureStore(o_x0, id, textureLoad(a_x0, id, 0));
+    textureStore(o_x1, id, textureLoad(a_x1, id, 0));
+    textureStore(o_x2, id, textureLoad(a_x2, id, 0));
 
     // Mirror / transform: the stack resampled at other texels (UV space).
     if P.k.x == 15u || P.k.x == 16u {
@@ -338,6 +378,12 @@ struct BlurParams { dir: vec4<i32>, k: vec4<f32> };   // dir.xy step, k.x radius
 @group(0) @binding(7) var o_mrh: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(8) var o_emi: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(9) var o_nrm: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(10) var i_x0: texture_2d<f32>;
+@group(0) @binding(11) var i_x1: texture_2d<f32>;
+@group(0) @binding(12) var i_x2: texture_2d<f32>;
+@group(0) @binding(13) var o_x0: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(14) var o_x1: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(15) var o_x2: texture_storage_2d<rgba16float, write>;
 
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) g: vec3<u32>) {
@@ -350,6 +396,9 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {
     var s1 = vec4<f32>(0.0);
     var s2 = vec4<f32>(0.0);
     var s3 = vec4<f32>(0.0);
+    var s4 = vec4<f32>(0.0);
+    var s5 = vec4<f32>(0.0);
+    var s6 = vec4<f32>(0.0);
     var wsum = 0.0;
     for (var k = -r; k <= r; k++) {
         let p = clamp(id + B.dir.xy * k, vec2<i32>(0), d - vec2<i32>(1));
@@ -361,6 +410,9 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {
         s1 += textureLoad(i_mrh, p, 0) * w;
         s2 += textureLoad(i_emi, p, 0) * w;
         s3 += textureLoad(i_nrm, p, 0) * w;
+        s4 += textureLoad(i_x0, p, 0) * w;
+        s5 += textureLoad(i_x1, p, 0) * w;
+        s6 += textureLoad(i_x2, p, 0) * w;
         wsum += w;
     }
     let inv = 1.0 / max(wsum, EPS);
@@ -368,13 +420,16 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {
     textureStore(o_mrh, id, s1 * inv);
     textureStore(o_emi, id, s2 * inv);
     textureStore(o_nrm, id, s3 * inv);
+    textureStore(o_x0, id, s4 * inv);
+    textureStore(o_x1, id, s5 * inv);
+    textureStore(o_x2, id, s6 * inv);
 }
 
 //// ENTRY finalize
 // Height becomes a tangent-space normal (RNM-combined with painted normals and
 // the baked normal), baked AO is applied, gutters are filled from the nearest
 // island texel (infinite dilation).
-struct FinalParams { k: vec4<f32> };   // height scale, ao strength
+struct FinalParams { k: vec4<f32> };   // height scale, ao strength, optional groups on
 @group(0) @binding(0) var<uniform> F: FinalParams;
 @group(0) @binding(1) var a_col: texture_2d<f32>;
 @group(0) @binding(2) var a_mrh: texture_2d<f32>;
@@ -387,6 +442,12 @@ struct FinalParams { k: vec4<f32> };   // height scale, ao strength
 @group(0) @binding(9) var o_orm: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(10) var o_nrm: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(11) var o_emi: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(12) var a_x0: texture_2d<f32>;
+@group(0) @binding(13) var a_x1: texture_2d<f32>;
+@group(0) @binding(14) var a_x2: texture_2d<f32>;
+@group(0) @binding(15) var o_x0: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(16) var o_x1: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(17) var o_x2: texture_storage_2d<rgba16float, write>;
 
 // p: global texel; the accumulators are read in the tile's scratch space.
 fn covered(p: vec2<i32>, dims: vec2<i32>) -> bool {
@@ -395,8 +456,12 @@ fn covered(p: vec2<i32>, dims: vec2<i32>) -> bool {
     return all(n == p);
 }
 
+// Height whose relief shows: the hidden part (a Replace above it) is left out.
 fn height_at(p: vec2<i32>, fallback: f32, dims: vec2<i32>) -> f32 {
-    if covered(p, dims) { return textureLoad(a_mrh, p - T.scratch.xy, 0).z; }
+    if covered(p, dims) {
+        let q = p - T.scratch.xy;
+        return textureLoad(a_mrh, q, 0).z - textureLoad(a_nrm, q, 0).w;
+    }
     return fallback;
 }
 
@@ -416,17 +481,28 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {
     let c = textureLoad(a_col, ls, 0);
     let m = textureLoad(a_mrh, ls, 0);
     let e = textureLoad(a_emi, ls, 0);
-    let pn = safe_normalize(textureLoad(a_nrm, ls, 0).xyz);
+    let an = textureLoad(a_nrm, ls, 0);
+    let pn = safe_normalize(an.xyz);
     let h = m.z;
-    let hl = height_at(src + vec2<i32>(-1, 0), h, dims);
-    let hr = height_at(src + vec2<i32>(1, 0), h, dims);
-    let hu = height_at(src + vec2<i32>(0, -1), h, dims);
-    let hd = height_at(src + vec2<i32>(0, 1), h, dims);
+    let hv = h - an.w;
+    let hl = height_at(src + vec2<i32>(-1, 0), hv, dims);
+    let hr = height_at(src + vec2<i32>(1, 0), hv, dims);
+    let hu = height_at(src + vec2<i32>(0, -1), hv, dims);
+    let hd = height_at(src + vec2<i32>(0, 1), hv, dims);
     let k = F.k.x * f32(dims.x);
     let nh = normalize(vec3<f32>(-(hr - hl) * 0.5 * k, -(hu - hd) * 0.5 * k, 1.0));
     let nb = safe_normalize(load_clamped(baked_normal, src).xyz);
     let n = rnm(rnm(nb, pn), nh);
-    let ao = mix(1.0, load_clamped(baked_ao, src).r, F.k.y);
+    var ao = mix(1.0, load_clamped(baked_ao, src).r, F.k.y);
+    // The optional groups (their finals are 1x1 while unused).
+    if F.k.z > 0.5 {
+        let x0 = clamp(textureLoad(a_x0, ls, 0), vec4<f32>(0.0), vec4<f32>(1.0));
+        textureStore(o_x0, id, x0);
+        textureStore(o_x1, id, clamp(textureLoad(a_x1, ls, 0), vec4<f32>(0.0), vec4<f32>(1.0)));
+        textureStore(o_x2, id, clamp(textureLoad(a_x2, ls, 0), vec4<f32>(0.0), vec4<f32>(1.0)));
+        // The painted ambient occlusion darkens the baked one.
+        ao *= x0.x;
+    }
     textureStore(o_base, id, vec4<f32>(max(c.rgb, vec3<f32>(0.0)), clamp(c.a, 0.0, 1.0)));
     textureStore(o_orm, id, vec4<f32>(ao, clamp(m.x, 0.0, 1.0), clamp(m.y, 0.0, 1.0), h));
     // Optional channels ride in the spare .w: transmission with the normal,

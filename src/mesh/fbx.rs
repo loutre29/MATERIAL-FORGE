@@ -433,10 +433,9 @@ pub fn load(path: &Path) -> Result<RawMesh> {
                 let cp = if ci < 0 { !ci } else { ci } as usize;
                 let p = verts.get(cp * 3..cp * 3 + 3).map_or([0.0; 3], |v| [v[0], v[1], v[2]]);
                 let pos = world.transform_point3(vec3(p));
-                let n = normals
-                    .as_ref()
-                    .and_then(|e| e.get(k, cp, poly))
-                    .map_or(Vec3::Y, |v| vec3([v[0], v[1], v[2]]));
+                let given = normals.as_ref().and_then(|e| e.get(k, cp, poly));
+                raw.normal_missing.push(given.is_none());
+                let n = given.map_or(Vec3::Y, |v| vec3([v[0], v[1], v[2]]));
                 let uv = uvs.as_ref().and_then(|e| e.get(k, cp, poly)).map_or([0.0, 0.0], |v| {
                     [v[0] as f32, 1.0 - v[1] as f32]
                 });
@@ -463,9 +462,13 @@ pub fn load(path: &Path) -> Result<RawMesh> {
                 .unwrap_or_else(|| if model_name.is_empty() { "DefaultMaterial".into() } else { model_name.clone() });
             let g = *group_of.entry(name.clone()).or_insert_with(|| {
                 raw.groups.push((name.clone(), Vec::new(), Vec::new()));
+                raw.polys.push(Vec::new());
                 raw.groups.len() - 1
             });
+            let source_poly = raw.next_poly;
+            raw.next_poly += 1;
             for k in 1..corners.len().saturating_sub(1) {
+                raw.polys[g].push(source_poly);
                 let (a, b, c) = (corners[0], corners[k], corners[k + 1]);
                 if flip {
                     raw.groups[g].1.extend_from_slice(&[a, c, b]);
@@ -482,8 +485,8 @@ pub fn load(path: &Path) -> Result<RawMesh> {
     if !any_uv {
         raw.uvs.clear();
     }
-    if !any_normal {
-        raw.normals.clear();
+    if any_normal && raw.normal_missing.iter().all(|m| !*m) {
+        raw.normal_missing.clear();
     }
     if !any_color {
         raw.colors.clear();

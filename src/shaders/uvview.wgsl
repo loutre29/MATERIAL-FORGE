@@ -2,10 +2,14 @@
 // wireframe on top.
 
 struct View {
-    // uv -> ndc: ndc = uv * scale + offset
+    // uv -> ndc: ndc = (dot(xform.xy, uv), dot(xform.zw, uv)) + offs.xy (the
+    // view may be rotated)
     xform: vec4<f32>,
+    offs: vec4<f32>,
     // display mode, line alpha, unused, unused
     mode: vec4<f32>,
+    // wireframe color (linear), opacity
+    line: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> V: View;
@@ -25,9 +29,13 @@ fn vs_quad(@builtin(vertex_index) i: u32) -> QOut {
     );
     let uv = corners[i];
     var o: QOut;
-    o.pos = vec4<f32>(uv * V.xform.xy + V.xform.zw, 0.0, 1.0);
+    o.pos = vec4<f32>(to_ndc(uv), 0.0, 1.0);
     o.uv = uv;
     return o;
+}
+
+fn to_ndc(uv: vec2<f32>) -> vec2<f32> {
+    return vec2<f32>(dot(V.xform.xy, uv), dot(V.xform.zw, uv)) + V.offs.xy;
 }
 
 fn data(v: vec3<f32>) -> vec4<f32> {
@@ -58,10 +66,10 @@ struct VsIn {
 
 @vertex
 fn vs_line(v: VsIn) -> @builtin(position) vec4<f32> {
-    return vec4<f32>(v.uv * V.xform.xy + V.xform.zw, 0.0, 1.0);
+    return vec4<f32>(to_ndc(v.uv), 0.0, 1.0);
 }
 
 @fragment
 fn fs_line() -> @location(0) vec4<f32> {
-    return vec4<f32>(0.9, 0.9, 0.95, V.mode.y);
+    return V.line;
 }

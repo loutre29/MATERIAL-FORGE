@@ -57,16 +57,20 @@ struct Driver {
     frames: usize,
     shapes: Vec<epaint::ClippedShape>,
     texts: Vec<(Rect, String)>,
+    /// Clip rect of each text (its panel or window).
+    text_clips: Vec<Rect>,
     clashes: Vec<String>,
 }
 
-fn shape_texts(s: &epaint::Shape, out: &mut Vec<(Rect, String)>) {
+/// Texts of a shape: the part of each that its clip rect lets show.
+fn shape_texts(s: &epaint::Shape, clip: Rect, out: &mut Vec<(Rect, String)>) {
     match s {
-        epaint::Shape::Vec(v) => v.iter().for_each(|x| shape_texts(x, out)),
+        epaint::Shape::Vec(v) => v.iter().for_each(|x| shape_texts(x, clip, out)),
         epaint::Shape::Text(t) => {
             let text = t.galley.text().trim().to_string();
-            if !text.is_empty() {
-                out.push((t.galley.rect.translate(t.pos.to_vec2()), text));
+            let r = t.galley.rect.translate(t.pos.to_vec2()).intersect(clip);
+            if !text.is_empty() && r.is_positive() {
+                out.push((r, text));
             }
         }
         _ => {}
@@ -122,9 +126,12 @@ impl Driver {
             }
         }
         self.texts.clear();
+        self.text_clips.clear();
         self.clashes.clear();
         for cs in &out.shapes {
-            shape_texts(&cs.shape, &mut self.texts);
+            let n = self.texts.len();
+            shape_texts(&cs.shape, cs.clip_rect, &mut self.texts);
+            self.text_clips.extend(std::iter::repeat(cs.clip_rect).take(self.texts.len() - n));
         }
         for (_, t) in &self.texts {
             if t.starts_with('🔥') {
@@ -295,7 +302,7 @@ struct Baseline {
     export: bool,
     bake: bool,
     new: bool,
-    dock: Option<egui_dock::DockState<dock::Tab>>,
+    dock: Option<dock::Panels>,
     shelf: (shelf::Category, String, bool, shelf::Source, Option<String>),
     props_tab: usize,
     row_channel: usize,
@@ -319,7 +326,7 @@ impl Baseline {
             stencil: app.stencil.clone(),
             view: app.view.clone(),
             camera: app.camera,
-            flags: [app.show_view_settings, app.show_set_settings, app.show_help, app.show_log, app.show_history],
+            flags: [app.show_view_settings, app.show_set_settings, app.show_prefs, app.show_log, app.show_history],
             export: app.export_dialog.is_some(),
             bake: app.bake_dialog.is_some(),
             new: app.new_dialog.is_some(),
@@ -356,7 +363,7 @@ impl Baseline {
         app.stencil = self.stencil.clone();
         app.view = self.view.clone();
         app.camera = self.camera;
-        [app.show_view_settings, app.show_set_settings, app.show_help, app.show_log, app.show_history] = self.flags;
+        [app.show_view_settings, app.show_set_settings, app.show_prefs, app.show_log, app.show_history] = self.flags;
         if !self.export {
             app.export_dialog = None;
         } else if app.export_dialog.is_none() {
@@ -371,7 +378,7 @@ impl Baseline {
         if !self.new {
             app.new_dialog = None;
         } else if app.new_dialog.is_none() {
-            app.new_dialog = Some(NewProjectDialog { path: String::new(), res: 1024, error: None });
+            app.new_dialog = Some(NewProjectDialog { path: String::new(), res: 1024, error: None, auto_uv: Default::default() });
         }
         app.dock = self.dock.clone();
         app.shelf.set_ui_state(self.shelf.clone());
@@ -456,11 +463,19 @@ fn scenarios() -> Vec<Scenario> {
         Scenario { name: "folder", setup: |app| select_first(app, |l| l.is_folder(), |_| Target::Content) },
         Scenario { name: "content effect", setup: |app| select_first(app, |l| !l.desc.effects.is_empty(), |l| Target::ContentEffect(l.desc.effects[0].id)) },
         Scenario { name: "tool eraser", setup: |app| app.tool = Tool::Erase },
+        Scenario { name: "tool projection (dock)", setup: |app| app.tool = Tool::Projection },
+        Scenario { name: "auto uv window", setup: |app| app.open_uv_dialog() },
         Scenario {
-            name: "tool projection",
+            name: "tool path",
             setup: |app| {
-                app.tool = Tool::Paint;
-                app.stencil.enabled = true;
+                app.tool = Tool::Path;
+                // A path layer with a selected path (its handles show).
+                let r = app.vp_rect;
+                for (fx, fy) in [(0.42, 0.52), (0.5, 0.44), (0.58, 0.52)] {
+                    app.path_press(glam::Vec2::new(r.width() * fx, r.height() * fy), false, false);
+                    app.path_release();
+                }
+                app.path.pen = true;
             },
         },
         Scenario { name: "tool polygon fill", setup: |app| app.tool = Tool::PolygonFill },
@@ -468,6 +483,45 @@ fn scenarios() -> Vec<Scenario> {
         Scenario { name: "tool clone", setup: |app| app.tool = Tool::Clone },
         Scenario { name: "tool picker", setup: |app| app.tool = Tool::Picker },
         Scenario { name: "tool geometry mask", setup: |app| app.tool = Tool::Hide },
+        Scenario {
+            name: "tool rectangle select",
+            setup: |app| {
+                app.tool = Tool::Select(super::selection::SelShape::Rect);
+                app.select_all();
+            },
+        },
+        Scenario {
+            name: "tool magic wand",
+            setup: |app| {
+                app.tool = Tool::Wand;
+                app.select_uv_rect(glam::Vec2::new(0.2, 0.2), glam::Vec2::new(0.7, 0.6));
+            },
+        },
+        Scenario { name: "tool paint bucket", setup: |app| app.tool = Tool::Bucket },
+        Scenario { name: "tool selection brush", setup: |app| app.tool = Tool::SelBrush },
+        Scenario {
+            name: "select by mesh map window",
+            setup: |app| {
+                let k = super::selection::MapSel::Cavities;
+                app.sel_by_map = Some((k, k.default_threshold()));
+            },
+        },
+        Scenario { name: "tool gradient", setup: |app| app.tool = Tool::Gradient },
+        Scenario {
+            name: "select modify window",
+            setup: |app| {
+                app.select_uv_rect(glam::Vec2::new(0.2, 0.2), glam::Vec2::new(0.7, 0.6));
+                app.sel_modify = Some((crate::flood::Modify::Feather, 8.0));
+            },
+        },
+        Scenario {
+            name: "tool polygonal lasso",
+            setup: |app| {
+                app.view.layout = Layout::Both;
+                app.tool = Tool::Select(super::selection::SelShape::PolyLasso);
+                app.select_uv_rect(glam::Vec2::new(0.1, 0.1), glam::Vec2::new(0.6, 0.5));
+            },
+        },
         Scenario { name: "texture set settings", setup: |app| app.focus_tab(dock::Tab::SetSettings) },
         Scenario { name: "display settings", setup: |app| app.show_view_settings = true },
         Scenario { name: "history", setup: |app| app.show_history = true },
@@ -480,8 +534,30 @@ fn scenarios() -> Vec<Scenario> {
                 app.bake_dialog = Some(BakeDialog { settings: Default::default(), high: String::new(), sets: vec![true; n] });
             },
         },
-        Scenario { name: "new project dialog", setup: |app| app.new_dialog = Some(NewProjectDialog { path: String::new(), res: 1024, error: None }) },
+        Scenario { name: "new project dialog", setup: |app| app.new_dialog = Some(NewProjectDialog { path: String::new(), res: 1024, error: None, auto_uv: Default::default() }) },
         Scenario { name: "2D and 3D views", setup: |app| app.view.layout = Layout::Both },
+        Scenario {
+            name: "2D manipulator turned view",
+            setup: |app| {
+                app.view.layout = Layout::Only2D;
+                app.view.uv_rot = 25f32.to_radians();
+                if let Some(doc) = &mut app.doc {
+                    let s = &mut doc.sets[doc.active];
+                    let mut fill = None;
+                    crate::document::visit(&s.layers, &mut |l| {
+                        if fill.is_none() && matches!(&l.desc.kind, LayerKind::Fill(f) if f.projection.mode == crate::document::ProjMode::Uv) {
+                            fill = Some(l.desc.id);
+                        }
+                    });
+                    s.selected = fill;
+                    s.target = crate::document::Target::Content;
+                }
+            },
+        },
+        Scenario {
+            name: "library filtered",
+            setup: |app| app.shelf.set_ui_state((shelf::Category::Materials, "rust".into(), false, shelf::Source::Starter, None)),
+        },
         Scenario { name: "assets list view", setup: |app| app.shelf.set_ui_state((shelf::Category::Materials, String::new(), true, shelf::Source::All, None)) },
     ]
 }
@@ -511,6 +587,65 @@ fn build_project(app: &mut RetroApp, path: &Path) -> anyhow::Result<()> {
 
 /// Holds two or more other clickable widgets of its layer (popup areas,
 /// windows, rows): its own empty parts are what a click reaches.
+/// Text alignment in the clickable boxes of a frame (buttons, fields,
+/// combos, rows): a single-line text must sit vertically centered (2.5 px)
+/// and inside its box; texts of one box on one row must share a center.
+fn alignment_findings(d: &Driver, state: &str) -> Vec<Finding> {
+    let mut out = Vec::new();
+    let ws = d.widgets();
+    for w in &ws {
+        let r = w.rect;
+        if r.height() < 14.0 || r.height() > 44.0 || r.width() < 16.0 {
+            continue;
+        }
+        // Boxes holding other boxes (rows of buttons) are judged by those.
+        if ws.iter().any(|o| o.id != w.id && r.contains_rect(o.rect) && o.rect.area() < r.area() * 0.9) {
+            continue;
+        }
+        // Only what shows on the box's own layer (not a window above it).
+        // A text clipped to another panel or window (one under this box's
+        // window) is not this box's.
+        let area = d.ctx.memory(|m| m.area_rect(w.layer.id)).unwrap_or(Rect::EVERYTHING).expand(1.0);
+        let texts: Vec<&(Rect, String)> = d
+            .texts
+            .iter()
+            .zip(&d.text_clips)
+            .filter(|((t, _), clip)| r.contains(t.center()) && t.height() <= r.height() + 1.0 && t.height() < 26.0 && area.contains_rect(**clip))
+            .filter(|((t, _), _)| d.ctx.layer_id_at(t.center()) == Some(w.layer))
+            .map(|(t, _)| t)
+            .collect();
+        // Lines stacked in the box (title and subtitle) are centered as a block.
+        let stacked = texts.iter().any(|(a, _)| texts.iter().any(|(b, _)| (a.center().y - b.center().y).abs() >= a.height().min(b.height()) * 0.6));
+        if stacked {
+            let (top, bottom) = texts.iter().fold((f32::MAX, f32::MIN), |(t, b), (r2, _)| (t.min(r2.min.y), b.max(r2.max.y)));
+            let dy = (top + bottom) * 0.5 - r.center().y;
+            if dy.abs() > 2.5 {
+                out.push(Finding { kind: "ALIGN", state: state.into(), what: format!("the text block is {dy:+.1} px off center in {}", w.describe()), rect: r });
+            }
+        }
+        for (t, label) in &texts {
+            let dy = t.center().y - r.center().y;
+            if dy.abs() > 2.5 && !stacked {
+                out.push(Finding { kind: "ALIGN", state: state.into(), what: format!("\"{label}\" is {dy:+.1} px off center in {}", w.describe()), rect: *t });
+            }
+            let over = (r.min.x - t.min.x).max(t.max.x - r.max.x);
+            if over > 1.5 {
+                out.push(Finding { kind: "ALIGN", state: state.into(), what: format!("\"{label}\" spills {over:.1} px out of {}", w.describe()), rect: *t });
+            }
+        }
+        for (i, (a, la)) in texts.iter().enumerate() {
+            for (b, lb) in texts.iter().skip(i + 1) {
+                let same_row = (a.center().y - b.center().y).abs() < a.height().min(b.height()) * 0.6;
+                let dy = (a.center().y - b.center().y).abs();
+                if same_row && dy > 1.5 {
+                    out.push(Finding { kind: "ALIGN", state: state.into(), what: format!("\"{la}\" and \"{lb}\" are {dy:.1} px apart vertically in {}", w.describe()), rect: a.union(*b) });
+                }
+            }
+        }
+    }
+    out
+}
+
 fn is_container(all: &[W], w: &W) -> bool {
     all.iter().filter(|o| o.id != w.id && o.layer == w.layer && w.rect.expand(1.0).contains_rect(o.rect)).count() >= 2
 }
@@ -523,7 +658,7 @@ fn reset_ui(app: &mut RetroApp, ctx: &egui::Context) {
     app.view = ViewSettings::default();
     app.show_view_settings = false;
     app.show_set_settings = false;
-    app.show_help = false;
+    app.show_prefs = false;
     app.show_log = false;
     app.show_history = false;
     app.export_dialog = None;
@@ -534,6 +669,15 @@ fn reset_ui(app: &mut RetroApp, ctx: &egui::Context) {
     app.props_tab = 0;
     app.row_channel = 0;
     app.quick_props = None;
+    app.sel_drag = None;
+    app.sel_op = Default::default();
+    app.sel_through = false;
+    app.sel_modify = None;
+    app.sel_by_map = None;
+    app.poly_to_selection = false;
+    if let Some(d) = &mut app.doc {
+        d.sets.iter_mut().for_each(|s| s.selection = None);
+    }
     widgets::close_color_picker(ctx);
     ctx.memory_mut(|m| m.close_popup());
 }
@@ -621,8 +765,9 @@ pub fn ui_crawl(out: &Path) -> anyhow::Result<usize> {
         ctx.style_mut(|s| s.interaction.tooltip_delay = 1.0e6);
         let mut app = RetroApp::build(engine, Arc::new(egui::mutex::RwLock::new(renderer)), &ctx, with);
         app.persist_layout = false;
+    app.lock_cursor = false;
         app.autosave_minutes = 0.0;
-        let d = Driver { ctx, size, time: 0.0, frames: 0, shapes: Vec::new(), texts: Vec::new(), clashes: Vec::new() };
+        let d = Driver { ctx, size, time: 0.0, frames: 0, shapes: Vec::new(), texts: Vec::new(), text_clips: Vec::new(), clashes: Vec::new() };
         Ok((app, d))
     };
     {
@@ -633,6 +778,7 @@ pub fn ui_crawl(out: &Path) -> anyhow::Result<usize> {
     let (mut app, mut d) = fresh(None)?;
 
     let mut findings: Vec<Finding> = Vec::new();
+    let mut align_seen: HashSet<String> = HashSet::new();
     let mut seen: HashSet<(Id, String)> = HashSet::new();
     let mut seen_clash: HashSet<String> = HashSet::new();
     let mut tested = 0usize;
@@ -678,6 +824,12 @@ pub fn ui_crawl(out: &Path) -> anyhow::Result<usize> {
             println!("  warning: '{}' does not render the same frame twice", sc.name);
         }
         let shot_marks_start = findings.len();
+        // The same box is reported once per run.
+        for f in alignment_findings(&d, sc.name) {
+            if align_seen.insert(f.what.clone()) {
+                findings.push(f);
+            }
+        }
         let mut queue: Vec<W> = d.widgets().into_iter().filter(|w| !seen.contains(&w.key())).collect();
         let total = queue.len();
         let mut n_state = 0;
@@ -947,10 +1099,10 @@ pub fn ui_crawl(out: &Path) -> anyhow::Result<usize> {
         d.frames,
         t0.elapsed().as_secs_f32()
     );
-    for k in ["PANIC", "INVARIANT", "UNDO", "CLASH", "STOLEN", "UNREACHABLE", "FLAKY", "NO EFFECT"] {
+    for k in ["PANIC", "INVARIANT", "UNDO", "CLASH", "STOLEN", "UNREACHABLE", "FLAKY", "NO EFFECT", "ALIGN"] {
         text += &format!("{k}: {}\n", by_kind.get(k).copied().unwrap_or(0));
     }
-    for k in ["PANIC", "INVARIANT", "UNDO", "CLASH", "STOLEN", "UNREACHABLE", "FLAKY", "NO EFFECT"] {
+    for k in ["PANIC", "INVARIANT", "UNDO", "CLASH", "STOLEN", "UNREACHABLE", "FLAKY", "NO EFFECT", "ALIGN"] {
         let v: Vec<&Finding> = findings.iter().filter(|f| f.kind == k).collect();
         if v.is_empty() {
             continue;

@@ -193,6 +193,8 @@ pub static DEFS: &[ProcDef] = &[
     def(K::GradientAxial, "Gradient", 21, 9, [0.0; 4], &GRAD),
     def(K::GradientAxialReflected, "Gradient", 21, 10, [0.0; 4], &GRAD),
     def(K::GradientRadial, "Gradient", 21, 11, [0.0; 4], &GRAD),
+    // ------------------------------------------------------------ Normals
+    def(K::Flakes, "Normals", 0, 0, [0.0; 4], &FLAKES),
 ];
 
 static FS: [Param; 4] = [int("Scale", 0, 1.0, 64.0, 2.0), float("Roughness", 1, 0.0, 1.0, 0.82), int("Min level", 2, 0.0, 6.0, 0.0), int("Max level", 3, 1.0, 10.0, 8.0)];
@@ -222,6 +224,7 @@ static GEO_CHECK: [Param; 1] = [int("Tiling", 0, 1.0, 64.0, 4.0)];
 static GEO: [Param; 2] = [int("Tiling", 0, 1.0, 64.0, 4.0), float("Size", 1, 0.0, 1.0, 0.8)];
 static GEO_STRIPES: [Param; 2] = [int("Tiling", 0, 1.0, 64.0, 8.0), float("Width", 1, 0.0, 2.0, 1.0)];
 static POLY1: [Param; 3] = [int("Tiling", 0, 1.0, 64.0, 1.0), float("Size", 1, 0.0, 1.0, 0.9), float("Angle", 2, 0.0, 360.0, 0.0)];
+static FLAKES: [Param; 3] = [int("Scale", 0, 1.0, 128.0, 48.0), float("Tilt", 1, 0.0, 1.0, 0.45), float("Coverage", 2, 0.0, 1.0, 1.0)];
 static GRAD: [Param; 1] = [int("Tiling", 0, 1.0, 64.0, 1.0)];
 static GRAD4: [Param; 1] = [int("Tiling", 0, 1.0, 64.0, 4.0)];
 static GRAD8: [Param; 1] = [int("Tiling", 0, 1.0, 64.0, 8.0)];
@@ -231,7 +234,7 @@ pub fn def_of(kind: ProcKind) -> Option<&'static ProcDef> {
 }
 
 /// Shelf folders in Painter's order (the legacy generators last).
-pub const FOLDERS: [&str; 7] = ["Noises", "Noises Advanced", "Grunges", "Patterns", "Geometric", "Gradient", "Classic"];
+pub const FOLDERS: [&str; 8] = ["Noises", "Noises Advanced", "Grunges", "Patterns", "Geometric", "Gradient", "Normals", "Classic"];
 
 pub fn folder_of(kind: ProcKind) -> &'static str {
     def_of(kind).map(|d| d.folder).unwrap_or("Classic")

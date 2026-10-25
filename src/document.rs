@@ -22,17 +22,88 @@ pub const CH_OPACITY: usize = 5;
 pub const CH_NORMAL: usize = 6;
 
 /// Optional channels a texture set can add (Texture Set Settings > Channels).
-/// They live in spare accumulator / final slots: specular level in the
-/// roughness-metal-height .w and emissive final .w, transmission in the
-/// emissive accumulator .w and normal final .w.
-pub const NEXT: usize = 2;
-pub const EXT_NAMES: [&str; NEXT] = ["Specular level", "Transmission"];
-pub const EXT_SHORT: [&str; NEXT] = ["spec", "trans"];
+/// The first two live in spare accumulator / final slots: specular level in
+/// the roughness-metal-height .w and emissive final .w, transmission in the
+/// emissive accumulator .w and normal final .w. The others go four per group
+/// in extra accumulators and finals (`ext_slot`), allocated only while used.
+pub const NEXT: usize = 14;
+pub const EXT_NAMES: [&str; NEXT] = [
+    "Specular level",
+    "Transmission",
+    "Ambient occlusion",
+    "Glossiness",
+    "Displacement",
+    "Scattering",
+    "Coat opacity",
+    "Coat roughness",
+    "Sheen opacity",
+    "Sheen roughness",
+    "Anisotropy level",
+    "Anisotropy angle",
+    "IOR",
+    "Absorption",
+];
+pub const EXT_SHORT: [&str; NEXT] = ["spec", "trans", "ao", "gloss", "disp", "scatter", "coat", "coat rough", "sheen", "sheen rough", "aniso", "aniso angle", "ior", "absorb"];
 /// Values when a layer does not write the channel.
-pub const EXT_DEFAULTS: [f32; NEXT] = [0.5, 0.0];
+pub const EXT_DEFAULTS: [f32; NEXT] = [0.5, 0.0, 1.0, 0.5, 0.0, 0.0, 0.0, 0.1, 0.0, 0.3, 0.0, 0.0, 0.25, 0.0];
+/// Shown range of the stored 0..1 value (IOR 1 to 3, the angle in degrees).
+pub const EXT_RANGE: [(f32, f32); NEXT] = [
+    (0.0, 1.0),
+    (0.0, 1.0),
+    (0.0, 1.0),
+    (0.0, 1.0),
+    (0.0, 1.0),
+    (0.0, 1.0),
+    (0.0, 1.0),
+    (0.0, 1.0),
+    (0.0, 1.0),
+    (0.0, 1.0),
+    (0.0, 1.0),
+    (0.0, 360.0),
+    (1.0, 3.0),
+    (0.0, 1.0),
+];
+/// On in a new texture set: specular level and transmission (the others are
+/// added from the texture set settings).
+pub const EXT_ON_DEFAULT: [bool; NEXT] = {
+    let mut v = [false; NEXT];
+    v[0] = true;
+    v[1] = true;
+    v
+};
+
+/// Group and component of an optional channel past the first two.
+pub fn ext_slot(i: usize) -> Option<(usize, usize)> {
+    (i >= 2 && i < NEXT).then(|| ((i - 2) / 4, (i - 2) % 4))
+}
 
 fn ext_default() -> [FillChannel; NEXT] {
     std::array::from_fn(|i| FillChannel { enabled: false, value: [EXT_DEFAULTS[i]; 3], value_b: [1.0; 3], ..Default::default() })
+}
+
+/// Fill optional channels saved with fewer channels: the rest default.
+fn de_ext<'de, D: serde::Deserializer<'de>>(d: D) -> Result<[FillChannel; NEXT], D::Error> {
+    let v: Vec<FillChannel> = Vec::deserialize(d)?;
+    let mut out = ext_default();
+    for (o, c) in out.iter_mut().zip(v) {
+        *o = c;
+    }
+    Ok(out)
+}
+
+/// Texture set optional channels. Projects from before the extra channels
+/// get specular level and transmission, on by default since.
+fn de_ext_on<'de, D: serde::Deserializer<'de>>(d: D) -> Result<[bool; NEXT], D::Error> {
+    let v: Vec<bool> = Vec::deserialize(d)?;
+    let mut out = [false; NEXT];
+    for (o, c) in out.iter_mut().zip(&v) {
+        *o = *c;
+    }
+    if v.len() < NEXT {
+        out[0] = true;
+        out[1] = true;
+    }
+    Ok(out)
 }
 
 /// True for channels holding a color (rgb), false for scalars and the normal.
@@ -260,6 +331,9 @@ named_enum!(ProcKind {
     GradientAxial => "Gradient Axial",
     GradientAxialReflected => "Gradient Axial Reflected",
     GradientRadial => "Gradient Radial",
+    // Normal map generators (evaluated per texel, after the others so saved
+    // codes keep their meaning).
+    Flakes => "Flakes",
 });
 
 impl ProcKind {
@@ -278,7 +352,12 @@ impl ProcKind {
 
     /// Rendered once into a seamless texture (engine/procgen.rs).
     pub fn is_bitmap(self) -> bool {
-        !self.is_classic() && !self.is_3d()
+        !self.is_classic() && !self.is_3d() && !self.is_normal()
+    }
+
+    /// Generates a tangent normal (in a normal slot) besides its gray value.
+    pub fn is_normal(self) -> bool {
+        self == ProcKind::Flakes
     }
 
     /// Case of `proc_raw` in procedural.wgsl (classic codes, then the 3D noises).
@@ -291,6 +370,7 @@ impl ProcKind {
             ProcKind::Voronoi3D => 24,
             ProcKind::VoronoiFractal3D => 25,
             ProcKind::Worley3D => 26,
+            ProcKind::Flakes => 27,
             k if k.is_classic() => k.code(),
             _ => 0,
         }
@@ -411,7 +491,68 @@ impl ProcParams {
         [self.seed, self.contrast, self.balance, self.warp]
     }
     fn pb(&self) -> [f32; 4] {
+        // The normal generators read their own parameters.
+        if self.kind.is_normal() {
+            return [self.p[0], self.p[1], self.p[2], self.p[3]];
+        }
         [self.detail, self.aspect, self.density, self.roughness]
+    }
+}
+
+/// UV projection repetition (Painter's UV Wrap).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum UvWrap {
+    #[default]
+    Repeat,
+    None,
+    Horizontal,
+    Vertical,
+}
+
+impl UvWrap {
+    pub const ALL: [UvWrap; 4] = [UvWrap::None, UvWrap::Horizontal, UvWrap::Vertical, UvWrap::Repeat];
+    pub fn name(self) -> &'static str {
+        match self {
+            UvWrap::None => "None",
+            UvWrap::Horizontal => "Repeat horizontally",
+            UvWrap::Vertical => "Repeat vertically",
+            UvWrap::Repeat => "Repeat",
+        }
+    }
+    fn code(self) -> f32 {
+        match self {
+            UvWrap::Repeat => 0.0,
+            UvWrap::None => 1.0,
+            UvWrap::Horizontal => 2.0,
+            UvWrap::Vertical => 3.0,
+        }
+    }
+}
+
+/// Texture filtering of a projection (Painter's Filtering).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum UvFilter {
+    #[default]
+    BilinearHq,
+    BilinearSharp,
+    Nearest,
+}
+
+impl UvFilter {
+    pub const ALL: [UvFilter; 3] = [UvFilter::BilinearHq, UvFilter::BilinearSharp, UvFilter::Nearest];
+    pub fn name(self) -> &'static str {
+        match self {
+            UvFilter::BilinearHq => "Bilinear | HQ",
+            UvFilter::BilinearSharp => "Bilinear | Sharp",
+            UvFilter::Nearest => "Nearest",
+        }
+    }
+    fn code(self) -> f32 {
+        match self {
+            UvFilter::BilinearHq => 0.0,
+            UvFilter::BilinearSharp => 1.0,
+            UvFilter::Nearest => 2.0,
+        }
     }
 }
 
@@ -432,6 +573,13 @@ pub struct Projection {
     pub position: [f32; 3],
     pub orient: [f32; 4],
     pub axes: [f32; 3],
+    /// UV projection: per-axis scale of the transformation (the 2D view
+    /// manipulator's handles; the frame is 1 / stretch of the UV space).
+    pub stretch: [f32; 2],
+    /// UV projection: rotation and scale origin (UV space).
+    pub pivot: [f32; 2],
+    pub wrap: UvWrap,
+    pub filter: UvFilter,
 }
 
 impl Default for Projection {
@@ -446,6 +594,10 @@ impl Default for Projection {
             position: [0.0; 3],
             orient: [0.0, 0.0, 0.0, 1.0],
             axes: [1.0; 3],
+            stretch: [1.0; 2],
+            pivot: [0.5; 2],
+            wrap: UvWrap::Repeat,
+            filter: UvFilter::BilinearHq,
         }
     }
 }
@@ -475,6 +627,10 @@ pub struct ProjU {
     pub offs: [f32; 4],
     pub xf: [[f32; 4]; 3],
     pub nr: [[f32; 4]; 3],
+    /// Stretch u, stretch v, wrap, filter.
+    pub uvx: [f32; 4],
+    /// Pivot u, pivot v.
+    pub uvp: [f32; 4],
 }
 
 impl Projection {
@@ -512,6 +668,8 @@ impl Projection {
             offs: [self.offset[0], self.offset[1], if self.mirror[0] { -1.0 } else { 1.0 }, if self.mirror[1] { -1.0 } else { 1.0 }],
             xf: [row(&l, 0, b.x), row(&l, 1, b.y), row(&l, 2, b.z)],
             nr: [row(&rinv, 0, 0.0), row(&rinv, 1, 0.0), row(&rinv, 2, 0.0)],
+            uvx: [self.stretch[0], self.stretch[1], self.wrap.code(), self.filter.code()],
+            uvp: [self.pivot[0], self.pivot[1], 0.0, 0.0],
         }
     }
 }
@@ -550,7 +708,7 @@ pub struct FillDesc {
     pub channels: [FillChannel; NCH],
     pub projection: Projection,
     /// Optional channels (specular level, transmission): uniform or procedural.
-    #[serde(default = "ext_default")]
+    #[serde(default = "ext_default", deserialize_with = "de_ext")]
     pub ext: [FillChannel; NEXT],
     /// Material the fill was made from (shown in its Material mode slot).
     pub material: Option<String>,
@@ -812,6 +970,102 @@ pub struct LayerDesc {
     /// (Auto shader alpha then blends the set).
     #[serde(default)]
     pub opacity_painted: bool,
+    /// Path layer: its paint is generated from these paths (Path tool),
+    /// never painted by hand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paths: Option<Vec<PathDesc>>,
+    /// The brush and material every path of a path layer paints with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_style: Option<PathStyle>,
+}
+
+/// What every path of a path layer paints with: one brush and material per
+/// layer (other settings mean another path layer).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PathStyle {
+    pub brush: crate::brush::BrushSettings,
+    pub material: crate::brush::BrushMaterial,
+    /// Material painted instead of the flat values (name, material).
+    pub fill: Option<(String, FillDesc)>,
+    /// Brush sizes are screen points: world units (3D paths) and UV units
+    /// (2D paths) per point, taken when the layer's first path of the kind
+    /// was made, so every path paints the same from any camera (0: none
+    /// yet).
+    pub unit: f32,
+    pub uv_unit: f32,
+}
+
+/// How a path point's handles behave.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PointKind {
+    /// Handles follow the neighbors (a smooth curve through the points).
+    #[default]
+    Auto,
+    /// Handles set by hand, kept in line.
+    Smooth,
+    /// Handles move independently (zero handles: a corner).
+    Broken,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PathPoint {
+    /// World position on the surface (3D path) or UV in x, y (2D path).
+    pub pos: [f32; 3],
+    /// Surface normal under the point (3D paths).
+    pub nrm: [f32; 3],
+    /// Handle ends relative to the point (Smooth and Broken points).
+    pub h_in: [f32; 3],
+    pub h_out: [f32; 3],
+    pub kind: PointKind,
+}
+
+/// One path of a path layer (its layer's `PathStyle` paints it).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PathDesc {
+    pub id: u64,
+    pub name: String,
+    pub visible: bool,
+    /// Drawn in the 2D view (UV space).
+    pub uv: bool,
+    pub closed: bool,
+    pub points: Vec<PathPoint>,
+    /// Stamp orientation of brushes that do not follow the path (the
+    /// camera's right when the path was made).
+    pub right: [f32; 3],
+    /// Jitter seed: the same path always paints the same stamps.
+    pub seed: u64,
+    /// Projects from when each path had its own brush: read once to give
+    /// the layer its style (`LayerDesc::migrate_path_style`).
+    #[serde(default, skip_serializing, rename = "brush")]
+    pub old_brush: Option<crate::brush::BrushSettings>,
+    #[serde(default, skip_serializing, rename = "material")]
+    pub old_material: Option<crate::brush::BrushMaterial>,
+    #[serde(default, skip_serializing, rename = "fill")]
+    pub old_fill: Option<(String, FillDesc)>,
+    #[serde(default, skip_serializing, rename = "unit")]
+    pub old_unit: Option<f32>,
+}
+
+impl Default for PathDesc {
+    fn default() -> Self {
+        PathDesc {
+            id: 0,
+            name: String::new(),
+            visible: true,
+            uv: false,
+            closed: false,
+            points: Vec::new(),
+            right: [1.0, 0.0, 0.0],
+            seed: 1,
+            old_brush: None,
+            old_material: None,
+            old_fill: None,
+            old_unit: None,
+        }
+    }
 }
 
 /// An effect on a layer's content. The layer and its effects composite as
@@ -833,10 +1087,31 @@ fn one_f32() -> f32 {
 }
 
 impl LayerDesc {
+    /// A path layer without a style (a project from when each path had its
+    /// own brush) takes its first path's.
+    pub fn migrate_path_style(&mut self) {
+        let Some(paths) = &mut self.paths else { return };
+        if self.path_style.is_some() {
+            return;
+        }
+        let mut s = PathStyle::default();
+        if let Some(p) = paths.iter().find(|p| p.old_brush.is_some()) {
+            s.brush = p.old_brush.clone().unwrap_or_default();
+            s.material = p.old_material.clone().unwrap_or_default();
+            s.fill = p.old_fill.clone();
+        }
+        s.unit = paths.iter().find(|p| !p.uv).and_then(|p| p.old_unit).unwrap_or(0.0);
+        s.uv_unit = paths.iter().find(|p| p.uv).and_then(|p| p.old_unit).unwrap_or(0.0);
+        for p in paths.iter_mut() {
+            (p.old_brush, p.old_material, p.old_fill, p.old_unit) = (None, None, None, None);
+        }
+        self.path_style = Some(s);
+    }
+
     pub fn new(id: u64, name: String, kind: LayerKind) -> Self {
         let mut blend = [BlendMode::Normal; NCH];
         blend[CH_NORMAL] = BlendMode::NormalCombine;
-        LayerDesc { id, name, visible: true, kind, blend, opacity: [1.0; NCH], mask: None, expanded: true, effects: Vec::new(), tag: 0, ext_opacity: 1.0, opacity_painted: false }
+        LayerDesc { id, name, visible: true, kind, blend, opacity: [1.0; NCH], mask: None, expanded: true, effects: Vec::new(), tag: 0, ext_opacity: 1.0, opacity_painted: false, paths: None, path_style: None }
     }
 
     fn blend_u(&self) -> BlendU {
@@ -1079,6 +1354,9 @@ pub struct Resource {
     pub id: u64,
     pub name: String,
     pub kind: ResKind,
+    /// Imported by the user (a file from disk), not pulled in from the
+    /// starter assets or the library by a material, brush or alpha.
+    pub imported: bool,
     /// Original file bytes, kept for saving the project.
     pub encoded: Arc<Vec<u8>>,
     pub gpu: Arc<Tex>,
@@ -1086,7 +1364,7 @@ pub struct Resource {
 }
 
 pub fn decode_image(bytes: &[u8]) -> anyhow::Result<image::RgbaImage> {
-    let img = image::load_from_memory(bytes)?;
+    let img = crate::imageio::decode(bytes)?;
     // HDR sources are tonemapped into 8 bits: resources are material inputs.
     Ok(img.into_rgba8())
 }
@@ -1141,6 +1419,7 @@ pub struct SetSettings {
     pub emissive_intensity: f32,
     pub visible: bool,
     /// Optional channels enabled on this texture set.
+    #[serde(deserialize_with = "de_ext_on")]
     pub ext_channels: [bool; NEXT],
 }
 
@@ -1155,7 +1434,7 @@ impl Default for SetSettings {
             alpha_cutoff: 0.5,
             emissive_intensity: 1.0,
             visible: true,
-            ext_channels: [false; NEXT],
+            ext_channels: EXT_ON_DEFAULT,
         }
     }
 }
@@ -1193,6 +1472,10 @@ pub struct TextureSet {
     /// Texels painted since the last composite when nothing else changed
     /// (`dirty` wins): only that rect gets recomposited.
     pub dirty_region: Option<crate::engine::composite::Region>,
+    /// The active selection (r8, UV space; `engine::select`). None: nothing
+    /// selected, every tool works everywhere. Never modified in place: each
+    /// change makes a new texture, so undo keeps the old one.
+    pub selection: Option<Arc<crate::engine::Tex>>,
 }
 
 impl TextureSet {
@@ -1231,6 +1514,18 @@ impl TextureSet {
             })
         }
         any(&self.layers)
+    }
+
+    /// Some visible fill writes optional channel `i` (and the set has it on).
+    pub fn uses_ext(&self, i: usize) -> bool {
+        fn any(layers: &[Layer], i: usize) -> bool {
+            layers.iter().filter(|l| l.desc.visible).any(|l| match &l.desc.kind {
+                LayerKind::Fill(f) => f.ext[i].enabled,
+                LayerKind::Folder => any(&l.children, i),
+                _ => false,
+            })
+        }
+        self.settings.ext_channels[i] && any(&self.layers, i)
     }
 
     /// Viewport shader alpha: 0 opaque, 1 alpha test, 2 alpha blend.
@@ -1397,7 +1692,19 @@ impl TextureSet {
             mrh: [s.base_values[0], s.base_values[1], s.base_values[2], EXT_DEFAULTS[0]],
             emi: [0.0, 0.0, 0.0, EXT_DEFAULTS[1]],
             nrm: [0.0, 0.0, 1.0, 0.0],
+            x: ext_clear(),
         };
+        // Full size finals for the optional groups the set has on.
+        let mut used = [false; 3];
+        for i in 2..NEXT {
+            if let Some((g, _)) = ext_slot(i) {
+                used[g] |= s.ext_channels[i];
+            }
+        }
+        if self.gpu.ensure_ext(&engine.device, used) {
+            self.dirty = true;
+        }
+        let s = &self.settings;
         let res = self.resolution();
         let procs = self.proc_textures(engine, encoder);
         let ctx = PlanCtx { resources, procs: &procs, res, capture: capture_mask, bake_rev: self.bake_rev, world: self.world };
@@ -1434,6 +1741,17 @@ impl TextureSet {
     }
 }
 
+/// Clear values of the optional channel groups.
+fn ext_clear() -> [[f32; 4]; 3] {
+    let mut x = [[0.0; 4]; 3];
+    for (i, v) in EXT_DEFAULTS.iter().enumerate() {
+        if let Some((g, k)) = ext_slot(i) {
+            x[g][k] = *v;
+        }
+    }
+    x
+}
+
 impl TextureSet {
     /// Evaluates a fill material over this set into `out` (col, mrh, emi, nrm).
     pub fn evaluate_material(
@@ -1450,6 +1768,7 @@ impl TextureSet {
             mrh: [s.base_values[0], s.base_values[1], 0.0, EXT_DEFAULTS[0]],
             emi: [0.0, 0.0, 0.0, EXT_DEFAULTS[1]],
             nrm: [0.0, 0.0, 1.0, 0.0],
+            x: ext_clear(),
         };
         let layer = Layer {
             desc: LayerDesc::new(0, String::new(), LayerKind::Fill(Box::new(fill.clone()))),
@@ -1647,7 +1966,7 @@ fn plan_layer_inner<'a>(l: &'a Layer, ctx: &PlanCtx<'a>, mask: Option<MaskPlan<'
         LayerKind::Fill(f) => {
             let pu = f.projection.uniform(&ctx.world);
             let b = d.blend_u();
-            let mut u = FillU { mode_a: b.mode_a, mode_b: b.mode_b, op_a: b.op_a, op_b: b.op_b, proj: pu.proj, offs: pu.offs, xf: pu.xf, nr: pu.nr, ..Default::default() };
+            let mut u = FillU { mode_a: b.mode_a, mode_b: b.mode_b, op_a: b.op_a, op_b: b.op_b, proj: pu.proj, offs: pu.offs, xf: pu.xf, nr: pu.nr, uvx: pu.uvx, uvp: pu.uvp, ..Default::default() };
             let mut textures: [Option<&Tex>; NCH] = [None; NCH];
             for (c, ch) in f.channels.iter().enumerate() {
                 let generated = (ch.source == SourceKind::Procedural)
@@ -1830,6 +2149,7 @@ impl Document {
             bake_rev: 0,
             focus: None,
             dirty_region: None,
+            selection: None,
         }
     }
 
@@ -1863,6 +2183,10 @@ impl Document {
     /// Rebuilds every submesh's visible index buffer from `hidden`.
     pub fn refresh_visibility(&mut self, engine: &Engine) {
         use wgpu::util::DeviceExt;
+        self.gpu_mesh.vis_rev += 1;
+        for g in self.gpu_mesh.submeshes.iter_mut() {
+            g.sorted = None;
+        }
         for (si, s) in self.mesh.submeshes.iter().enumerate() {
             let hidden = self.hidden.get(si);
             let gs = &mut self.gpu_mesh.submeshes[si];
@@ -1965,6 +2289,7 @@ impl Document {
             s.layers.push(layer.take().unwrap());
         }
         s.selected = Some(id);
+        s.extra.clear();
         s.target = Target::Content;
         s.dirty = true;
         self.modified = true;
@@ -2013,7 +2338,7 @@ impl Document {
         self.modified = true;
     }
 
-    fn deep_copy(&mut self, engine: &Engine, src: &Layer, enc: &mut wgpu::CommandEncoder) -> Layer {
+    pub fn deep_copy(&mut self, engine: &Engine, src: &Layer, enc: &mut wgpu::CommandEncoder) -> Layer {
         let dup = |t: &Arc<Tex>, enc: &mut wgpu::CommandEncoder| Arc::new(t.duplicate(&engine.device, enc, "layer copy"));
         let mut desc = src.desc.clone();
         desc.id = self.alloc_id();
@@ -2353,16 +2678,25 @@ impl Document {
     pub fn import_resource(&mut self, engine: &Engine, path: &std::path::Path, kind: ResKind) -> anyhow::Result<u64> {
         let bytes = std::fs::read(path)?;
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        self.add_resource(engine, name, bytes, kind)
+        let id = self.add_resource(engine, name, bytes, kind)?;
+        if !crate::library::is_library_file(path) {
+            if let Some(r) = self.resources.get_mut(&id) {
+                r.imported = true;
+            }
+        }
+        Ok(id)
     }
 
     pub fn add_resource(&mut self, engine: &Engine, name: String, bytes: Vec<u8>, kind: ResKind) -> anyhow::Result<u64> {
+        if let Some(r) = self.resources.values().find(|r| r.kind == kind && r.name == name && *r.encoded == bytes) {
+            return Ok(r.id);
+        }
         let img = decode_image(&bytes)?;
         let gpu = crate::engine::texture::rgba8_with_mips(&engine.device, &engine.queue, &name, &img);
         let id = self.alloc_id();
         self.resources.insert(
             id,
-            Resource { id, name, kind, encoded: Arc::new(bytes), gpu: Arc::new(gpu), image: Arc::new(img) },
+            Resource { id, name, kind, imported: false, encoded: Arc::new(bytes), gpu: Arc::new(gpu), image: Arc::new(img) },
         );
         self.modified = true;
         Ok(id)
@@ -2386,6 +2720,7 @@ impl Document {
         if s.resolution() == res {
             return;
         }
+        s.selection = None;
         let dev = &engine.device;
         let b = &engine.blitter;
         let mut enc = dev.create_command_encoder(&Default::default());
@@ -2422,6 +2757,56 @@ impl Document {
 
     /// Replaces the mesh, keeping the layers of texture sets whose material
     /// name still exists. Returns remarks for the user.
+    /// Auto UV: the same mesh with new UVs. Every painted texture (paint
+    /// layers, painted masks) is carried over to the new layout first, then
+    /// the mesh is swapped like a reimport. Baked maps must be baked again.
+    pub fn apply_new_uvs(&mut self, engine: &Engine, mesh: MeshData) -> Vec<String> {
+        use wgpu::util::DeviceExt;
+        let old = self.mesh.clone();
+        let mut xfer = crate::engine::uvtransfer::UvTransfer::new(&engine.device);
+        let mut enc = engine.device.create_command_encoder(&Default::default());
+        for s in self.sets.iter_mut() {
+            let (Some(os), Some(ns)) = (old.submeshes.get(s.submesh), mesh.submeshes.get(s.submesh)) else { continue };
+            if os.indices.len() != ns.indices.len() {
+                continue;
+            }
+            let uv = |m: &MeshData, i: u32| m.vertices[i as usize].uv;
+            // A set left out of the unwrap keeps its layout and its paint.
+            if os.indices.iter().zip(&ns.indices).all(|(o, n)| uv(&old, *o) == uv(&mesh, *n)) {
+                continue;
+            }
+            let tris: Vec<([[f32; 2]; 3], [[f32; 2]; 3])> = os
+                .indices
+                .chunks_exact(3)
+                .zip(ns.indices.chunks_exact(3))
+                .map(|(o, n)| ([uv(&mesh, n[0]), uv(&mesh, n[1]), uv(&mesh, n[2])], [uv(&old, o[0]), uv(&old, o[1]), uv(&old, o[2])]))
+                .collect();
+            let corners = crate::engine::uvtransfer::UvTransfer::corners(&tris, 1.5 / s.resolution() as f32);
+            let buf = engine.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("uv transfer"),
+                contents: bytemuck::cast_slice(&corners),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            let n = corners.len() as u32;
+            visit_mut(&mut s.layers, &mut |l| {
+                let mut move_tex = |t: &mut Arc<Tex>| *t = Arc::new(xfer.resample(&engine.device, &mut enc, t, &buf, n));
+                if let Some(p) = &mut l.paint {
+                    move_tex(&mut p.color);
+                    move_tex(&mut p.vals);
+                    move_tex(&mut p.alph);
+                    for t in [&mut p.emis, &mut p.nrm, &mut p.opac].into_iter().flatten() {
+                        move_tex(t);
+                    }
+                }
+                for t in l.mask_paint.values_mut() {
+                    move_tex(t);
+                }
+            });
+        }
+        engine.queue.submit(Some(enc.finish()));
+        self.reimport(engine, mesh)
+    }
+
     pub fn reimport(&mut self, engine: &Engine, mesh: MeshData) -> Vec<String> {
         let mut notes = mesh.notes.clone();
         let gpu_mesh = GpuMesh::new(&engine.device, &mesh);
@@ -2429,8 +2814,25 @@ impl Document {
         let mut old: Vec<TextureSet> = std::mem::take(&mut self.sets);
         let default_res = old.first().map(|s| s.resolution()).unwrap_or(2048);
         let mut sets = Vec::new();
+        // Same triangles, positions and UVs: the set (its baked maps
+        // included) carries over as it is.
+        let old_mesh = self.mesh.clone();
+        let same = |a: usize, b: usize| {
+            let (sa, sb) = (&old_mesh.submeshes[a], &mesh.submeshes[b]);
+            sa.indices.len() == sb.indices.len()
+                && sa.indices.iter().zip(&sb.indices).all(|(x, y)| {
+                    let (va, vb) = (&old_mesh.vertices[*x as usize], &mesh.vertices[*y as usize]);
+                    va.pos == vb.pos && va.uv == vb.uv
+                })
+        };
         for (i, sub) in mesh.submeshes.iter().enumerate() {
             match old.iter().position(|s| s.name == sub.name) {
+                Some(p) if old[p].submesh < old_mesh.submeshes.len() && same(old[p].submesh, i) => {
+                    let mut o = old.remove(p);
+                    o.submesh = i;
+                    o.dirty = true;
+                    sets.push(o);
+                }
                 Some(p) => {
                     let o = old.remove(p);
                     let mut fresh = Self::make_set(engine, &mesh, i, o.resolution());
@@ -2483,5 +2885,47 @@ impl SetMaps {
             || (bake::position_map(mesh, sub, &raster), bake::world_normal_map(mesh, sub, &raster)),
         );
         SetMaps { raster, nearest, position, wnormal }
+    }
+}
+
+/// Center of every triangle, per submesh.
+pub fn tri_centers(m: &MeshData) -> Vec<Vec<glam::Vec3>> {
+    use rayon::prelude::*;
+    let v = |i: u32| glam::Vec3::from(m.vertices[i as usize].pos);
+    m.submeshes.iter().map(|s| s.indices.par_chunks_exact(3).map(|t| (v(t[0]) + v(t[1]) + v(t[2])) / 3.0).collect()).collect()
+}
+
+/// Back-to-front index buffers for the submeshes in `blended` (alpha
+/// blending is order dependent); the others draw unsorted.
+pub fn sort_blended(doc: &mut Document, engine: &Engine, centers: &[Vec<glam::Vec3>], blended: &[usize], eye: glam::Vec3, fwd: glam::Vec3, ortho: bool) {
+    use rayon::prelude::*;
+    use wgpu::util::DeviceExt;
+    for (si, g) in doc.gpu_mesh.submeshes.iter_mut().enumerate() {
+        if !blended.contains(&si) {
+            g.sorted = None;
+            continue;
+        }
+        let hidden = doc.hidden.get(si);
+        let c = &centers[si];
+        let mut order: Vec<(f32, u32)> = (0..c.len() as u32)
+            .into_par_iter()
+            .filter(|t| !hidden.and_then(|h| h.get(*t as usize)).copied().unwrap_or(false))
+            .map(|t| {
+                let p = c[t as usize];
+                (if ortho { (p - eye).dot(fwd) } else { (p - eye).length_squared() }, t)
+            })
+            .collect();
+        // Farthest first.
+        order.par_sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+        let idx = &doc.mesh.submeshes[si].indices;
+        let sorted: Vec<u32> = order.iter().flat_map(|(_, t)| idx[*t as usize * 3..*t as usize * 3 + 3].iter().copied()).collect();
+        g.sorted = (!sorted.is_empty()).then(|| {
+            let buf = engine.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("sorted indices"),
+                contents: bytemuck::cast_slice(&sorted),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+            (buf, sorted.len() as u32)
+        });
     }
 }

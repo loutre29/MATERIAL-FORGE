@@ -32,7 +32,7 @@ pub struct Slider<'a> {
     indent: f32,
     enabled: bool,
     suffix: &'a str,
-    /// Typed values may go beyond the track range, up to these limits.
+    /// Limits of typed values (default `typed_range`: past the track).
     soft: Option<(f32, f32)>,
 }
 
@@ -54,7 +54,8 @@ impl<'a> Slider<'a> {
         self.log = true;
         self
     }
-    /// Typed values can go up to `lo..=hi` (the track keeps its range).
+    /// Typed values can go up to `lo..=hi` (the track keeps its range);
+    /// without it they go past both ends (`typed_range`).
     pub fn soft(mut self, lo: f32, hi: f32) -> Self {
         self.soft = Some((lo, hi));
         self
@@ -86,8 +87,10 @@ impl<'a> Slider<'a> {
 
     /// Returns true when the value changed.
     pub fn show(self, ui: &mut Ui) -> bool {
+        // Design system slider: label | rounded pill track with an orange
+        // fill and a white knob | the value in a small box (click to type).
         let w = ui.available_width();
-        let (rect, base) = ui.allocate_exact_size(Vec2::new(w, 34.0), Sense::hover());
+        let (rect, base) = ui.allocate_exact_size(Vec2::new(w, 28.0), Sense::hover());
         let rect = Rect::from_min_max(rect.min + Vec2::new(self.indent, 0.0), rect.max);
         // The allocation's auto id is unique: labels repeat ("Scale" in every
         // procedural, child UIs share their parent's id), and a clashing id
@@ -95,10 +98,31 @@ impl<'a> Slider<'a> {
         let id = base.id.with("sp slider");
         let col = |c: Color32| if self.enabled { c } else { c.linear_multiply(0.45) };
         let p = ui.painter().clone();
-        p.text(rect.min + Vec2::new(0.0, 1.0), egui::Align2::LEFT_TOP, self.label, font(12.0), col(LABEL));
+        let wide = rect.width() >= 200.0;
+        let label_w = if self.label.is_empty() {
+            0.0
+        } else if wide {
+            slider_label_width(rect.width())
+        } else {
+            p.layout_no_wrap(self.label.to_string(), font(12.0), LABEL).size().x + 10.0
+        };
+        let value_w = {
+            let k = if self.percent { 100.0 } else { 1.0 };
+            let widest = [self.min * k, self.max * k, *self.value * k]
+                .iter()
+                .map(|v| p.layout_no_wrap(format!("{:.*}{}", self.decimals, v, self.suffix), egui::FontId::monospace(11.0), VALUE).size().x)
+                .fold(0.0f32, f32::max);
+            (widest + 14.0).max(if wide { 52.0 } else { 42.0 }).min(rect.width() * 0.45)
+        };
+        let cy = rect.center().y;
+        if label_w > 0.0 {
+            let lr = Rect::from_min_max(rect.min, Pos2::new(rect.min.x + label_w - 4.0, rect.max.y));
+            p.with_clip_rect(lr).text(Pos2::new(rect.min.x, cy), egui::Align2::LEFT_CENTER, self.label, font(12.0), col(LABEL));
+        }
 
-        // Value: a click types a number.
-        let vrect = Rect::from_min_max(Pos2::new(rect.max.x - 64.0, rect.min.y), Pos2::new(rect.max.x - 6.0, rect.min.y + 16.0));
+        // Value: a small rounded box; a click types a number.
+        let vrect = Rect::from_min_max(Pos2::new(rect.max.x - value_w, cy - 10.0), Pos2::new(rect.max.x, cy + 10.0));
+        p.rect(vrect, 6.0, col(style::FIELD), Stroke::new(1.0f32, style::SEPARATOR));
         let mut changed = false;
         let mut typed = false;
         let mut value = *self.value;
@@ -110,19 +134,18 @@ impl<'a> Slider<'a> {
         }
 
         // Track.
-        let y = rect.min.y + 25.0;
-        let (x0, x1) = (rect.min.x + 6.0, rect.max.x - 8.0);
-        let track = Rect::from_min_max(Pos2::new(x0 - 6.0, y - 8.0), Pos2::new(x1 + 6.0, y + 8.0));
+        let track = Rect::from_min_max(Pos2::new(rect.min.x + label_w, cy - 10.0), Pos2::new((vrect.min.x - 8.0).max(rect.min.x + label_w + 24.0), cy + 10.0));
+        let (x0, x1) = (track.min.x + 9.0, track.max.x - 9.0);
         let tresp = ui.interact(track, id.with("track"), if self.enabled { Sense::click_and_drag() } else { Sense::hover() });
         let (mods, dx) = ui.input(|i| (i.modifiers, i.pointer.delta().x));
         if let Some(pos) = tresp.interact_pointer_pos() {
             if mods.shift && tresp.dragged() {
                 // Shift: fine adjustment, a tenth of the pointer motion.
-                value = self.from_t(self.to_t(*self.value) + dx / (x1 - x0) * 0.1);
+                value = self.from_t(self.to_t(*self.value) + dx / (x1 - x0).max(1.0) * 0.1);
                 changed = true;
             } else if !mods.shift && (tresp.is_pointer_button_down_on() || tresp.dragged() || tresp.clicked()) {
                 // Jump on press, not on release.
-                let mut t = (pos.x - x0) / (x1 - x0);
+                let mut t = (pos.x - x0) / (x1 - x0).max(1.0);
                 if mods.ctrl {
                     // Ctrl snaps to tenths of the track (round values on log tracks).
                     t = (t * 10.0).round() / 10.0;
@@ -151,8 +174,11 @@ impl<'a> Slider<'a> {
             }
         }
         if changed {
+            // Typed numbers aren't held to the track (percentages are: they
+            // are parts of a whole); dragging is.
             let (lo, hi) = match self.soft {
                 Some((lo, hi)) if typed => (lo, hi),
+                None if typed && !self.percent => typed_range(self.min, self.max),
                 _ => (self.min, self.max),
             };
             value = value.clamp(lo, hi);
@@ -161,33 +187,125 @@ impl<'a> Slider<'a> {
             }
             *self.value = value;
         }
-        let t = self.to_t(*self.value);
+        let t = self.to_t(*self.value).clamp(0.0, 1.0);
         let hx = x0 + t * (x1 - x0);
-        p.line_segment([Pos2::new(x0, y), Pos2::new(x1, y)], Stroke::new(1.0f32, col(Color32::from_gray(95))));
-        p.line_segment([Pos2::new(x0, y), Pos2::new(hx, y)], Stroke::new(2.0f32, col(Color32::from_gray(205))));
         let hot = tresp.hovered() || tresp.dragged();
-        p.circle_filled(Pos2::new(hx, y), if hot { 6.5 } else { 5.5 }, style::PANEL);
-        p.circle_stroke(Pos2::new(hx, y), if hot { 6.5 } else { 5.5 }, Stroke::new(1.5f32, col(if hot { Color32::WHITE } else { Color32::from_gray(200) })));
+        p.rect(track, 10.0, col(Color32::from_rgb(34, 34, 38)), Stroke::new(1.0f32, if hot { style::LINE } else { style::SEPARATOR }));
+        let fill = Rect::from_min_max(track.min, Pos2::new((hx + 9.0).min(track.max.x), track.max.y));
+        if fill.width() > 1.0 {
+            p.rect_filled(fill, 10.0, col(if hot { style::ACCENT } else { Color32::from_rgb(222, 98, 28) }));
+        }
+        let r = if hot { 7.5 } else { 7.0 };
+        p.circle_filled(Pos2::new(hx, cy + 1.0), r + 1.0, Color32::from_black_alpha(90));
+        p.circle_filled(Pos2::new(hx, cy), r, col(Color32::WHITE));
         changed
     }
 }
 
-/// Horizontal gradient bar with a handle (uniform grayscale channel values).
+/// Range of a typed value for a track from `min` to `max`: no upper limit,
+/// and below the track only where that can make sense (a track from zero
+/// stays positive, a positive track keeps a positive value).
+pub fn typed_range(min: f32, max: f32) -> (f32, f32) {
+    let lo = if min > 0.0 {
+        min * 1e-3
+    } else if min == 0.0 {
+        0.0
+    } else {
+        -1e7
+    };
+    (lo, 1e7f32.max(max))
+}
+
+/// Label column of wide sliders and rows (they align in a panel).
+pub fn slider_label_width(w: f32) -> f32 {
+    (w * 0.34).clamp(48.0, 96.0)
+}
+
+/// A number a `slide` edits (floats and counts).
+pub trait SlideNum: Copy {
+    fn to_f(self) -> f32;
+    fn from_f(v: f32) -> Self;
+    const INT: bool;
+}
+
+impl SlideNum for f32 {
+    fn to_f(self) -> f32 {
+        self
+    }
+    fn from_f(v: f32) -> Self {
+        v
+    }
+    const INT: bool = false;
+}
+
+impl SlideNum for u32 {
+    fn to_f(self) -> f32 {
+        self as f32
+    }
+    fn from_f(v: f32) -> Self {
+        v.round().max(0.0) as u32
+    }
+    const INT: bool = true;
+}
+
+/// `slide` with `decimals` decimals (angles in whole degrees).
+pub fn slide_dec(ui: &mut Ui, value: &mut f32, range: std::ops::RangeInclusive<f32>, decimals: usize, suffix: &str) -> bool {
+    let mut s = Slider::new("", value, range).decimals(decimals);
+    s.suffix = suffix;
+    ui.allocate_ui(Vec2::new(220.0, 28.0), |ui| {
+        ui.set_width(220.0);
+        s.show(ui)
+    })
+    .inner
+}
+
+/// A design system slider without its label (grid rows that already have
+/// one): pill track and value box, 220 px wide. True when changed.
+pub fn slide<N: SlideNum>(ui: &mut Ui, value: &mut N, range: std::ops::RangeInclusive<N>, log: bool, suffix: &str) -> bool {
+    let mut f = value.to_f();
+    let mut s = Slider::new("", &mut f, range.start().to_f()..=range.end().to_f());
+    s.suffix = suffix;
+    if N::INT {
+        s = s.decimals(0);
+    }
+    if log {
+        s = s.log();
+    }
+    let changed = ui.allocate_ui(Vec2::new(220.0, 28.0), |ui| {
+        ui.set_width(220.0);
+        s.show(ui)
+    })
+    .inner;
+    if changed {
+        *value = N::from_f(f);
+    }
+    changed
+}
+
+/// Grayscale channel value: a pill track shading from `from` to `to`, a
+/// knob of the value's own gray, the value box on the right.
 pub fn gradient_slider(ui: &mut Ui, id: impl std::hash::Hash, value: &mut f32, min: f32, max: f32, from: Color32, to: Color32) -> bool {
     let w = ui.available_width();
-    let (row, base) = ui.allocate_exact_size(Vec2::new(w, 20.0), Sense::hover());
+    let (row, base) = ui.allocate_exact_size(Vec2::new(w, 28.0), Sense::hover());
     let _ = id;
-    // Bar on the left, the typed value on the right (like Painter).
-    let vrect = Rect::from_min_max(Pos2::new(row.max.x - 52.0, row.min.y + 2.0), Pos2::new(row.max.x - 4.0, row.max.y - 2.0));
-    let rect = Rect::from_min_max(row.min, Pos2::new(vrect.min.x - 6.0, row.max.y));
+    let cy = row.center().y;
+    let vrect = Rect::from_min_max(Pos2::new(row.max.x - 52.0, cy - 10.0), Pos2::new(row.max.x, cy + 10.0));
+    let p = ui.painter().clone();
+    p.rect(vrect, 6.0, style::FIELD, Stroke::new(1.0f32, style::SEPARATOR));
+    let rect = Rect::from_min_max(Pos2::new(row.min.x, cy - 10.0), Pos2::new(vrect.min.x - 8.0, cy + 10.0));
     let resp = ui.interact(rect, base.id.with("bar"), Sense::click_and_drag());
     let mut changed = false;
     let edit = NumberEdit { decimals: 3, percent: false, suffix: "", enabled: true, color: VALUE };
     if let Some(v) = edit.show(ui, base.id.with("number"), vrect, *value) {
-        *value = v.clamp(min, max);
+        let (lo, hi) = typed_range(min, max);
+        *value = v.clamp(lo, hi);
         changed = true;
     }
-    let bar = Rect::from_center_size(rect.center(), Vec2::new(rect.width() - 12.0, 7.0));
+    // The track: rounded caps of the end colors, the gradient between them.
+    let (rr, x0, x1) = (8.0, rect.min.x + 8.0, rect.max.x - 8.0);
+    let bar = Rect::from_min_max(Pos2::new(x0, cy - rr), Pos2::new(x1, cy + rr));
+    p.circle_filled(Pos2::new(x0, cy), rr, from);
+    p.circle_filled(Pos2::new(x1, cy), rr, to);
     let mut mesh = egui::Mesh::default();
     mesh.colored_vertex(bar.left_top(), from);
     mesh.colored_vertex(bar.right_top(), to);
@@ -195,27 +313,27 @@ pub fn gradient_slider(ui: &mut Ui, id: impl std::hash::Hash, value: &mut f32, m
     mesh.colored_vertex(bar.left_bottom(), from);
     mesh.add_triangle(0, 1, 2);
     mesh.add_triangle(0, 2, 3);
-    let p = ui.painter();
     p.add(egui::Shape::mesh(mesh));
-    p.line_segment([Pos2::new(bar.center().x, bar.min.y), Pos2::new(bar.center().x, bar.max.y)], Stroke::new(1.0f32, Color32::from_gray(90)));
+    let hot = resp.hovered() || resp.dragged();
+    p.rect_stroke(Rect::from_min_max(Pos2::new(x0 - rr, cy - rr), Pos2::new(x1 + rr, cy + rr)), rr, Stroke::new(1.0f32, if hot { style::LINE } else { style::SEPARATOR }));
     let (shift, dx) = ui.input(|i| (i.modifiers.shift, i.pointer.delta().x));
     if let Some(pos) = resp.interact_pointer_pos() {
         if shift && resp.dragged() {
-            *value = (*value + dx / bar.width() * 0.1 * (max - min)).clamp(min, max);
+            *value = (*value + dx / bar.width().max(1.0) * 0.1 * (max - min)).clamp(min, max);
             changed = true;
         } else if !shift && (resp.is_pointer_button_down_on() || resp.dragged() || resp.clicked()) {
-            let t = ((pos.x - bar.min.x) / bar.width()).clamp(0.0, 1.0);
+            let t = ((pos.x - x0) / bar.width().max(1.0)).clamp(0.0, 1.0);
             *value = min + t * (max - min);
             changed = true;
         }
     }
     let t = ((*value - min) / (max - min)).clamp(0.0, 1.0);
-    let c = Pos2::new(bar.min.x + t * bar.width(), bar.center().y);
-    let hot = resp.hovered() || resp.dragged();
+    let c = Pos2::new(x0 + t * bar.width(), cy);
+    let k = if hot { 8.5 } else { 8.0 };
+    p.circle_filled(c + Vec2::new(0.0, 1.0), k + 1.0, Color32::from_black_alpha(100));
+    p.circle_filled(c, k, Color32::WHITE);
     let shade = (t * 255.0) as u8;
-    p.circle_filled(c, 6.0, Color32::from_gray(shade));
-    p.circle_stroke(c, 6.0, Stroke::new(1.5f32, if hot { Color32::WHITE } else { Color32::from_gray(170) }));
-    let _ = resp;
+    p.circle_filled(c, k - 2.5, Color32::from_gray(shade));
     changed
 }
 
@@ -247,7 +365,7 @@ impl NumberEdit<'_> {
         let shown = if self.percent { value * 100.0 } else { value };
         let live = ui.data(|d| d.get_temp::<EditBuf>(id)).filter(|e| e.1 + 1 >= pass && e.2 == owner);
         let Some(EditBuf(mut buf, _, _)) = live else {
-            ui.painter().text(Pos2::new(vrect.max.x, vrect.min.y + 1.0), egui::Align2::RIGHT_TOP, format!("{:.*}{}", self.decimals, shown, self.suffix), font(12.0), self.color);
+            ui.painter().text(Pos2::new(vrect.max.x - 6.0, vrect.center().y), egui::Align2::RIGHT_CENTER, format!("{:.*}{}", self.decimals, shown, self.suffix), egui::FontId::monospace(11.0), self.color);
             if vresp.clicked() {
                 ui.data_mut(|d| {
                     d.insert_temp(id, EditBuf(format!("{:.*}", self.decimals, shown), pass, owner));
@@ -280,12 +398,12 @@ impl NumberEdit<'_> {
         if esc || !(r.lost_focus() || enter) {
             return None;
         }
-        let v = buf.trim().trim_end_matches(self.suffix).trim().replace(',', ".").parse::<f32>().ok()?;
+        let v = buf.trim().trim_end_matches(self.suffix).trim().replace(',', ".").parse::<f32>().ok().filter(|v| v.is_finite())?;
         Some(if self.percent { v / 100.0 } else { v })
     }
 }
 
-fn lin_to_c32(c: [f32; 3]) -> Color32 {
+pub fn lin_to_c32(c: [f32; 3]) -> Color32 {
     egui::Rgba::from_rgb(c[0].max(0.0), c[1].max(0.0), c[2].max(0.0)).into()
 }
 
@@ -672,8 +790,8 @@ pub fn slot_box(ui: &mut Ui, title: &str, subtitle: &str, thumb: Option<egui::Te
     let w = ui.available_width();
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 40.0), Sense::click());
     let p = ui.painter();
-    p.rect_filled(rect, 3.0, if resp.hovered() { Color32::from_gray(52) } else { style::FIELD });
-    p.rect_stroke(rect, 3.0, Stroke::new(1.0f32, if drop_ok { style::ACCENT } else { Color32::from_gray(64) }));
+    p.rect_filled(rect, 3.0, if resp.hovered() { crate::style::warm(52) } else { style::FIELD });
+    p.rect_stroke(rect, 3.0, Stroke::new(1.0f32, if drop_ok { style::ACCENT } else { crate::style::warm(64) }));
     if drop_ok {
         p.rect_stroke(rect.shrink(1.0), 3.0, Stroke::new(1.0f32, style::ACCENT));
     }
@@ -698,8 +816,8 @@ pub fn resource_card(ui: &mut Ui, thumb: Option<egui::TextureId>, name: &str, su
     let w = ui.available_width();
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 40.0), Sense::click());
     let p = ui.painter().clone();
-    p.rect_filled(rect, 3.0, if resp.hovered() { Color32::from_gray(52) } else { style::FIELD });
-    p.rect_stroke(rect, 3.0, Stroke::new(1.0f32, if drop_ok { style::ACCENT } else { Color32::from_gray(58) }));
+    p.rect_filled(rect, 3.0, if resp.hovered() { crate::style::warm(52) } else { style::FIELD });
+    p.rect_stroke(rect, 3.0, Stroke::new(1.0f32, if drop_ok { style::ACCENT } else { crate::style::warm(58) }));
     let tr = Rect::from_min_size(rect.min + Vec2::new(4.0, 4.0), Vec2::splat(32.0));
     p.rect_filled(tr, 1.0, Color32::BLACK);
     if let Some(t) = thumb {
@@ -722,7 +840,7 @@ pub fn section_title(ui: &mut Ui, title: &str, first: bool) -> Rect {
     if !first {
         ui.add_space(8.0);
         let (r, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), Sense::hover());
-        ui.painter().line_segment([r.left_center(), r.right_center()], Stroke::new(1.0f32, Color32::from_gray(64)));
+        ui.painter().line_segment([r.left_center(), r.right_center()], Stroke::new(1.0f32, crate::style::warm(64)));
     }
     ui.add_space(8.0);
     let r = ui.label(RichText::new(title.to_uppercase()).font(style::bold(12.0)).color(Color32::from_gray(235))).rect;
@@ -740,9 +858,22 @@ pub fn sub_section(ui: &mut Ui, id: impl std::hash::Hash, title: &str, default_o
         .body(|ui| body(ui));
 }
 
+/// `sub_section` whose header opens `menu` on a right click.
+pub fn sub_section_menu(ui: &mut Ui, id: impl std::hash::Hash, title: &str, default_open: bool, menu: impl FnOnce(&mut Ui), body: impl FnOnce(&mut Ui)) {
+    let id = ui.id().with(("sub", id));
+    egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, default_open)
+        .show_header(ui, |ui| {
+            let r = ui.label(RichText::new(title).font(style::bold(12.0)).color(Color32::from_gray(225)));
+            // The rest of the header row answers the right click too.
+            let row = r.rect.union(Rect::from_min_size(r.rect.min, Vec2::new(ui.available_width() + r.rect.width(), r.rect.height())));
+            ui.interact(row, id.with("menu"), Sense::click()).on_hover_text("Right click: copy, paste, reset").context_menu(menu);
+        })
+        .body(|ui| body(ui));
+}
+
 /// Label column of the property rows: about 40 % of the panel.
 pub fn label_width(ui: &Ui) -> f32 {
-    (ui.available_width() * 0.42).clamp(48.0, 110.0)
+    slider_label_width(ui.available_width())
 }
 
 /// "Label    [dropdown]" row.
@@ -763,17 +894,28 @@ pub fn combo_row<T: Copy + PartialEq>(ui: &mut Ui, label: &str, id: impl std::ha
 
 /// "Label    [Enabled / Disabled]" toggle row.
 pub fn toggle_row(ui: &mut Ui, label: &str, value: &mut bool) -> bool {
-    let mut changed = false;
-    ui.horizontal(|ui| {
-        ui.add_sized([label_width(ui), 22.0], egui::Label::new(RichText::new(label).size(12.0).color(LABEL)).truncate());
-        let text = if *value { "Enabled" } else { "Disabled" };
-        let b = egui::Button::new(RichText::new(text).size(12.0)).wrap_mode(egui::TextWrapMode::Truncate).min_size(Vec2::new((ui.available_width() - 2.0).max(16.0), 22.0));
-        if ui.add(b).clicked() {
-            *value = !*value;
-            changed = true;
-        }
-    });
+    let w = ui.available_width();
+    let (r, resp) = ui.allocate_exact_size(Vec2::new(w, 26.0), Sense::click());
+    let lw = slider_label_width(w);
+    let p = ui.painter();
+    p.with_clip_rect(Rect::from_min_max(r.min, Pos2::new(r.min.x + lw - 4.0, r.max.y))).text(Pos2::new(r.min.x, r.center().y), egui::Align2::LEFT_CENTER, label, font(12.0), LABEL);
+    let changed = resp.clicked();
+    if changed {
+        *value = !*value;
+    }
+    let sw = Rect::from_min_size(Pos2::new(r.min.x + lw, r.center().y - 10.0), Vec2::new(36.0, 20.0));
+    let t = ui.ctx().animate_bool(resp.id.with("switch"), *value);
+    let off = if resp.hovered() { style::PRESSED } else { style::HOVER };
+    p.rect_filled(sw, 10.0, lerp_color(off, style::ACCENT, t));
+    let kx = sw.min.x + 10.0 + t * 16.0;
+    p.circle_filled(Pos2::new(kx, sw.center().y + 0.5), 8.0, Color32::from_black_alpha(70));
+    p.circle_filled(Pos2::new(kx, sw.center().y), 7.0, Color32::WHITE);
     changed
+}
+
+fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
+    let l = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    Color32::from_rgb(l(a.r(), b.r()), l(a.g(), b.g()), l(a.b(), b.b()))
 }
 
 /// Row of icon tabs (top of the Properties panel). Returns the clicked tab.
@@ -835,7 +977,7 @@ pub fn picker_popup(ui: &Ui, id: Id, anchor: &Response, title: &str, items: &[Pi
                         let (r, resp) = ui.allocate_exact_size(Vec2::new(size, size + 14.0), Sense::click());
                         let p = ui.painter();
                         if resp.hovered() {
-                            p.rect_filled(r, 2.0, Color32::from_gray(60));
+                            p.rect_filled(r, 2.0, crate::style::warm(60));
                         }
                         let tr = Rect::from_min_size(r.min + Vec2::new(4.0, 2.0), Vec2::splat(size - 8.0));
                         match it.thumb {
@@ -843,7 +985,7 @@ pub fn picker_popup(ui: &Ui, id: Id, anchor: &Response, title: &str, items: &[Pi
                                 p.image(t, tr, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
                             }
                             None => {
-                                p.rect_filled(tr, 2.0, Color32::from_gray(45));
+                                p.rect_filled(tr, 2.0, crate::style::warm(45));
                             }
                         }
                         let mut n = it.name.clone();
@@ -932,4 +1074,46 @@ pub fn sub_menu<R>(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui) -> R) -> 
         return None;
     }
     Some(ui.indent(id, add).inner)
+}
+
+/// An active filter: an accent chip with a cross; a click anywhere on it
+/// takes the filter away.
+pub fn filter_chip(ui: &mut Ui, text: &str) -> egui::Response {
+    let h = 22.0;
+    let w = filter_chip_width(ui, text);
+    let (r, resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::click());
+    let hov = resp.hovered();
+    let p = ui.painter();
+    p.rect(r, h * 0.5, crate::style::ROW_SELECTED, Stroke::new(1.0f32, if hov { crate::style::ACCENT } else { crate::style::ACCENT.gamma_multiply(0.55) }));
+    p.text(egui::pos2(r.min.x + 9.0, r.center().y), egui::Align2::LEFT_CENTER, text, egui::FontId::proportional(11.0), crate::style::TEXT);
+    let cr = Rect::from_center_size(egui::pos2(r.max.x - 11.0, r.center().y), egui::vec2(10.0, 10.0));
+    super::icons::paint(p, cr, super::icons::Icon::Close, if hov { Color32::WHITE } else { crate::style::TEXT2 });
+    resp.on_hover_text("Remove this filter")
+}
+
+/// Width of a `filter_chip` showing `text`.
+pub fn filter_chip_width(ui: &Ui, text: &str) -> f32 {
+    ui.painter().layout_no_wrap(text.to_string(), egui::FontId::proportional(11.0), Color32::WHITE).size().x + 28.0
+}
+
+/// A filter chip (pill): the active one is light with dark text.
+pub fn pill(ui: &mut Ui, text: &str, on: bool) -> egui::Response {
+    chip_sized(ui, text, on, 12.0, 26.0)
+}
+
+fn chip_sized(ui: &mut Ui, text: &str, on: bool, size: f32, h: f32) -> egui::Response {
+    let g = ui.painter().layout_no_wrap(text.to_string(), egui::FontId::proportional(size), Color32::WHITE);
+    let w = g.size().x + h * 0.9;
+    let (r, resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::click());
+    let (fill, text_c, stroke) = if on {
+        (crate::style::TEXT, Color32::from_rgb(20, 20, 22), Color32::TRANSPARENT)
+    } else if resp.hovered() {
+        (crate::style::HOVER, crate::style::TEXT, crate::style::LINE)
+    } else {
+        (crate::style::FIELD, crate::style::TEXT2, crate::style::SEPARATOR)
+    };
+    let p = ui.painter();
+    p.rect(r, h * 0.5, fill, Stroke::new(1.0f32, stroke));
+    p.text(r.center(), egui::Align2::CENTER_CENTER, text, egui::FontId::proportional(size), text_c);
+    resp
 }

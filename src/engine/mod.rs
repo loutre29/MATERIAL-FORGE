@@ -5,11 +5,14 @@ pub mod blit;
 pub mod composite;
 pub mod env;
 pub mod gpubake;
+pub mod oidn;
 pub mod paint;
 pub mod pathtrace;
 pub mod procgen;
+pub mod select;
 pub mod texture;
 pub mod thumbs;
+pub mod uvtransfer;
 pub mod uvview;
 pub mod viewport;
 
@@ -26,14 +29,18 @@ pub struct GpuSubMesh {
     pub edge_count: u32,
     /// Indices of the triangles left visible by the geometry mask.
     pub visible: Option<(wgpu::Buffer, u32)>,
+    /// Alpha blended sets: the visible triangles sorted back to front for
+    /// the current camera (blending is order dependent).
+    pub sorted: Option<(wgpu::Buffer, u32)>,
 }
 
 impl GpuSubMesh {
-    /// Index buffer to draw (respects the geometry mask).
+    /// Index buffer to draw (respects the geometry mask and, when present,
+    /// the back-to-front order).
     pub fn draw_indices(&self) -> (&wgpu::Buffer, u32) {
-        match &self.visible {
-            Some((b, n)) => (b, *n),
-            None => (&self.index_buffer, self.index_count),
+        match (&self.sorted, &self.visible) {
+            (Some((b, n)), _) | (None, Some((b, n))) => (b, *n),
+            (None, None) => (&self.index_buffer, self.index_count),
         }
     }
 }
@@ -41,6 +48,8 @@ impl GpuSubMesh {
 pub struct GpuMesh {
     pub vertex_buffer: wgpu::Buffer,
     pub submeshes: Vec<GpuSubMesh>,
+    /// Bumped when the visible (not hidden) index buffers change.
+    pub vis_rev: u64,
 }
 
 impl GpuMesh {
@@ -54,13 +63,21 @@ impl GpuMesh {
             .submeshes
             .iter()
             .map(|s| {
-                let mut edges = std::collections::HashSet::new();
-                for t in s.indices.chunks_exact(3) {
+                // Edges of each polygon: an edge seen twice inside the same
+                // polygon is a triangulation diagonal and is not drawn.
+                let mut edges: std::collections::HashMap<(u32, u32), (u32, u32)> = std::collections::HashMap::new();
+                for (ti, t) in s.indices.chunks_exact(3).enumerate() {
+                    let poly = s.tri_polys.get(ti).copied().unwrap_or(u32::MAX);
                     for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
-                        edges.insert(if a < b { (a, b) } else { (b, a) });
+                        let e = edges.entry(if a < b { (a, b) } else { (b, a) }).or_insert((poly, 0));
+                        if e.0 == poly {
+                            e.1 += 1;
+                        } else {
+                            e.1 = 1;
+                        }
                     }
                 }
-                let lines: Vec<u32> = edges.into_iter().flat_map(|(a, b)| [a, b]).collect();
+                let lines: Vec<u32> = edges.into_iter().filter(|(_, (_, n))| *n == 1).flat_map(|((a, b), _)| [a, b]).collect();
                 let empty = [0u32, 0];
                 GpuSubMesh {
                     index_buffer: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -76,10 +93,11 @@ impl GpuMesh {
                     }),
                     edge_count: lines.len() as u32,
                     visible: None,
+                    sorted: None,
                 }
             })
             .collect();
-        Self { vertex_buffer, submeshes }
+        Self { vertex_buffer, submeshes, vis_rev: 0 }
     }
 }
 
@@ -125,6 +143,9 @@ pub struct TextureSetGpu {
     /// tangent-space normal xyz
     pub final_normal: Tex,
     pub final_emissive: Tex,
+    /// The optional channel groups (`document::EXT_NAMES` from the third,
+    /// four per group): full size only while the set uses one of the group.
+    pub final_ext: [Tex; 3],
     pub baked_ao: Tex,
     pub baked_curvature: Tex,
     pub baked_normal: Tex,
@@ -190,6 +211,7 @@ impl TextureSetGpu {
             final_orm: fin("final orm"),
             final_normal: fin("final normal"),
             final_emissive: fin("final emissive"),
+            final_ext: std::array::from_fn(|_| Tex::with_mips(d, "final optional", 1, 1, rgba, final_usage)),
             baked_ao: filled("baked ao", r16, &[1.0]),
             baked_curvature: filled("baked curvature", r16, &[0.5]),
             baked_normal: filled("baked normal", rgba, &[0.0, 0.0, 1.0, 1.0]),
@@ -202,6 +224,26 @@ impl TextureSetGpu {
             cell,
             dilation,
         }
+    }
+
+    /// Some optional channel group is in use (its accumulators are needed).
+    pub fn ext_on(&self) -> bool {
+        self.final_ext.iter().any(|t| t.width > 1)
+    }
+
+    /// Sizes the optional groups' finals: full size for the groups in use,
+    /// one texel otherwise. True when something changed (recomposite all).
+    pub fn ensure_ext(&mut self, device: &wgpu::Device, used: [bool; 3]) -> bool {
+        let usage = wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC;
+        let mut changed = false;
+        for (t, on) in self.final_ext.iter_mut().zip(used) {
+            let size = if on { self.resolution } else { 1 };
+            if t.width != size {
+                *t = Tex::with_mips(device, "final optional", size, size, wgpu::TextureFormat::Rgba16Float, usage);
+                changed = true;
+            }
+        }
+        changed
     }
 
     /// Texels whose finals are computed from `inner` (cell aligned).
@@ -261,6 +303,9 @@ impl TextureSetGpu {
             &self.final_orm,
             &self.final_normal,
             &self.final_emissive,
+            &self.final_ext[0],
+            &self.final_ext[1],
+            &self.final_ext[2],
             &self.baked_ao,
             &self.baked_curvature,
             &self.baked_normal,
@@ -290,6 +335,7 @@ pub struct Engine {
     pub thumbs: thumbs::Thumbnailer,
     pub pathtracer: pathtrace::PathTracer,
     pub procgen: procgen::ProcGen,
+    pub select: select::SelectPipelines,
 }
 
 /// Features this app uses when the adapter has them.
@@ -313,7 +359,8 @@ impl Engine {
         let thumbs = thumbs::Thumbnailer::new(&device);
         let pathtracer = pathtrace::PathTracer::new(&device, &queue);
         let procgen = procgen::ProcGen::new(&device);
-        Self { device, queue, adapter_name, env, viewport, uvview, paint, compositor, blitter, thumbs, pathtracer, procgen }
+        let select = select::SelectPipelines::new(&device, &queue);
+        Self { device, queue, adapter_name, env, viewport, uvview, paint, compositor, blitter, thumbs, pathtracer, procgen, select }
     }
 
     pub fn set_environment(&mut self, env: env::Environment) {

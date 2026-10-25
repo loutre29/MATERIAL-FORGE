@@ -35,6 +35,9 @@ pub enum Entry {
     State { label: String, set: usize, state: SetState },
     /// Geometry mask: hidden triangles per submesh.
     Hidden { label: String, hidden: Vec<Vec<bool>> },
+    /// A texture set's selection before the change (selections are never
+    /// edited in place, so the old texture is the backup).
+    Selection { label: String, set: usize, selection: Option<Arc<Tex>> },
 }
 
 fn copy_region(enc: &mut wgpu::CommandEncoder, src: &Tex, so: (u32, u32), dst: &Tex, d_o: (u32, u32), w: u32, h: u32) {
@@ -53,13 +56,14 @@ fn tile_size(t: &Tex, origin: (u32, u32)) -> (u32, u32) {
 impl Entry {
     pub fn label(&self) -> &str {
         match self {
-            Entry::Stroke { label, .. } | Entry::State { label, .. } | Entry::Hidden { label, .. } => label,
+            Entry::Stroke { label, .. } | Entry::State { label, .. } | Entry::Hidden { label, .. } | Entry::Selection { label, .. } => label,
         }
     }
 
     fn bytes(&self) -> u64 {
         match self {
             Entry::Stroke { textures, .. } => textures.iter().map(|(_, b)| b.bytes()).sum(),
+            Entry::Selection { selection, .. } => selection.as_ref().map_or(0, |t| t.byte_size()),
             Entry::State { .. } | Entry::Hidden { .. } => 0,
         }
     }
@@ -189,6 +193,13 @@ impl History {
                 let old = std::mem::replace(&mut doc.hidden, hidden);
                 doc.refresh_visibility(engine);
                 Entry::Hidden { label, hidden: old }
+            }
+            Entry::Selection { label, set, selection } => {
+                let old = match doc.sets.get_mut(set) {
+                    Some(s) => std::mem::replace(&mut s.selection, selection),
+                    None => selection,
+                };
+                Entry::Selection { label, set, selection: old }
             }
         }
     }

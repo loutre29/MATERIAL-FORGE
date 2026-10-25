@@ -1,6 +1,6 @@
 [package]
 name = "material_forge"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Material Forge: a clean-room PBR 3D texture painter written in Rust"
 publish = false
@@ -12,11 +12,10 @@ path = "src/main.rs"
 [dependencies]
 eframe = { version = "0.29.1", default-features = false, features = ["default_fonts", "wgpu", "accesskit"] }
 wgpu = "22.1.0"
-egui_dock = { version = "0.14.0", features = ["serde"] }
 glam = { version = "0.29.2", features = ["bytemuck"] }
 bytemuck = { version = "1.19.0", features = ["derive"] }
 gltf = "1.4.1"
-image = { version = "0.25.5", default-features = false, features = ["png", "jpeg", "hdr", "exr", "tga", "tiff", "bmp", "ico"] }
+image = { version = "0.25.5", default-features = false, features = ["png", "jpeg", "hdr", "exr", "tga", "tiff", "bmp", "ico", "webp"] }
 half = "2.4.1"
 mikktspace = "0.3.0"
 rayon = "1.10.0"
@@ -27,7 +26,12 @@ flate2 = "1.0.34"
 anyhow = "1.0.93"
 pollster = "0.3.0"
 log = "0.4.22"
+libloading = "0.8.9"
+uvunwrap = { path = "vendor/uvunwrap" }
+faer = { version = "0.22", default-features = false, features = ["std"] }
 env_logger = "0.11.5"
+# AVIF decoding (rav1d), vendored to build without NASM (see its Cargo.toml).
+avif-decode = { path = "vendor/avif-decode", default-features = false }
 
 [build-dependencies]
 winresource = "0.1.19"

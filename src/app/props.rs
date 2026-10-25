@@ -18,13 +18,22 @@ use std::collections::HashMap;
 pub(super) struct Thumbs {
     pub res: HashMap<u64, egui::TextureId>,
     pub assets: HashMap<String, egui::TextureId>,
+    /// Items shown without a thumbnail yet: queued after the frame.
+    pub missing: std::cell::RefCell<Vec<Item>>,
 }
 
 impl Thumbs {
     fn item(&self, it: &Item) -> Option<egui::TextureId> {
         match it {
             Item::ProjectTexture(id, _) => self.res.get(id).copied(),
-            _ => self.assets.get(&it.key()).copied().filter(|t| *t != egui::TextureId::default()),
+            _ => {
+                let key = it.key();
+                let t = self.assets.get(&key).copied();
+                if t.is_none() {
+                    self.missing.borrow_mut().push(it.clone());
+                }
+                t.filter(|t| *t != egui::TextureId::default())
+            }
         }
     }
     fn pick_items(&self, items: &[Item]) -> Vec<PickItem> {
@@ -46,6 +55,7 @@ enum SlotPick {
     Item(Item),
 }
 
+#[derive(PartialEq)]
 enum Mode {
     /// Paint tool settings (brush, alpha, stencil, material).
     Paint,
@@ -55,12 +65,40 @@ enum Mode {
     Selection,
 }
 
+/// The brush material in the fill material editor (its commands carry this
+/// id instead of a layer's).
+pub(super) const BRUSH_FILL: u64 = u64::MAX;
+
+/// The brush's plain values as a fill.
+pub(super) fn brush_fill(m: &crate::brush::BrushMaterial) -> FillDesc {
+    let mut f = FillDesc::default();
+    let vals = [m.color, [m.roughness; 3], [m.metallic; 3], [m.height; 3], m.emissive, [m.opacity; 3], m.normal];
+    for (c, v) in vals.into_iter().enumerate() {
+        f.channels[c].value = v;
+        f.channels[c].enabled = m.channels[c];
+    }
+    f
+}
+
+/// A plain fill's values back into the brush.
+fn set_brush_values(m: &mut crate::brush::BrushMaterial, f: &FillDesc) {
+    let v = |c: usize| f.channels[c].value;
+    m.color = v(CH_COLOR);
+    m.roughness = v(CH_ROUGH)[0];
+    m.metallic = v(CH_METAL)[0];
+    m.height = v(CH_HEIGHT)[0];
+    m.emissive = v(CH_EMISSIVE);
+    m.opacity = v(CH_OPACITY)[0];
+    m.normal = v(CH_NORMAL);
+}
+
 fn accepts_texture(it: &Item) -> bool {
     matches!(it, Item::Texture(_) | Item::ProjectTexture(..))
 }
 
 fn accepts_fill_source(it: &Item) -> bool {
-    matches!(it, Item::Texture(_) | Item::ProjectTexture(..) | Item::Procedural(_) | Item::Material(..))
+    // Any map: images, alphas (files or built-in), procedurals, materials.
+    matches!(it, Item::Texture(_) | Item::AlphaFile(_) | Item::Alpha(_) | Item::ProjectTexture(..) | Item::Procedural(_) | Item::Material(..) | Item::TexMaterial(_))
 }
 
 fn accepts_alpha(it: &Item) -> bool {
@@ -85,7 +123,7 @@ fn next_slot_rect(ui: &Ui) -> Rect {
 fn or_divider(ui: &mut Ui) {
     let (r, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 18.0), egui::Sense::hover());
     let p = ui.painter();
-    let c = Color32::from_gray(70);
+    let c = crate::style::warm(70);
     p.line_segment([Pos2::new(r.min.x, r.center().y), Pos2::new(r.center().x - 14.0, r.center().y)], egui::Stroke::new(1.0f32, c));
     p.line_segment([Pos2::new(r.center().x + 14.0, r.center().y), Pos2::new(r.max.x, r.center().y)], egui::Stroke::new(1.0f32, c));
     p.text(r.center(), egui::Align2::CENTER_CENTER, "Or", egui::FontId::proportional(11.5), Color32::from_gray(170));
@@ -141,25 +179,32 @@ impl RetroApp {
             });
             return;
         }
+        let title = self.properties_title().replace("Properties - ", "");
+        let sub = self
+            .doc
+            .as_ref()
+            .and_then(|d| d.sets[d.active].selected_layer().map(|l| format!("on {}", l.desc.name)))
+            .filter(|_| self.properties_mode() != Mode::Selection)
+            .unwrap_or_default();
+        super::dock::panel_header(ui, &title, &sub, |_| {});
         let mut cmds = Vec::new();
         let (thumbs, lists) = self.slot_assets(ctx);
         self.properties_body(ui, ctx, &mut cmds, &thumbs, &lists);
+        for it in thumbs.missing.take() {
+            self.shelf.want(it);
+        }
         for c in cmds {
             self.run_cmd(c);
         }
     }
 
     /// Dock tab title: "Properties - Paint" and so on.
-    pub(super) fn properties_title_short(&self) -> String {
-        self.properties_title()
-    }
-
     /// Everything under the Properties title (also shown by the viewport's
     /// right click quick menu).
     fn properties_body(&mut self, ui: &mut Ui, ctx: &egui::Context, cmds: &mut Vec<Cmd>, thumbs: &Thumbs, lists: &Lists) {
         match self.properties_mode() {
             Mode::Paint => self.paint_properties(ui, ctx, cmds, thumbs, lists),
-            Mode::Tool => self.scroll_body(ui, |app, ui| app.tool_only_properties(ui)),
+            Mode::Tool => self.scroll_body(ui, |app, ui| app.tool_only_properties(ui, cmds, thumbs, lists)),
             Mode::Selection => {
                 let fill = self.doc.as_ref().is_some_and(|d| {
                     let s = &d.sets[d.active];
@@ -201,7 +246,8 @@ impl RetroApp {
         if own {
             return Mode::Selection;
         }
-        if !self.tool.is_brush() {
+        // The path paints with the brush: same properties.
+        if !self.tool.is_brush() && self.tool != Tool::Path {
             return Mode::Tool;
         }
         match (s.selected_layer().map(|l| &l.desc.kind), s.target) {
@@ -222,7 +268,7 @@ impl RetroApp {
         let Some(doc) = &self.doc else { return "Properties".into() };
         let s = &doc.sets[doc.active];
         let tool = match self.tool {
-            Tool::Paint if self.stencil.enabled => "Projection",
+            Tool::Projection => "Projection",
             Tool::Paint => "Paint",
             Tool::Erase => "Eraser",
             Tool::Clone => "Clone",
@@ -230,6 +276,12 @@ impl RetroApp {
             Tool::PolygonFill => "Polygon fill",
             Tool::Picker => "Color picker",
             Tool::Hide => "Geometry mask",
+            Tool::Select(s) => s.name(),
+            Tool::Wand => "Magic wand",
+            Tool::Bucket => "Paint bucket",
+            Tool::Gradient => "Gradient",
+            Tool::SelBrush => "Selection brush",
+            Tool::Path => "Path",
         };
         match self.properties_mode() {
             Mode::Paint | Mode::Tool => format!("Properties - {tool}"),
@@ -277,12 +329,7 @@ impl RetroApp {
         textures.extend(self.shelf.items_of(Category::Textures));
         let procedurals = self.shelf.items_of(Category::Procedurals);
         let materials = self.shelf.items_of(Category::Materials);
-        for it in alphas.iter().chain(&procedurals).chain(&materials).chain(textures.iter()) {
-            if !matches!(it, Item::ProjectTexture(..)) {
-                self.shelf.want(it.clone());
-            }
-        }
-        (Thumbs { res, assets: self.shelf.thumb_map() }, Lists { alphas, textures, procedurals, materials })
+        (Thumbs { res, assets: self.shelf.thumb_map(), missing: Default::default() }, Lists { alphas, textures, procedurals, materials })
     }
 
     // ------------------------------------------------------------ paint tools
@@ -308,6 +355,7 @@ impl RetroApp {
         }
         self.scroll_body(ui, |app, ui| {
             let header = app.mask_target_header(ui, cmds);
+            let header = header || (!header && app.paths_section(ui));
             let r = widgets::section_title(ui, "Brush", !header);
             if jump == Some(0) {
                 ui.scroll_to_rect(r, Some(egui::Align::TOP));
@@ -327,8 +375,75 @@ impl RetroApp {
             if jump == Some(3) {
                 ui.scroll_to_rect(r, Some(egui::Align::TOP));
             }
-            app.brush_material_section(ui, th, lists);
+            app.brush_material_section(ui, cmds, th, lists);
         });
+    }
+
+    /// Path tool: the paths of the active path layer (select, show, rename,
+    /// delete); the sections under it edit the layer's brush and material,
+    /// shared by all its paths.
+    fn paths_section(&mut self, ui: &mut Ui) -> bool {
+        if self.tool != Tool::Path {
+            return false;
+        }
+        widgets::section_title(ui, "Paths", true);
+        let Some(paths) = self.active_paths() else {
+            hint(ui, "Click on the mesh to start a path: a path layer is added. Its paint comes from its paths, which stay editable.");
+            return true;
+        };
+        let new_layer = ui
+            .add(egui::Button::new(RichText::new("New path layer").size(12.0)).min_size(egui::vec2(ui.available_width(), 24.0)))
+            .on_hover_text("Paths with another brush or material go on their own layer")
+            .clicked();
+        let rows: Vec<(u64, String, bool, usize, bool)> = paths.iter().map(|p| (p.id, p.name.clone(), p.visible, p.points.len(), p.uv)).collect();
+        if rows.is_empty() {
+            hint(ui, "Click on the mesh (or in the 2D view) to start a path.");
+        }
+        let sel = self.path.path;
+        let (mut pick, mut vis, mut del) = (None, None, None);
+        for (id, name, visible, n, uv) in &rows {
+            ui.horizontal(|ui| {
+                let mut v = *visible;
+                if ui.checkbox(&mut v, "").on_hover_text("Paint this path").changed() {
+                    vis = Some((*id, v));
+                }
+                let label = format!("{name}  ({n} point{}{})", if *n == 1 { "" } else { "s" }, if *uv { ", UV" } else { "" });
+                if ui.selectable_label(sel == Some(*id), RichText::new(label).size(12.0)).clicked() {
+                    pick = Some(*id);
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("Delete").clicked() {
+                        del = Some(*id);
+                    }
+                });
+            });
+        }
+        if let Some(id) = pick {
+            self.select_path(Some(id));
+        }
+        if let Some((id, v)) = vis {
+            self.edit_path(id, |p| p.visible = v);
+        }
+        if let Some(id) = del {
+            self.delete_path(id);
+        }
+        if let Some(name) = self.selected_path().map(|p| p.name.clone()) {
+            let mut edit = name.clone();
+            ui.horizontal(|ui| {
+                ui.add_sized([widgets::label_width(ui), 22.0], egui::Label::new(RichText::new("Name").size(12.0).color(widgets::LABEL)));
+                ui.add(egui::TextEdit::singleline(&mut edit).desired_width(f32::INFINITY));
+            });
+            if edit != name {
+                if let Some(p) = self.selected_path_mut() {
+                    p.name = edit;
+                }
+            }
+        }
+        hint(ui, "Brush, Alpha and Material below apply to every path of this layer, live. Other settings: New path layer.");
+        if new_layer {
+            self.new_path_layer();
+        }
+        true
     }
 
     fn brush_section(&mut self, ui: &mut Ui, title: Rect, th: &Thumbs) {
@@ -350,16 +465,8 @@ impl RetroApp {
             .map(|b| PickItem { name: b.name.clone(), thumb: th.assets.get(&format!("brush:{}", b.name)).copied().filter(|t| *t != egui::TextureId::default()) })
             .collect();
         if let Some(i) = widgets::picker_popup(ui, pid, &mresp, "Brush presets", &items) {
-            // A preset is a brush tip: size, symmetry, lazy mouse and pen
-            // settings stay as the user set them.
-            let keep = self.brush.clone();
-            self.brush = presets[i].settings.clone();
-            self.brush.size = keep.size;
-            self.brush.symmetry = keep.symmetry;
-            self.brush.lazy = keep.lazy;
-            self.brush.pressure_size = keep.pressure_size;
-            self.brush.pressure_flow = keep.pressure_flow;
-            self.status = format!("Brush: {}", presets[i].name);
+            let preset = presets[i].clone();
+            self.apply_brush_preset(&preset);
         }
         let b = &mut self.brush;
         let pen = |ui: &mut Ui, on: &mut bool, tip: &str| {
@@ -393,7 +500,7 @@ impl RetroApp {
         widgets::toggle_row(ui, "Backface culling", &mut b.angle_fade);
         ui.add_space(2.0);
         if ui.add(egui::Button::new("Save as brush preset").min_size(egui::vec2(ui.available_width(), 22.0))).clicked() {
-            let preset = crate::brush::BrushPreset { name: format!("Brush {}", super::panels::chrono_like_stamp()), settings: self.brush.clone() };
+            let preset = crate::brush::BrushPreset::new(format!("Brush {}", super::panels::chrono_like_stamp()), self.brush.clone());
             match crate::library::save_brush(&preset) {
                 Ok(p) => {
                     self.shelf.refresh();
@@ -439,6 +546,7 @@ impl RetroApp {
 
     fn stencil_section(&mut self, ui: &mut Ui, cmds: &mut Vec<Cmd>, th: &Thumbs, lists: &Lists) {
         let name = self.stencil.resource.and_then(|id| self.doc.as_ref()?.resources.get(&id)).map(|r| r.name.clone());
+        let projection_tool = self.tool == Tool::Projection;
         let st = &mut self.stencil;
         let (hovering, dropped) = slot_drop(ui, next_slot_rect(ui), &accepts_texture);
         let (resp, cleared) = match &name {
@@ -457,16 +565,15 @@ impl RetroApp {
         let picked = widgets::picker_popup(ui, pid, &resp, "Textures", &th.pick_items(&lists.textures)).map(|i| lists.textures[i].clone());
         for it in dropped.into_iter().chain(picked) {
             match it {
-                Item::ProjectTexture(id, _) => {
-                    st.resource = Some(id);
-                    st.enabled = true;
-                }
+                Item::ProjectTexture(id, _) => st.resource = Some(id),
                 Item::Texture(p) => cmds.push(Cmd::AssignFile(p, TexSlot::Stencil)),
                 _ => {}
             }
         }
+        if !projection_tool {
+            hint(ui, "The image is projected only in the Projection tool (Shift + B).");
+        }
         if st.resource.is_some() {
-            widgets::toggle_row(ui, "Projection", &mut st.enabled);
             Slider::new("Size", &mut st.size, 10.0..=4000.0).log().decimals(0).show(ui);
             Slider::new("Rotation", &mut st.rotation, -180.0..=180.0).decimals(0).show(ui);
             Slider::new("Overlay opacity", &mut st.opacity, 0.0..=1.0).percent().show(ui);
@@ -475,11 +582,11 @@ impl RetroApp {
             if st.drive_height {
                 Slider::new("Height strength", &mut st.height_strength, 0.0..=2.0).show(ui);
             }
-            hint(ui, "S + left drag moves, S + right drag scales and rotates.");
+            hint(ui, "T + left drag rotates, T + middle drag moves, T + right drag scales.");
         }
     }
 
-    fn brush_material_section(&mut self, ui: &mut Ui, th: &Thumbs, lists: &Lists) {
+    fn brush_material_section(&mut self, ui: &mut Ui, cmds: &mut Vec<Cmd>, th: &Thumbs, lists: &Lists) {
         let target_is_mask = self.doc.as_ref().map(|d| d.sets[d.active].target.is_mask()).unwrap_or(false);
         let erase = self.tool == Tool::Erase;
         let m = &mut self.mat;
@@ -491,81 +598,52 @@ impl RetroApp {
             }
             return;
         }
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
-            for c in 0..NCH {
-                if widgets::chip(ui, CHANNEL_SHORT[c], m.channels[c], CHANNELS[c]).clicked() {
-                    m.channels[c] = !m.channels[c];
-                }
-            }
-        });
-        ui.add_space(4.0);
         if erase {
             // Like Painter: the eraser only picks the channels it removes.
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+                for c in 0..NCH {
+                    if widgets::chip(ui, CHANNEL_SHORT[c], m.channels[c], CHANNELS[c]).clicked() {
+                        m.channels[c] = !m.channels[c];
+                    }
+                }
+            });
+            ui.add_space(4.0);
             hint(ui, "The eraser removes every enabled channel.");
             return;
         }
-        let (hovering, dropped) = slot_drop(ui, next_slot_rect(ui), &|it| matches!(it, Item::Material(..)));
-        let (resp, cleared) = match &m.material {
-            Some((n, _)) => widgets::resource_card(ui, th.assets.get(&format!("mat:{n}")).copied(), n, "Material", true, hovering),
-            None => (widgets::slot_box(ui, "Material mode", "No resource selected", None, hovering), false),
+        // The brush material has a fill layer's slots: per channel a value,
+        // an image or map, or a procedural; or a whole material. Plain
+        // values paint as values, anything else is evaluated per texel.
+        let empty = HashMap::new();
+        let resources = self.doc.as_ref().map(|d| &d.resources).unwrap_or(&empty);
+        let mut fd = match &m.material {
+            Some((_, f)) => f.clone(),
+            None => brush_fill(m),
         };
-        super::mark(ui.ctx(), "slot:Material mode", resp.rect);
-        if cleared {
-            m.material = None;
-        }
-        let pid = ui.id().with("brush mat picker");
-        if resp.clicked() && !cleared {
-            ui.memory_mut(|mm| mm.toggle_popup(pid));
-        }
-        let picked = widgets::picker_popup(ui, pid, &resp, "Materials", &th.pick_items(&lists.materials)).map(|i| lists.materials[i].clone());
-        if let Some(Item::Material(n, f)) = dropped.or(picked) {
-            m.material = Some((n, f));
-        }
-        if m.material.is_some() {
-            return;
-        }
-        or_divider(ui);
         for c in 0..NCH {
-            if !m.channels[c] {
-                continue;
-            }
-            ui.label(RichText::new(CHANNELS[c]).size(12.0).color(widgets::LABEL));
-            match c {
-                CH_COLOR => {
-                    widgets::color_bar(ui, "brush color", &mut m.color);
-                }
-                CH_ROUGH => {
-                    widgets::gradient_slider(ui, "brush rough", &mut m.roughness, 0.0, 1.0, Color32::BLACK, Color32::WHITE);
-                }
-                CH_METAL => {
-                    widgets::gradient_slider(ui, "brush metal", &mut m.metallic, 0.0, 1.0, Color32::BLACK, Color32::WHITE);
-                }
-                CH_HEIGHT => {
-                    widgets::gradient_slider(ui, "brush height", &mut m.height, -1.0, 1.0, Color32::BLACK, Color32::WHITE);
-                }
-                CH_EMISSIVE => {
-                    widgets::color_bar(ui, "brush emissive", &mut m.emissive);
-                }
-                CH_OPACITY => {
-                    widgets::gradient_slider(ui, "brush opacity", &mut m.opacity, 0.0, 1.0, Color32::BLACK, Color32::WHITE);
-                }
-                _ => {
-                    let (r, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 18.0), egui::Sense::hover());
-                    ui.painter().rect_filled(r.shrink(2.0), 1.0, Color32::from_rgb(128, 128, 255));
-                }
-            }
-            ui.add_space(6.0);
+            fd.channels[c].enabled = m.channels[c];
         }
-        if erase {
-            hint(ui, "The eraser removes every enabled channel.");
+        fill_material_ui(ui, BRUSH_FILL, &mut fd, [false; NEXT], resources, th, lists, cmds);
+        for c in 0..NCH {
+            m.channels[c] = fd.channels[c].enabled;
+        }
+        let plain = fd.material.is_none() && fd.channels.iter().all(|c| c.source == SourceKind::Uniform);
+        if plain {
+            set_brush_values(m, &fd);
+            m.material = None;
+        } else {
+            let name = fd.material.clone().unwrap_or_else(|| "Custom".into());
+            widgets::sub_section(ui, "brush projection", "Projection", false, |ui| projection_ui(ui, BRUSH_FILL, &mut fd.projection));
+            m.material = Some((name, fd));
         }
     }
 
     /// Stroke preview image (alpha stamped along a curve), cached.
     fn stroke_preview_texture(&mut self, ctx: &egui::Context) -> Option<egui::TextureId> {
         let b = &self.brush;
-        let key = format!("{:?}|{:.2}|{:.2}|{:.0}", b.alpha, b.hardness, b.spacing, b.angle);
+        // Everything but the size shapes the preview.
+        let key = format!("{:?}", crate::brush::BrushSettings { size: 0.0, ..b.clone() });
         if let Some((k, h)) = &self.stroke_preview {
             if *k == key {
                 return Some(h.id());
@@ -578,56 +656,9 @@ impl RetroApp {
                 None => image::DynamicImage::ImageRgba8(crate::brush::alpha_image(AlphaKind::Round)).to_luma8(),
             },
         };
+        let round = b.alpha == AlphaSource::Builtin(AlphaKind::Round);
         let (w, h) = (176usize, 128usize);
-        let mut acc = vec![0.0f32; w * h];
-        let rad = 15.0f32;
-        let step = (b.spacing * rad * 2.0).max(1.0);
-        let curve = |t: f32| -> (f32, f32) {
-            let x = 18.0 + t * (w as f32 - 36.0);
-            let y = h as f32 * 0.5 - (t * std::f32::consts::PI * 2.4).sin() * h as f32 * 0.28 + (t - 0.5) * 10.0;
-            (x, y)
-        };
-        let (aw, ah) = (alpha.width() as f32, alpha.height() as f32);
-        let (sa, ca) = b.angle.to_radians().sin_cos();
-        let mut t = 0.0f32;
-        let mut prev = curve(0.0);
-        let mut travelled = step;
-        while t <= 1.0 {
-            let c = curve(t);
-            travelled += ((c.0 - prev.0).powi(2) + (c.1 - prev.1).powi(2)).sqrt();
-            prev = c;
-            t += 0.002;
-            if travelled < step {
-                continue;
-            }
-            travelled = 0.0;
-            let (x0, x1) = ((c.0 - rad).floor().max(0.0) as usize, ((c.0 + rad).ceil() as usize).min(w - 1));
-            let (y0, y1) = ((c.1 - rad).floor().max(0.0) as usize, ((c.1 + rad).ceil() as usize).min(h - 1));
-            for y in y0..=y1 {
-                for x in x0..=x1 {
-                    let (dx, dy) = ((x as f32 - c.0) / rad, (y as f32 - c.1) / rad);
-                    let (u, v) = (dx * ca + dy * sa, -dx * sa + dy * ca);
-                    if u.abs() > 1.0 || v.abs() > 1.0 {
-                        continue;
-                    }
-                    let px = (((u * 0.5 + 0.5) * aw) as u32).min(alpha.width() - 1);
-                    let py = (((v * 0.5 + 0.5) * ah) as u32).min(alpha.height() - 1);
-                    let a = alpha.get_pixel(px, py).0[0] as f32 / 255.0;
-                    let r = (u * u + v * v).sqrt();
-                    let edge = ((1.0 - r) / (1.0 - b.hardness + 0.05)).clamp(0.0, 1.0);
-                    let s = a * edge * 0.6;
-                    let o = &mut acc[y * w + x];
-                    *o += (1.0 - *o) * s;
-                }
-            }
-        }
-        let rgba: Vec<u8> = acc
-            .iter()
-            .flat_map(|a| {
-                let g = (a.clamp(0.0, 1.0).powf(1.0 / 2.2) * 255.0) as u8;
-                [g, g, g, 255]
-            })
-            .collect();
+        let rgba = crate::brush::stroke_image(&alpha, b, round, w as u32, h as u32).into_raw();
         let img = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
         let handle = ctx.load_texture("stroke preview", img, egui::TextureOptions::LINEAR);
         let id = handle.id();
@@ -648,8 +679,14 @@ impl RetroApp {
                 f
             }
         };
+        let look = self.preview_look();
+        let set = self.doc.as_ref().and_then(|d| d.sets.get(d.active)).map(|s| s.settings.clone());
         let mut h = std::collections::hash_map::DefaultHasher::new();
         format!("{fill:?}").hash(&mut h);
+        (look.key(), &self.engine.env.name).hash(&mut h);
+        if let Some(st) = &set {
+            format!("{:?}{:?}{}{}", st.base_color, st.base_values, st.height_scale, st.emissive_intensity).hash(&mut h);
+        }
         let key = h.finish();
         if self.brush_ball.as_ref().is_some_and(|b| b.0 == key) || self.brush_ball_at.elapsed().as_secs_f32() < 0.1 {
             return;
@@ -658,7 +695,7 @@ impl RetroApp {
         let tree = LayerTree { desc: LayerDesc::new(0, String::new(), LayerKind::Fill(Box::new(fill))), children: Vec::new() };
         let empty = HashMap::new();
         let resources = self.doc.as_ref().map(|d| &d.resources).unwrap_or(&empty);
-        let tex = self.shelf.preview(&self.engine, &tree, resources);
+        let tex = self.shelf.preview(&self.engine, &tree, resources, look, set.as_ref());
         let mut r = self.renderer.write();
         match &mut self.brush_ball {
             Some(b) => {
@@ -673,19 +710,94 @@ impl RetroApp {
         }
     }
 
-    fn tool_only_properties(&mut self, ui: &mut Ui) {
+    fn tool_only_properties(&mut self, ui: &mut Ui, cmds: &mut Vec<Cmd>, th: &Thumbs, lists: &Lists) {
         let title = self.properties_title().replace("Properties - ", "");
         widgets::section_title(ui, &title, true);
         match self.tool {
             Tool::PolygonFill | Tool::Hide => {
-                widgets::combo_row(ui, "Selection mode", "polymode", &mut self.poly_mode, &PolyMode::ALL, PolyMode::name);
+                if self.tool == Tool::PolygonFill {
+                    widgets::combo_row(ui, "Result", "polyresult", &mut self.poly_to_selection, &[false, true], |s| if s { "Selection" } else { "Fill" });
+                }
+                widgets::combo_row(ui, "Shape", "polyselect", &mut self.poly_select, &super::view3d::PolySelect::ALL, super::view3d::PolySelect::name);
+                if self.poly_select.is_area() {
+                    widgets::combo_row(ui, "Fill mode", "polymode", &mut self.poly_mode, &PolyMode::ALL, PolyMode::name);
+                    widgets::combo_row(ui, "Hit-test", "polyhit", &mut self.poly_hit, &super::view3d::PolyHit::ALL, super::view3d::PolyHit::name);
+                    widgets::toggle_row(ui, "Visible polygons only", &mut self.poly_visible_only);
+                }
+                // The wireframe these tools show.
+                widgets::sub_section(ui, "poly wire", "Wireframe", false, |ui| {
+                    widgets::color_bar_named(ui, "poly wire color", "Wireframe", &mut self.view.wire_color);
+                    widgets::Slider::new("Opacity (3D)", &mut self.view.wire_opacity, 0.0..=1.0).percent().show(ui);
+                    widgets::Slider::new("Opacity (UV)", &mut self.view.uv_wire, 0.0..=1.0).percent().show(ui);
+                });
                 hint(
                     ui,
-                    if self.tool == Tool::Hide {
-                        "Click hides a part, Ctrl + click keeps only it."
-                    } else {
-                        "Click fills the selected layer (or its mask). The eraser unfills."
+                    match (self.tool, self.poly_select) {
+                        (Tool::Hide, _) => "Click or drag a rectangle to hide geometry, Ctrl keeps only the selection.",
+                        (_, super::view3d::PolySelect::Marquee) => "Click fills under the cursor, drag a rectangle to fill everything inside it.",
+                        (_, super::view3d::PolySelect::Lasso) => "Click fills under the cursor, draw an outline to fill everything inside it.",
+                        (_, super::view3d::PolySelect::Loop) => "Click fills a loop of quads, drag over other quads to add their loops.",
+                        _ => "Drag from a quad along a loop; move sideways to grow a patch (Shift: the loop only).",
                     },
+                );
+                // Polygon fill paints the brush material: shown here.
+                if self.tool == Tool::PolygonFill && !self.poly_to_selection {
+                    widgets::section_title(ui, "Material", false);
+                    self.brush_material_section(ui, cmds, th, lists);
+                }
+            }
+            Tool::Gradient => {
+                widgets::combo_row(ui, "Type", "gradient kind", &mut self.gradient_kind, &[0u8, 1, 2], |k| ["Linear", "Radial", "Reflected"][k as usize]);
+                widgets::Slider::new("Opacity", &mut self.brush.flow, 0.01..=1.0).percent().show(ui);
+                widgets::toggle_row(ui, "Through", &mut self.gradient_through);
+                hint(
+                    ui,
+                    if self.gradient_through {
+                        "3D view: every texel of the texture set takes the gradient, hidden or facing away too."
+                    } else {
+                        "3D view: only the surfaces the camera sees take the gradient."
+                    },
+                );
+                let mask = self.doc.as_ref().map(|d| d.sets[d.active].target.is_mask()).unwrap_or(false);
+                widgets::section_title(ui, if mask { "Gradient (mask values)" } else { "Gradient" }, false);
+                let brush = self.mat.color;
+                let stops = if mask { &mut self.grad_mask } else { &mut self.grad_color };
+                super::gradient::editor_section(ui, if mask { "mask gradient" } else { "color gradient" }, stops, &mut self.grad_sel, mask, brush);
+                if !mask {
+                    widgets::toggle_row(ui, "Stop colors", &mut self.grad_stop_colors);
+                }
+                hint(
+                    ui,
+                    "Drag a line over the mesh (3D or 2D): the stops spread from its start to its end. Radial goes outward from the start, reflected both ways.",
+                );
+                if !mask {
+                    widgets::section_title(ui, "Material", false);
+                    self.brush_material_section(ui, cmds, th, lists);
+                }
+            }
+            Tool::Wand | Tool::Bucket => {
+                widgets::Slider::new("Tolerance", &mut self.wand_tolerance, 0.0..=255.0).decimals(0).show(ui);
+                widgets::toggle_row(ui, "Contiguous", &mut self.wand_contiguous);
+                widgets::toggle_row(ui, "All layers", &mut self.wand_all_layers);
+                if self.tool == Tool::Wand {
+                    hint(
+                        ui,
+                        "Click the mesh (3D or 2D) to select the texels of similar color. Contiguous follows the surface across UV seams. \
+                         Shift adds, Ctrl subtracts, Shift + Ctrl intersects.",
+                    );
+                } else {
+                    hint(ui, "Click the mesh to fill the area of similar color with the material below (inside the selection, if any).");
+                    widgets::section_title(ui, "Material", false);
+                    self.brush_material_section(ui, cmds, th, lists);
+                }
+            }
+            Tool::Select(_) => {
+                widgets::toggle_row(ui, "Select through (3D)", &mut self.sel_through);
+                hint(
+                    ui,
+                    "Drag in the 3D or 2D view to select. Shift adds, Ctrl subtracts, Shift + Ctrl intersects. \
+                     Everything you paint, fill or erase then stays inside the selection. \
+                     Ctrl + A all, Ctrl + D deselect, Ctrl + Shift + I invert, Shift + Backspace fills, Delete clears.",
                 );
             }
             _ => hint(ui, "Click the mesh to pick its base color, roughness, metallic and height into the brush."),
@@ -720,8 +832,7 @@ impl RetroApp {
                         if jump == Some(1) {
                             ui.scroll_to_rect(r, Some(egui::Align::TOP));
                         }
-                        fill_material_ui(ui, id, f, resources, th, lists, cmds);
-                        ext_channels_ui(ui, id, f, ext_on, th, lists);
+                        fill_material_ui(ui, id, f, ext_on, resources, th, lists, cmds);
                     }
                     LayerKind::Filter(f) => {
                         widgets::section_title(ui, "Filter", true);
@@ -819,8 +930,35 @@ fn channel_slot(
     let resp = widgets::slot_box(ui, title, subtitle, thumb, hovering);
     super::mark(ui.ctx(), format!("slot:{title}"), resp.rect);
     let pid = ui.id().with(("slot picker", id));
-    if resp.clicked() {
+    // A map or procedural in the slot: a cross (and right click) takes it
+    // out, back to a uniform value, like the stencil card.
+    let set = thumb.is_some() || !subtitle.starts_with("uniform");
+    let mut clear = false;
+    if set {
+        let cr = Rect::from_center_size(Pos2::new(resp.rect.max.x - 14.0, resp.rect.center().y), egui::vec2(16.0, 16.0));
+        let c = ui.interact(cr, resp.id.with("slot clear"), egui::Sense::click()).on_hover_text("Remove (back to a uniform value)");
+        super::mark(ui.ctx(), format!("slot clear:{title}"), cr);
+        icons::paint(ui.painter(), cr.shrink(3.0), Icon::Close, if c.hovered() { Color32::WHITE } else { Color32::from_gray(150) });
+        clear = c.clicked();
+    }
+    if resp.clicked() && !clear {
         ui.memory_mut(|m| m.toggle_popup(pid));
+    }
+    resp.context_menu(|ui| {
+        if ui.add_enabled(set, egui::Button::new("Clear")).clicked() {
+            clear = true;
+            ui.close_menu();
+        }
+    });
+    if clear {
+        return Some(SlotPick::Uniform);
+    }
+    if let Some(it) = dropped {
+        return Some(SlotPick::Item(it));
+    }
+    // The resource list is built only while the picker is open.
+    if !ui.memory(|m| m.is_popup_open(pid)) {
+        return None;
     }
     let mut all: Vec<Item> = Vec::new();
     for l in lists {
@@ -829,9 +967,6 @@ fn channel_slot(
     let mut items = vec![PickItem { name: "Uniform".into(), thumb: None }];
     items.extend(th.pick_items(&all));
     let picked = widgets::picker_popup(ui, pid, &resp, "Resources", &items);
-    if let Some(it) = dropped {
-        return Some(SlotPick::Item(it));
-    }
     match picked {
         Some(0) => Some(SlotPick::Uniform),
         Some(i) => Some(SlotPick::Item(all[i - 1].clone())),
@@ -839,21 +974,10 @@ fn channel_slot(
     }
 }
 
-/// The texture set's optional channels (specular level, transmission) on a
-/// fill: a chip each, then a slot with a uniform value or a procedural.
+/// The texture set's optional channels (specular level, transmission...) on
+/// a fill, after the main ones: a slot each with a uniform value or a
+/// procedural (their chips share the main channels' row).
 fn ext_channels_ui(ui: &mut Ui, id: u64, f: &mut FillDesc, ext_on: [bool; NEXT], th: &Thumbs, lists: &Lists) {
-    if !ext_on.iter().any(|e| *e) {
-        return;
-    }
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
-        for i in 0..NEXT {
-            if ext_on[i] && widgets::chip(ui, EXT_SHORT[i], f.ext[i].enabled, EXT_NAMES[i]).clicked() {
-                f.ext[i].enabled = !f.ext[i].enabled;
-            }
-        }
-    });
-    ui.add_space(4.0);
     for i in 0..NEXT {
         if !ext_on[i] || !f.ext[i].enabled {
             continue;
@@ -882,6 +1006,12 @@ fn ext_channels_ui(ui: &mut Ui, id: u64, f: &mut FillDesc, ext_on: [bool; NEXT],
             ch.value = [a; 3];
             ch.value_b = [b; 3];
             proc_params(ui, ("extproc", id, i), &mut ch.procedural);
+        } else if EXT_RANGE[i] != (0.0, 1.0) {
+            // IOR and the anisotropy angle in their own units.
+            let (lo, hi) = EXT_RANGE[i];
+            let mut v = lo + ch.value[0] * (hi - lo);
+            Slider::new(EXT_NAMES[i], &mut v, lo..=hi).show(ui);
+            ch.value = [((v - lo) / (hi - lo)).clamp(0.0, 1.0); 3];
         } else {
             let mut v = ch.value[0];
             if widgets::gradient_slider(ui, ("ext value", id, i), &mut v, 0.0, 1.0, Color32::BLACK, Color32::WHITE) {
@@ -892,9 +1022,11 @@ fn ext_channels_ui(ui: &mut Ui, id: u64, f: &mut FillDesc, ext_on: [bool; NEXT],
     }
 }
 
-/// Fill layer material: chips, material mode slot, then one slot per enabled
+/// Fill layer material: chips (the main channels, then the texture set's
+/// optional ones in `ext_on`), material mode slot, then one slot per enabled
 /// channel with its value editor.
-fn fill_material_ui(ui: &mut Ui, id: u64, f: &mut FillDesc, resources: &HashMap<u64, Resource>, th: &Thumbs, lists: &Lists, cmds: &mut Vec<Cmd>) {
+#[allow(clippy::too_many_arguments)]
+fn fill_material_ui(ui: &mut Ui, id: u64, f: &mut FillDesc, ext_on: [bool; NEXT], resources: &HashMap<u64, Resource>, th: &Thumbs, lists: &Lists, cmds: &mut Vec<Cmd>) {
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
         for c in 0..NCH {
@@ -902,11 +1034,16 @@ fn fill_material_ui(ui: &mut Ui, id: u64, f: &mut FillDesc, resources: &HashMap<
                 f.channels[c].enabled = !f.channels[c].enabled;
             }
         }
+        for i in 0..NEXT {
+            if ext_on[i] && widgets::chip(ui, EXT_SHORT[i], f.ext[i].enabled, EXT_NAMES[i]).clicked() {
+                f.ext[i].enabled = !f.ext[i].enabled;
+            }
+        }
     });
     ui.add_space(4.0);
     let mut replace: Option<FillDesc> = None;
     {
-        let (hovering, dropped) = slot_drop(ui, next_slot_rect(ui), &|it| matches!(it, Item::Material(..)));
+        let (hovering, dropped) = slot_drop(ui, next_slot_rect(ui), &|it| matches!(it, Item::Material(..) | Item::TexMaterial(_)));
         let (resp, cleared) = match &f.material {
             Some(n) => widgets::resource_card(ui, th.assets.get(&format!("mat:{n}")).copied(), n, "Material", true, hovering),
             None => (widgets::slot_box(ui, "Material mode", "No resource selected", None, hovering), false),
@@ -916,14 +1053,37 @@ fn fill_material_ui(ui: &mut Ui, id: u64, f: &mut FillDesc, resources: &HashMap<
             // Keeps the channels, forgets where they came from.
             f.material = None;
         }
+        // Right click: forget the material, or clear every map it set.
+        resp.context_menu(|ui| {
+            if ui.add_enabled(f.material.is_some(), egui::Button::new("Clear material")).clicked() {
+                f.material = None;
+                ui.close_menu();
+            }
+            let has_maps = f.channels.iter().any(|c| c.source != SourceKind::Uniform);
+            if ui.add_enabled(has_maps, egui::Button::new("Clear all maps")).clicked() {
+                for c in f.channels.iter_mut() {
+                    if c.source != SourceKind::Uniform {
+                        c.source = SourceKind::Uniform;
+                        c.texture = None;
+                    }
+                }
+                f.material = None;
+                ui.close_menu();
+            }
+        });
         let pid = ui.id().with(("fill mat picker", id));
         if resp.clicked() && !cleared {
             ui.memory_mut(|m| m.toggle_popup(pid));
         }
-        let picked = widgets::picker_popup(ui, pid, &resp, "Materials", &th.pick_items(&lists.materials)).map(|i| lists.materials[i].clone());
-        if let Some(Item::Material(n, mut fd)) = dropped.or(picked) {
-            fd.material = Some(n);
-            replace = Some(fd);
+        let open = ui.memory(|m| m.is_popup_open(pid));
+        let picked = if open { widgets::picker_popup(ui, pid, &resp, "Materials", &th.pick_items(&lists.materials)).map(|i| lists.materials[i].clone()) } else { None };
+        match dropped.or(picked) {
+            Some(Item::Material(n, mut fd)) => {
+                fd.material = Some(n);
+                replace = Some(fd);
+            }
+            Some(Item::TexMaterial(m)) => cmds.push(Cmd::FillTexMaterial(id, m)),
+            _ => {}
         }
     }
     or_divider(ui);
@@ -940,11 +1100,12 @@ fn fill_material_ui(ui: &mut Ui, id: u64, f: &mut FillDesc, resources: &HashMap<
             ),
             SourceKind::Procedural => (th.item(&Item::Procedural(ch.procedural.kind)), ch.procedural.kind.name().to_string()),
         };
-        let pick = channel_slot(ui, (id, c), CHANNELS[c], &subtitle, thumb, &accepts_fill_source, th, &[&lists.textures, &lists.procedurals]);
+        let pick = channel_slot(ui, (id, c), CHANNELS[c], &subtitle, thumb, &accepts_fill_source, th, &[&lists.textures, &lists.procedurals, &lists.alphas]);
         match pick {
             Some(SlotPick::Uniform) => ch.source = SourceKind::Uniform,
             Some(SlotPick::Item(Item::ProjectTexture(rid, _))) => cmds.push(Cmd::AssignResource(rid, TexSlot::FillChannel(id, c))),
-            Some(SlotPick::Item(Item::Texture(p))) => cmds.push(Cmd::AssignFile(p, TexSlot::FillChannel(id, c))),
+            Some(SlotPick::Item(Item::Texture(p) | Item::AlphaFile(p))) => cmds.push(Cmd::AssignFile(p, TexSlot::FillChannel(id, c))),
+            Some(SlotPick::Item(Item::Alpha(k))) => cmds.push(Cmd::AssignAlphaShape(k, TexSlot::FillChannel(id, c))),
             Some(SlotPick::Item(Item::Procedural(k))) => {
                 ch.source = SourceKind::Procedural;
                 ch.procedural = ProcParams::of(k);
@@ -960,6 +1121,7 @@ fn fill_material_ui(ui: &mut Ui, id: u64, f: &mut FillDesc, resources: &HashMap<
                 fd.material = Some(n);
                 replace = Some(fd);
             }
+            Some(SlotPick::Item(Item::TexMaterial(m))) => cmds.push(Cmd::FillTexMaterial(id, m)),
             _ => {}
         }
         ui.add_space(2.0);
@@ -1007,6 +1169,7 @@ fn fill_material_ui(ui: &mut Ui, id: u64, f: &mut FillDesc, resources: &HashMap<
         }
         ui.add_space(6.0);
     }
+    ext_channels_ui(ui, id, f, ext_on, th, lists);
     if let Some(fd) = replace {
         let proj = f.projection.clone();
         *f = fd;
@@ -1023,6 +1186,25 @@ fn effect_props(ui: &mut Ui, lid: u64, e: &mut MaskEffect, resources: &HashMap<u
         widgets::combo_row(ui, "Blending", ("eb", eid), &mut e.blend, MaskBlend::ALL, MaskBlend::name);
     }
     Slider::new("Opacity", &mut e.opacity, 0.0..=1.0).percent().show(ui);
+    // Filter effects: which filter.
+    const FILTERS: [&str; 3] = ["Blur", "Invert", "Threshold"];
+    let filter = match e.kind {
+        MaskEffectKind::Blur { .. } => Some(0usize),
+        MaskEffectKind::Invert => Some(1),
+        MaskEffectKind::Threshold { .. } => Some(2),
+        _ => None,
+    };
+    if let Some(mut f) = filter {
+        let before = f;
+        widgets::combo_row(ui, "Filter", ("efk", eid), &mut f, &[0usize, 1, 2], |i| FILTERS[i]);
+        if f != before {
+            e.kind = match f {
+                0 => MaskEffectKind::Blur { radius: 4.0 },
+                1 => MaskEffectKind::Invert,
+                _ => MaskEffectKind::Threshold { value: 0.5 },
+            };
+        }
+    }
     match &mut e.kind {
         MaskEffectKind::Paint => {
             hint(ui, "Paint on the mesh to edit this effect.");
@@ -1044,11 +1226,12 @@ fn effect_props(ui: &mut Ui, lid: u64, e: &mut MaskEffect, resources: &HashMap<u
                 ),
                 SourceKind::Procedural => (th.item(&Item::Procedural(procedural.kind)), procedural.kind.name().to_string()),
             };
-            let accept = |it: &Item| matches!(it, Item::Texture(_) | Item::ProjectTexture(..) | Item::Procedural(_));
-            match channel_slot(ui, ("mfill", eid), "Grayscale", &subtitle, thumb, &accept, th, &[&lists.procedurals, &lists.textures]) {
+            let accept = |it: &Item| matches!(it, Item::Texture(_) | Item::AlphaFile(_) | Item::Alpha(_) | Item::ProjectTexture(..) | Item::Procedural(_));
+            match channel_slot(ui, ("mfill", eid), "Grayscale", &subtitle, thumb, &accept, th, &[&lists.procedurals, &lists.textures, &lists.alphas]) {
                 Some(SlotPick::Uniform) => *source = SourceKind::Uniform,
                 Some(SlotPick::Item(Item::ProjectTexture(rid, _))) => cmds.push(Cmd::AssignResource(rid, TexSlot::MaskFill(lid, eid))),
-                Some(SlotPick::Item(Item::Texture(p))) => cmds.push(Cmd::AssignFile(p, TexSlot::MaskFill(lid, eid))),
+                Some(SlotPick::Item(Item::Texture(p) | Item::AlphaFile(p))) => cmds.push(Cmd::AssignFile(p, TexSlot::MaskFill(lid, eid))),
+                Some(SlotPick::Item(Item::Alpha(k))) => cmds.push(Cmd::AssignAlphaShape(k, TexSlot::MaskFill(lid, eid))),
                 Some(SlotPick::Item(Item::Procedural(k))) => {
                     *source = SourceKind::Procedural;
                     *procedural = ProcParams::of(k);
@@ -1163,6 +1346,9 @@ impl RetroApp {
                 });
             });
         });
+        for it in thumbs.missing.take() {
+            self.shelf.want(it);
+        }
         for c in cmds {
             self.run_cmd(c);
         }

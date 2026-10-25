@@ -118,6 +118,7 @@ fn frame_for<'a>(engine: &Engine, doc: &'a Document, cam: &OrbitCamera, display:
             sh: env.sh,
             light_view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
             light: [0.3, 1.0, 0.4, 1.0],
+            wire: [0.85, 0.85, 0.9, 0.35],
         },
         post: PostUniform { a: [1.0, 0.0, 0.05, 1.5], b: [0.1, 1.0, 1.0, if display > 0.5 { 1.0 } else { 0.0 }], texel: [0.0; 4] },
         mesh: Some(&doc.gpu_mesh),
@@ -133,10 +134,13 @@ fn frame_for<'a>(engine: &Engine, doc: &'a Document, cam: &OrbitCamera, display:
                 display: disp(s),
                 params: SetUniform { k: [0.0, 0.5, 1.0, kind] },
                 visible: true,
+                transmissive: false,
             })
             .collect(),
         shadows: display == 0.0,
         wireframe: display == 0.0,
+        wire_only: None,
+        selection: None,
         path_traced: false,
     }
 }
@@ -281,7 +285,7 @@ pub fn run(out: &Path, mesh_path: Option<&Path>) -> Result<()> {
 
     // Layer tree on the box: smart material folder, procedural fill with a
     // mask stack, an HSL filter on top.
-    let sm = library::smart_materials().into_iter().find(|s| s.name == "Steel painted worn").context("smart material")?;
+    let sm = library::procedural_smart_materials().into_iter().find(|s| s.name == "Steel painted worn").context("smart material")?;
     let folder = doc.instantiate(&engine, 0, &sm.tree);
     let folder_id = folder.desc.id;
     doc.sets[0].selected = None;
@@ -329,7 +333,7 @@ pub fn run(out: &Path, mesh_path: Option<&Path>) -> Result<()> {
     // Wrap-mode stroke through the brush engine on the box paint layer.
     let vp_size = Vec2::new(engine.viewport.width as f32, engine.viewport.height as f32);
     let vpm = cam.view_proj(vp_size.x / vp_size.y);
-    let view = View { view_proj: vpm, inv_view_proj: vpm.inverse(), eye: cam.eye(), size: vp_size, fov_y: cam.fov_y, ppp: 1.0, ortho_wpp: None };
+    let view = View { view_proj: vpm, inv_view_proj: vpm.inverse(), eye: cam.eye(), size: vp_size, fov_y: cam.fov_y, ppp: 1.0, ortho_wpp: None, uv_rot: 0.0 };
     let brush = BrushSettings { size: 40.0, flow: 0.9, spacing: 0.1, ..Default::default() };
     let mut stroke = Stroke::new(Space::Wrap, 0, 1234);
     let mut stamps: Vec<Stamp> = Vec::new();
@@ -368,6 +372,124 @@ pub fn run(out: &Path, mesh_path: Option<&Path>) -> Result<()> {
         let painted = count(&engine, &l.paint.as_ref().unwrap().color, |p| p[3] > 0.5);
         println!("ball paint layer: {painted} texels painted (camera)");
         ensure!(!strict || painted > 500, "camera stroke painted nothing");
+    }
+
+    // Selections: the left half of the UV square selected (2D marquee),
+    // a full fill paints only there; subtract / invert / intersect.
+    {
+        use crate::engine::select::{self, SelOp, SelectUniform, SPACE_ALL, SPACE_UV};
+        let res = doc.sets[1].resolution();
+        let sub = doc.sets[1].submesh;
+        let r = res as f32;
+        let dev = &engine.device;
+        let uv_mask = |x0: f32, x1: f32| {
+            let m = select::rasterize_polygon(&select::rect_points([x0 * r, 0.0], [x1 * r, r]), res, res);
+            select::shape_texture(dev, &engine.queue, res, res, &m)
+        };
+        let uvu = SelectUniform { params: [SPACE_UV, 0.0, 0.0, 0.0], uvx: [1.0, 1.0, 0.0, 0.0], ..Default::default() };
+        let all = SelectUniform { params: [SPACE_ALL, 0.0, 0.0, 0.0], ..Default::default() };
+        let sel = select::new_selection(dev, &engine.queue, res);
+        let mut enc = dev.create_command_encoder(&Default::default());
+        engine.select.apply(dev, &mut enc, &doc.gpu_mesh, sub, None, &sel, Some(&uv_mask(0.0, 0.5)), engine.viewport.depth(), uvu, SelOp::Replace);
+        engine.queue.submit(Some(enc.finish()));
+        let raster = doc.sets[1].raster.tri.iter().map(|t| *t >= 0).collect::<Vec<bool>>();
+        let raster = Raster(raster);
+        // (selected texels left, selected texels right) over covered texels away from the edge.
+        let halves = |bytes: &[u8], f: &dyn Fn(u8) -> bool| {
+            let (mut l, mut rr, mut nl, mut nr) = (0usize, 0usize, 0usize, 0usize);
+            for (i, b) in bytes.iter().enumerate() {
+                if !raster.covered(i) {
+                    continue;
+                }
+                let u = (i as u32 % res) as f32 / r;
+                if u < 0.45 {
+                    nl += 1;
+                    l += f(*b) as usize;
+                } else if u > 0.55 {
+                    nr += 1;
+                    rr += f(*b) as usize;
+                }
+            }
+            (l, nl, rr, nr)
+        };
+        let (l, nl, rr, nr) = halves(&sel.read_bytes(dev, &engine.queue), &|b| b > 250);
+        println!("selection (left half): {l} / {nl} left texels, {rr} / {nr} right texels");
+        ensure!(nl > 100 && l == nl && rr == 0, "the UV marquee did not select exactly the left half");
+        // Painting through the selection: only the left half takes paint.
+        let mut layer = doc.new_layer(&engine, 1, LayerKind::Paint, None);
+        layer.materialize(dev, res, None);
+        engine.paint.selection = Some(sel.texture.create_view(&Default::default()));
+        engine.paint.upload(&engine.queue, uniform(&cam, &engine, MODE_FULL, [0.9, 0.1, 0.1]), &[]);
+        let mut enc = dev.create_command_encoder(&Default::default());
+        engine.paint.draw(dev, &mut enc, &doc.gpu_mesh, sub, None, &paint_targets(&layer, PaintPass::PaintA), engine.viewport.depth(), PaintPass::PaintA, [true; 7]);
+        engine.queue.submit(Some(enc.finish()));
+        engine.paint.selection = None;
+        let col = f16_bytes_to_f32(&layer.paint.as_ref().unwrap().color.read_bytes(dev, &engine.queue));
+        let alpha: Vec<u8> = col.chunks_exact(4).map(|p| (p[3].clamp(0.0, 1.0) * 255.0) as u8).collect();
+        let (l, nl, rr, _) = halves(&alpha, &|b| b > 250);
+        println!("fill through the selection: {l} / {nl} left texels painted, {rr} right");
+        ensure!(l == nl && rr == 0, "painting leaked out of the selection");
+        // Subtract the left quarter, then invert: the right half plus the left quarter.
+        let mut enc = dev.create_command_encoder(&Default::default());
+        engine.select.apply(dev, &mut enc, &doc.gpu_mesh, sub, None, &sel, Some(&uv_mask(0.0, 0.25)), engine.viewport.depth(), uvu, SelOp::Subtract);
+        let inv = select::new_selection(dev, &engine.queue, res);
+        engine.select.apply(dev, &mut enc, &doc.gpu_mesh, sub, None, &inv, None, engine.viewport.depth(), all, SelOp::Replace);
+        engine.select.apply(dev, &mut enc, &doc.gpu_mesh, sub, None, &inv, Some(&sel), engine.viewport.depth(), uvu, SelOp::Subtract);
+        // Intersect with the left half: only the left quarter stays.
+        engine.select.apply(dev, &mut enc, &doc.gpu_mesh, sub, None, &inv, Some(&uv_mask(0.0, 0.5)), engine.viewport.depth(), uvu, SelOp::Intersect);
+        engine.queue.submit(Some(enc.finish()));
+        let bytes = inv.read_bytes(dev, &engine.queue);
+        let quarter = |lo: f32, hi: f32| {
+            bytes.iter().enumerate().filter(|(i, _)| raster.covered(*i)).filter(move |(i, _)| {
+                let u = (*i as u32 % res) as f32 / r;
+                u > lo && u < hi
+            })
+        };
+        let (on, n1) = (quarter(0.02, 0.23).filter(|(_, b)| **b > 250).count(), quarter(0.02, 0.23).count());
+        let off = quarter(0.27, 1.0).filter(|(_, b)| **b > 5).count();
+        println!("subtract / invert / intersect: {on} / {n1} texels in the left quarter, {off} elsewhere");
+        ensure!(on == n1 && n1 > 50 && off == 0, "subtract / invert / intersect gave a wrong selection");
+    }
+
+    // Flood fill (magic wand / bucket): on the box, a contiguous flood of
+    // one color crosses the UV seams and covers the whole surface; without
+    // the seam links it stays on one island.
+    {
+        let s = &doc.sets[0];
+        let raster = &s.raster;
+        let covered = raster.tri.iter().filter(|t| **t >= 0).count();
+        let seed = raster.tri.iter().position(|t| *t >= 0).unwrap();
+        let t0 = Instant::now();
+        let seams = crate::flood::Seams::build(&doc.mesh, s.submesh, raster);
+        let built = t0.elapsed();
+        let all = crate::flood::flood(raster, &seams, seed, true, &|_| true);
+        let n_all = all.iter().filter(|b| **b > 0).count();
+        let one = crate::flood::flood(raster, &crate::flood::Seams::none(), seed, true, &|_| true);
+        let n_one = one.iter().filter(|b| **b > 0).count();
+        println!(
+            "flood: {} seam links ({:.0} ms), across seams {n_all} / {covered} texels, one island {n_one}",
+            seams.link_count(),
+            built.as_secs_f64() * 1000.0
+        );
+        ensure!(n_all == covered, "the flood did not cross every UV seam of the box ({n_all} / {covered})");
+        ensure!(n_one * 3 < covered, "without seam links the flood should stay on one island ({n_one})");
+        // Grow / shrink / feather / border of the left half, across seams.
+        let res = raster.res;
+        let left: Vec<u8> = (0..(res * res) as usize).map(|i| if raster.tri[i] >= 0 && (i as u32 % res) < res / 2 { 255 } else { 0 }).collect();
+        let n = |v: &[u8]| v.iter().filter(|b| **b >= 128).count();
+        let (n0, grow, shrink) = (
+            n(&left),
+            n(&crate::flood::modify(raster, &seams, &left, crate::flood::Modify::Grow, 8.0)),
+            n(&crate::flood::modify(raster, &seams, &left, crate::flood::Modify::Shrink, 8.0)),
+        );
+        let feather = crate::flood::modify(raster, &seams, &left, crate::flood::Modify::Feather, 8.0);
+        let soft = feather.iter().filter(|b| **b > 10 && **b < 245).count();
+        let border = n(&crate::flood::modify(raster, &seams, &left, crate::flood::Modify::Border, 8.0));
+        println!("modify: {n0} selected, grow {grow}, shrink {shrink}, feather {soft} soft texels, border {border}");
+        ensure!(grow > n0 && shrink < n0 && soft > 0 && border > 0 && border < n0, "grow / shrink / feather / border gave wrong sizes");
+        // Not contiguous: every similar texel, here the left half by position.
+        let half = crate::flood::flood(raster, &seams, seed, false, &|i| (i as u32 % raster.res) < raster.res / 2);
+        ensure!(half.iter().filter(|b| **b > 0).count() < covered, "a non contiguous flood took everything");
     }
 
     // Material painting: the Rust material evaluated over the ball set and
@@ -469,7 +591,7 @@ pub fn run(out: &Path, mesh_path: Option<&Path>) -> Result<()> {
     {
         let mut enc = engine.device.create_command_encoder(&Default::default());
         engine.uvview.resize(&engine.device, 600, 600);
-        engine.uvview.render(&engine.device, &mut enc, &doc.sets[0].gpu.final_base, 0, 560.0, [20.0, 20.0], Some((&doc.gpu_mesh, 0)), 0.4);
+        engine.uvview.render(&engine.device, &mut enc, &doc.sets[0].gpu.final_base, 0, 560.0, [20.0, 20.0], 0.0, Some((&doc.gpu_mesh, 0)), [0.9, 0.9, 0.95, 0.4], None);
         engine.queue.submit(Some(enc.finish()));
         screenshot(&engine, &engine.uvview.out, &out.join("04_uv_view.png"))?;
     }
@@ -488,6 +610,7 @@ pub fn run(out: &Path, mesh_path: Option<&Path>) -> Result<()> {
             env: [0.0, 1.0, 0.0, 4.0],
             emi_a: [1.0; 4],
             emi_b: [1.0; 4],
+            ..Default::default()
         };
         for _ in 0..96 {
             let mut enc = engine.device.create_command_encoder(&Default::default());
@@ -686,9 +809,181 @@ pub fn run(out: &Path, mesh_path: Option<&Path>) -> Result<()> {
         ensure!((spec - 0.9).abs() < 0.02 && (trans - 0.6).abs() < 0.02, "optional channels did not reach the finals");
     }
 
+    // A color image with transparency (a decal): where it is transparent
+    // the layer leaves everything under it, in every channel.
+    {
+        let before = export::read_maps(&engine, &doc2, 0);
+        let img = image::RgbaImage::from_fn(64, 64, |x, _| image::Rgba([255, 0, 0, if x < 32 { 0 } else { 255 }]));
+        let mut png = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)?;
+        let rid = doc2.add_resource(&engine, "decal.png".into(), png, ResKind::Texture)?;
+        let mut f = FillDesc::material([1.0; 3], 0.9, 1.0);
+        f.channels[CH_COLOR] = FillChannel { source: SourceKind::Texture, texture: Some(rid), value: [1.0; 3], ..Default::default() };
+        let l = doc2.new_layer(&engine, 0, LayerKind::Fill(Box::new(f)), Some("decal".into()));
+        let decal = l.desc.id;
+        doc2.insert_layer(0, l);
+        composite_all(&engine, &mut doc2);
+        let m = export::read_maps(&engine, &doc2, 0);
+        let res = m.res as usize;
+        let (mut kept, mut left, mut red, mut right) = (0, 0, 0, 0);
+        for y in 0..res {
+            for x in 0..res {
+                let i = (y * res + x) * 4;
+                if before.base[i + 3] < 0.5 || x % (res / 8) == 0 {
+                    continue;
+                }
+                if x < res / 2 - 2 {
+                    left += 1;
+                    let same = (0..3).all(|k| (m.base[i + k] - before.base[i + k]).abs() < 0.02 && (m.orm[i + k] - before.orm[i + k]).abs() < 0.02);
+                    kept += same as usize;
+                } else if x > res / 2 + 2 {
+                    right += 1;
+                    red += (m.base[i] > 0.8 && m.base[i + 1] < 0.1) as usize;
+                }
+            }
+        }
+        println!("image alpha: transparent half kept {kept} of {left} texels, opaque half red {red} of {right}");
+        ensure!(left > 0 && right > 0 && kept * 100 >= left * 99 && red * 100 >= right * 99, "a color image's transparency does not leave the layers under it");
+        doc2.delete_layers(0, &[decal]);
+        composite_all(&engine, &mut doc2);
+    }
+
+    // Replace on the normal or the height hides all the relief below (a
+    // height relief and normal details): the finals' normals are those of
+    // the stack without the layers below.
+    {
+        let mut relief = FillDesc::material([0.5; 3], 0.5, 0.0);
+        relief.channels[CH_HEIGHT] = FillChannel {
+            enabled: true,
+            source: SourceKind::Procedural,
+            procedural: ProcParams::of(ProcKind::Cells),
+            value: [0.0; 3],
+            value_b: [1.0; 3],
+            ..Default::default()
+        };
+        relief.channels[CH_NORMAL].enabled = true;
+        relief.channels[CH_NORMAL].value = [0.4, 0.2, 0.9];
+        let l = doc2.new_layer(&engine, 0, LayerKind::Fill(Box::new(relief)), Some("relief".into()));
+        doc2.insert_layer(0, l);
+        for (name, ch) in [("normal", CH_NORMAL), ("height", CH_HEIGHT)] {
+            let mut top = FillDesc::default();
+            for c in top.channels.iter_mut() {
+                c.enabled = false;
+            }
+            top.channels[ch].enabled = true;
+            let mut l = doc2.new_layer(&engine, 0, LayerKind::Fill(Box::new(top)), Some("replace".into()));
+            l.desc.blend[ch] = BlendMode::Replace;
+            let top_id = l.desc.id;
+            doc2.insert_layer(0, l);
+            composite_all(&engine, &mut doc2);
+            let with = export::read_maps(&engine, &doc2, 0);
+            let mut hidden = Vec::new();
+            visit_mut(&mut doc2.sets[0].layers, &mut |l| {
+                if l.desc.id != top_id && l.desc.visible {
+                    l.desc.visible = false;
+                    hidden.push(l.desc.id);
+                }
+            });
+            doc2.sets[0].dirty = true;
+            composite_all(&engine, &mut doc2);
+            let alone = export::read_maps(&engine, &doc2, 0);
+            visit_mut(&mut doc2.sets[0].layers, &mut |l| {
+                if hidden.contains(&l.desc.id) {
+                    l.desc.visible = true;
+                }
+            });
+            let ndiff = |a: &[f32], b: &[f32]| a.chunks_exact(4).zip(b.chunks_exact(4)).map(|(a, b)| (0..3).map(|k| (a[k] - b[k]).abs()).fold(0.0f32, f32::max)).fold(0.0f32, f32::max);
+            let diff = ndiff(&with.normal, &alone.normal);
+            // Control: without the Replace layer the relief shows.
+            visit_mut(&mut doc2.sets[0].layers, &mut |l| {
+                if l.desc.id == top_id {
+                    l.desc.visible = false;
+                }
+            });
+            doc2.sets[0].dirty = true;
+            composite_all(&engine, &mut doc2);
+            let below = export::read_maps(&engine, &doc2, 0);
+            let shows = ndiff(&below.normal, &alone.normal);
+            println!("replace on the {name}: normals differ from the stack without the layers below by {diff:.4} (relief without it: {shows:.3})");
+            ensure!(shows > 0.05, "the test relief does not show ({shows})");
+            ensure!(diff < 0.02, "Replace on the {name} does not hide the relief below ({diff})");
+            doc2.delete_layers(0, &[top_id]);
+        }
+        let mut rid = None;
+        visit(&doc2.sets[0].layers, &mut |l| {
+            if l.desc.name == "relief" {
+                rid = Some(l.desc.id);
+            }
+        });
+        if let Some(id) = rid {
+            doc2.delete_layers(0, &[id]);
+        }
+        doc2.sets[0].dirty = true;
+        composite_all(&engine, &mut doc2);
+    }
+
+    // The Flakes generator in a normal slot tilts the normals flake by flake.
+    {
+        let flat = export::read_maps(&engine, &doc2, 0);
+        let mut f = FillDesc::material([0.8; 3], 0.3, 1.0);
+        f.channels[CH_NORMAL] = FillChannel { enabled: true, source: SourceKind::Procedural, procedural: ProcParams::of(ProcKind::Flakes), ..Default::default() };
+        let l = doc2.new_layer(&engine, 0, LayerKind::Fill(Box::new(f)), Some("flakes".into()));
+        let fid = l.desc.id;
+        doc2.insert_layer(0, l);
+        composite_all(&engine, &mut doc2);
+        let m = export::read_maps(&engine, &doc2, 0);
+        let n = (m.normal.len() / 4).max(1);
+        let tilted = m.normal.chunks_exact(4).zip(flat.normal.chunks_exact(4)).filter(|(a, b)| (0..3).any(|k| (a[k] - b[k]).abs() > 0.03)).count();
+        println!("flakes normal: {:.0}% of the texels tilted", tilted as f32 * 100.0 / n as f32);
+        ensure!(tilted * 4 > n, "the Flakes normal does not tilt the normals ({tilted} of {n})");
+        doc2.delete_layers(0, &[fid]);
+        doc2.sets[0].dirty = true;
+        composite_all(&engine, &mut doc2);
+    }
+
+    // Optional channels past the first two: their own finals, allocated on
+    // demand; the painted ambient occlusion darkens the applied one.
+    {
+        let before = export::read_maps(&engine, &doc2, 0);
+        ensure!(!doc2.sets[0].gpu.ext_on(), "optional groups allocated while unused");
+        for i in [2, 3, 12] {
+            doc2.sets[0].settings.ext_channels[i] = true;
+        }
+        let mut f = FillDesc::material([0.5; 3], 0.5, 0.0);
+        for c in f.channels.iter_mut() {
+            c.enabled = false;
+        }
+        f.ext[2] = FillChannel { enabled: true, value: [0.3; 3], ..Default::default() };
+        f.ext[3] = FillChannel { enabled: true, value: [0.8; 3], ..Default::default() };
+        let l = doc2.new_layer(&engine, 0, LayerKind::Fill(Box::new(f)), Some("optional".into()));
+        let oid = l.desc.id;
+        doc2.insert_layer(0, l);
+        composite_all(&engine, &mut doc2);
+        let m = export::read_maps(&engine, &doc2, 0);
+        ensure!(doc2.sets[0].gpu.ext_on() && m.ext[0].is_some() && m.ext[1].is_none() && m.ext[2].is_some(), "optional group finals not sized by use");
+        let keep = doc2.sets[0].raster.tri.iter().position(|t| *t >= 0).unwrap_or(0) * 4;
+        let x0 = m.ext[0].as_ref().unwrap();
+        let x2 = m.ext[2].as_ref().unwrap();
+        let ao_ratio = m.orm[keep] / before.orm[keep].max(1e-4);
+        println!(
+            "optional channels: ao {:.2} gloss {:.2} ior {:.2} (default {:.2}), applied ao x{:.2}",
+            x0[keep], x0[keep + 1], x2[keep + 2], EXT_DEFAULTS[12], ao_ratio
+        );
+        ensure!((x0[keep] - 0.3).abs() < 0.01 && (x0[keep + 1] - 0.8).abs() < 0.01, "optional channel values wrong");
+        ensure!((x2[keep + 2] - EXT_DEFAULTS[12]).abs() < 0.01, "optional channel default wrong");
+        ensure!((ao_ratio - 0.3).abs() < 0.02, "painted AO not applied ({ao_ratio})");
+        doc2.delete_layers(0, &[oid]);
+        for i in [2, 3, 12] {
+            doc2.sets[0].settings.ext_channels[i] = false;
+        }
+        doc2.sets[0].dirty = true;
+        composite_all(&engine, &mut doc2);
+        ensure!(!doc2.sets[0].gpu.ext_on(), "optional groups kept after removal");
+    }
+
     // Shelf thumbnail.
     let mut pv = crate::preview::Previewer::new(&engine);
-    let thumb = pv.render(&engine, &library::smart_materials()[1].tree, &doc2.resources);
+    let thumb = pv.render(&engine, &library::procedural_smart_materials()[1].tree, &doc2.resources);
     screenshot(&engine, &thumb, &out.join("06_thumbnail.png"))?;
     // The material itself must be lit, not only the background.
     {
@@ -703,13 +998,223 @@ pub fn run(out: &Path, mesh_path: Option<&Path>) -> Result<()> {
     let _ = Arc::new(());
     let _ = &mut engine;
 
+    quad_check(out)?;
     opacity_check(&mut engine, out)?;
     projection_check(&mut engine, out)?;
     normal_filter_check(&mut engine, out)?;
     visibility_check(&mut engine, out)?;
     tiling_check(&mut engine, out)?;
+    starter_assets_check(&engine, out)?;
+    auto_uv_check(out)?;
 
     println!("SELFTEST OK in {:.1}s, outputs in {}", t0.elapsed().as_secs_f32(), out.display());
+    Ok(())
+}
+
+/// Auto UV: the test scene without its UVs gets UVs in 0-1, every
+/// triangle with a UV area, and OBJ export round-trips them.
+fn auto_uv_check(out: &Path) -> Result<()> {
+    let src = test_obj();
+    // Drop the texture coordinates: "f a/t/n" becomes "f a//n".
+    let mut no_uv = String::new();
+    for line in src.lines() {
+        if line.starts_with("vt ") {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("f ") {
+            let corners: Vec<String> = rest
+                .split_whitespace()
+                .map(|c| {
+                    let p: Vec<&str> = c.split('/').collect();
+                    match p.len() {
+                        3 => format!("{}//{}", p[0], p[2]),
+                        _ => p[0].to_string(),
+                    }
+                })
+                .collect();
+            no_uv.push_str(&format!("f {}\n", corners.join(" ")));
+        } else {
+            no_uv.push_str(line);
+            no_uv.push('\n');
+        }
+    }
+    let p = out.join("auto_uv_in.obj");
+    std::fs::write(&p, no_uv)?;
+    let t = Instant::now();
+    let m = mesh::load(&p)?;
+    let ms = t.elapsed().as_secs_f32() * 1000.0;
+    ensure!(m.notes.iter().any(|n| n.contains("generated automatically")), "no auto UV note: {:?}", m.notes);
+    ensure!(m.vertices.iter().all(|v| (0.0..=1.0).contains(&v.uv[0]) && (0.0..=1.0).contains(&v.uv[1])), "auto UVs outside 0-1");
+    let mut flat = 0;
+    for s in &m.submeshes {
+        for t in s.indices.chunks_exact(3) {
+            let (a, b, c) = (m.vertices[t[0] as usize].uv, m.vertices[t[1] as usize].uv, m.vertices[t[2] as usize].uv);
+            let area = ((b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1])).abs();
+            // Triangles without a 3D area (the sphere's poles) get none in UV either.
+            let p = |k: usize| glam::Vec3::from(m.vertices[t[k] as usize].pos);
+            let area3 = (p(1) - p(0)).cross(p(2) - p(0)).length();
+            if area < 1e-9 && area3 > 1e-6 {
+                flat += 1;
+            }
+        }
+    }
+    ensure!(flat == 0, "{flat} auto UV triangles have no area");
+    let (mirrored, total) = mirrored_uvs(&m);
+    ensure!(mirrored * 20 <= total, "{mirrored} of {total} auto UV triangles are mirrored (a texture reads backwards)");
+    let back = out.join("auto_uv_out.obj");
+    mesh::write_obj(&m, &back)?;
+    let m2 = mesh::load_with(&back, mesh::AutoUv::IfMissing)?;
+    ensure!(m2.triangle_count() == m.triangle_count() && m2.notes.iter().all(|n| !n.contains("generated")), "the exported OBJ lost its UVs");
+    let overlap = uv_overlap(&m);
+    ensure!(overlap == 0, "auto UV islands overlap ({overlap} texels covered twice)");
+    // One texture set alone (a copy of the first, its UVs halved): the
+    // others keep their UVs exactly.
+    {
+        let mut two = m.clone();
+        let base = two.vertices.len() as u32;
+        let copies: Vec<mesh::Vertex> = m.vertices.iter().map(|v| mesh::Vertex { uv: [v.uv[0] * 0.5, v.uv[1] * 0.5], ..*v }).collect();
+        two.vertices.extend(copies);
+        if !two.colors.is_empty() {
+            let c = two.colors.clone();
+            two.colors.extend(c);
+        }
+        let mut b = m.submeshes[0].clone();
+        b.name = "second".into();
+        b.indices.iter_mut().for_each(|i| *i += base);
+        two.submeshes.push(b);
+        let last = two.submeshes.len() - 1;
+        let mut pick = vec![false; last + 1];
+        pick[last] = true;
+        let (only, _) = mesh::unwrap_sets(&two, &mesh::UvSettings::default(), &pick)?;
+        let corners = |mm: &mesh::MeshData, s: usize| mm.submeshes[s].indices.iter().map(|i| mm.vertices[*i as usize].uv).collect::<Vec<_>>();
+        ensure!((0..last).all(|s| corners(&only, s) == corners(&two, s)), "unwrapping one texture set changed another one's UVs");
+        ensure!(corners(&only, last) != corners(&two, last), "the chosen texture set was not unwrapped");
+        let used: std::collections::HashSet<u32> = only.submeshes.iter().flat_map(|s| s.indices.iter().copied()).collect();
+        ensure!(used.len() == only.vertices.len(), "unused vertices left after a partial unwrap");
+    }
+    // A wavy grid of quads: its quads come out straightened, every row
+    // and column on an axis.
+    let (w, h) = (12, 8);
+    let mut grid = String::new();
+    for j in 0..=h {
+        for i in 0..=w {
+            let (x, z) = (i as f32 * 0.2, j as f32 * 0.2);
+            grid.push_str(&format!("v {x} {} {z}\n", 0.3 * (i as f32 * 0.4).sin() * (j as f32 * 0.3).cos()));
+        }
+    }
+    for j in 0..h {
+        for i in 0..w {
+            let a = j * (w + 1) + i + 1;
+            grid.push_str(&format!("f {} {} {} {}\n", a, a + w + 1, a + w + 2, a + 1));
+        }
+    }
+    let p = out.join("auto_uv_grid.obj");
+    std::fs::write(&p, grid)?;
+    let g = mesh::load(&p)?;
+    let mut bent = 0;
+    for s in &g.submeshes {
+        for t in s.indices.chunks_exact(3) {
+            // Two of the three edges (a quad's sides, not its diagonal) on an axis.
+            let mut off: Vec<f32> = (0..3)
+                .map(|k| {
+                    let (a, b) = (g.vertices[t[k] as usize].uv, g.vertices[t[(k + 1) % 3] as usize].uv);
+                    let (du, dv) = ((b[0] - a[0]).abs(), (b[1] - a[1]).abs());
+                    du.min(dv) / du.hypot(dv).max(1e-12)
+                })
+                .collect();
+            off.sort_by(f32::total_cmp);
+            bent += (off[1] > 0.02) as usize;
+        }
+    }
+    ensure!(bent == 0, "{bent} of {} triangles of a quad grid are not straightened", g.triangle_count());
+    ensure!(uv_overlap(&g) == 0 && mirrored_uvs(&g).0 == 0, "the straightened grid overlaps or is mirrored");
+    println!("auto UV: {} triangles unwrapped in {ms:.0} ms, no overlap, OBJ export reloads with its UVs; one texture set unwraps alone; a quad grid comes out straight", m.triangle_count());
+    Ok(())
+}
+
+/// Texels of a 1024 x 1024 UV raster that two triangles of one set cover
+/// (their insides, so neighbors sharing an edge don't count): 0 when no
+/// islands overlap.
+fn uv_overlap(m: &crate::mesh::MeshData) -> usize {
+    const N: usize = 1024;
+    let mut twice = 0;
+    let mut id = 0u32;
+    for s in &m.submeshes {
+        let mut owner = vec![u32::MAX; N * N];
+        for t in s.indices.chunks_exact(3) {
+            id += 1;
+            let p: Vec<[f32; 2]> = (0..3).map(|k| m.vertices[t[k] as usize].uv.map(|c| c * N as f32)).collect();
+            let d = (p[1][0] - p[0][0]) * (p[2][1] - p[0][1]) - (p[2][0] - p[0][0]) * (p[1][1] - p[0][1]);
+            if d.abs() < 1e-9 {
+                continue;
+            }
+            let lo = |k: usize| (p[0][k].min(p[1][k]).min(p[2][k]).floor().max(0.0) as usize).min(N - 1);
+            let hi = |k: usize| (p[0][k].max(p[1][k]).max(p[2][k]).ceil().max(0.0) as usize).min(N - 1);
+            for y in lo(1)..=hi(1) {
+                for x in lo(0)..=hi(0) {
+                    let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+                    let w1 = ((px - p[0][0]) * (p[2][1] - p[0][1]) - (p[2][0] - p[0][0]) * (py - p[0][1])) / d;
+                    let w2 = ((p[1][0] - p[0][0]) * (py - p[0][1]) - (px - p[0][0]) * (p[1][1] - p[0][1])) / d;
+                    if w1 > 1e-4 && w2 > 1e-4 && 1.0 - w1 - w2 > 1e-4 {
+                        let o = &mut owner[y * N + x];
+                        if *o != u32::MAX && *o != id {
+                            twice += 1;
+                        }
+                        *o = id;
+                    }
+                }
+            }
+        }
+    }
+    twice
+}
+
+/// Starter brushes and smart materials: every tip file and texture material
+/// they name exists; contact sheets of their thumbnails (`brushes.png`,
+/// `smart_materials.png`). Skipped without the starter assets.
+fn starter_assets_check(engine: &Engine, out: &Path) -> Result<()> {
+    if library::starter_dir().is_none() {
+        println!("starter assets: not found, skipped");
+        return Ok(());
+    }
+    let sheet = |tiles: &[image::RgbaImage], size: u32, path: &Path| -> Result<()> {
+        let cols = 8u32;
+        let rows = (tiles.len() as u32).div_ceil(cols);
+        let mut img = image::RgbaImage::from_pixel(cols * size, rows.max(1) * size, image::Rgba([30, 30, 30, 255]));
+        for (i, t) in tiles.iter().enumerate() {
+            let t = image::imageops::resize(t, size - 4, size - 4, image::imageops::FilterType::Triangle);
+            image::imageops::overlay(&mut img, &t, ((i as u32 % cols) * size + 2) as i64, ((i as u32 / cols) * size + 2) as i64);
+        }
+        img.save(path)?;
+        Ok(())
+    };
+    let brushes = crate::brush::builtin_brushes();
+    for b in &brushes {
+        if let Some(f) = &b.alpha_file {
+            ensure!(library::starter_alpha(f).is_some(), "brush {}: tip {f} missing", b.name);
+        }
+    }
+    let tiles: Vec<image::RgbaImage> = brushes.iter().map(|b| b.thumbnail(128)).collect();
+    ensure!(tiles.iter().all(|t| t.pixels().any(|p| p[0] > 60)), "a brush thumbnail is empty");
+    sheet(&tiles, 128, &out.join("brushes.png"))?;
+    let sms = library::smart_materials();
+    ensure!(sms.len() >= 18, "only {} of the 18 starter smart materials found their materials", sms.len());
+    let mut pv = crate::preview::Previewer::new_box(engine);
+    let mut tiles = Vec::new();
+    for sm in &sms {
+        let mut resources = std::collections::HashMap::new();
+        for (id, p) in &sm.textures {
+            let img = image::open(p).with_context(|| format!("{}: {}", sm.name, p.display()))?.to_rgba8();
+            let img = image::imageops::thumbnail(&img, 256, 256);
+            let gpu = crate::engine::texture::rgba8_with_mips(&engine.device, &engine.queue, "map", &img);
+            resources.insert(*id, Resource { id: *id, name: String::new(), kind: ResKind::Texture, imported: false, encoded: Default::default(), gpu: Arc::new(gpu), image: Arc::new(img) });
+        }
+        let t = pv.render(engine, &sm.tree, &resources);
+        let px = t.read_bytes(&engine.device, &engine.queue);
+        tiles.push(image::RgbaImage::from_raw(t.width, t.height, px).context("thumbnail size")?);
+    }
+    sheet(&tiles, 192, &out.join("smart_materials.png"))?;
+    println!("starter assets: {} brushes, {} smart materials", brushes.len(), sms.len());
     Ok(())
 }
 
@@ -723,7 +1228,7 @@ pub fn bench() -> Result<()> {
     for res in [2048u32, 4096] {
         let m = mesh::load(&p)?;
         let mut doc = Document::new(&engine, m, "bench".into(), res);
-        for sm in library::smart_materials().iter().take(6) {
+        for sm in library::procedural_smart_materials().iter().take(6) {
             let l = doc.instantiate(&engine, 0, &sm.tree);
             doc.insert_layer(0, l);
         }
@@ -783,6 +1288,15 @@ pub fn bench() -> Result<()> {
 
 /// Paint layers and mask paint effects start as 1x1 placeholders; the app
 /// sizes them on the first stroke, the tests do it up front.
+/// Covered texels of a UV raster (a copy, so the document stays free).
+struct Raster(Vec<bool>);
+
+impl Raster {
+    fn covered(&self, i: usize) -> bool {
+        self.0[i]
+    }
+}
+
 fn materialize_all(engine: &Engine, doc: &mut Document) {
     for s in &mut doc.sets {
         let res = s.resolution();
@@ -878,6 +1392,32 @@ fn projection_check(engine: &mut Engine, out: &Path) -> Result<()> {
 
 /// The opacity channel reaches the final base color alpha, from a fill and
 /// from a paint stroke.
+/// Meshes load as polygons: an OBJ cube made of quads, and the same cube
+/// triangulated, both give 6 polygons (the second by tris-to-quads).
+fn quad_check(out: &Path) -> Result<()> {
+    let v = "v -1 -1 -1\nv 1 -1 -1\nv 1 1 -1\nv -1 1 -1\nv -1 -1 1\nv 1 -1 1\nv 1 1 1\nv -1 1 1\nvt 0 0\nvt 1 0\nvt 1 1\nvt 0 1\n";
+    let quads = [[1, 2, 3, 4], [8, 7, 6, 5], [1, 5, 6, 2], [2, 6, 7, 3], [3, 7, 8, 4], [5, 1, 4, 8]];
+    let mut quad_obj = v.to_string();
+    let mut tri_obj = v.to_string();
+    for q in quads {
+        quad_obj += &format!("f {}/1 {}/2 {}/3 {}/4\n", q[3], q[2], q[1], q[0]);
+        tri_obj += &format!("f {}/1 {}/2 {}/3\nf {}/1 {}/3 {}/4\n", q[3], q[2], q[1], q[3], q[1], q[0]);
+    }
+    let mut counts = Vec::new();
+    for (name, text) in [("quads", quad_obj), ("tris", tri_obj)] {
+        let path = out.join(format!("cube_{name}.obj"));
+        std::fs::write(&path, text)?;
+        let mesh = crate::mesh::load(&path)?;
+        let s = &mesh.submeshes[0];
+        let polys: std::collections::HashSet<u32> = s.tri_polys.iter().copied().collect();
+        anyhow::ensure!(s.tri_polys.len() * 3 == s.indices.len(), "{name}: one polygon id per triangle");
+        anyhow::ensure!(polys.len() == 6, "{name}: cube loaded as {} polygons, expected 6", polys.len());
+        counts.push(polys.len());
+    }
+    println!("quads: cube of quads {} polygons, triangulated cube {} polygons", counts[0], counts[1]);
+    Ok(())
+}
+
 fn opacity_check(engine: &mut Engine, out: &Path) -> Result<()> {
     let p = out.join("opacity.obj");
     std::fs::write(&p, test_obj())?;
@@ -964,7 +1504,7 @@ fn tiling_check(engine: &mut Engine, out: &Path) -> Result<()> {
     std::fs::write(&p, test_obj())?;
     let res = 2048;
     let mut doc = Document::new(engine, mesh::load(&p)?, "tiling".into(), res);
-    for sm in library::smart_materials().iter().take(3) {
+    for sm in library::procedural_smart_materials().iter().take(3) {
         let l = doc.instantiate(engine, 0, &sm.tree);
         doc.insert_layer(0, l);
     }
@@ -1115,5 +1655,584 @@ pub fn proc_sheet(out: &Path) -> Result<()> {
         n += 1;
     }
     println!("{n} procedurals written to {}", out.display());
+    Ok(())
+}
+
+/// `--matsheet <dir>`: the shelf thumbnail of every texture material, one
+/// contact sheet (`materials.png`, a row per folder).
+/// Diagnostic: each fill layer of a project's active set, its layer stack
+/// thumbnail (as the app renders it) next to the model with only that layer
+/// shown (mask off), lit like the viewport. Reads the project, writes PNGs.
+pub fn layer_shot(project_path: &Path, out: &Path) -> Result<()> {
+    std::fs::create_dir_all(out)?;
+    let mut engine = Engine::headless()?;
+    if let Some(p) = library::default_environment() {
+        let (w, h, px) = crate::engine::env::load_hdr(&p)?;
+        let e = crate::engine::env::Environment::build(&engine.device, &engine.queue, w, h, px, "default".into());
+        engine.set_environment(e);
+    }
+    let (mut doc, cam) = project::load(&engine, project_path)?;
+    engine.viewport.resize(&engine.device, 384, 384);
+    let set = doc.active;
+    let mut fills: Vec<u64> = Vec::new();
+    visit(&doc.sets[set].layers, &mut |l| {
+        if matches!(l.desc.kind, LayerKind::Fill(_)) {
+            fills.push(l.desc.id);
+        }
+    });
+    let mut pv_mat = crate::preview::Previewer::new_material(&engine);
+    let t = crate::preview::THUMB;
+    let mut sheet = image::RgbaImage::new(t * 3 + 384, 384 * fills.len().max(1) as u32);
+    for (row, id) in fills.iter().enumerate() {
+        let Some(l) = find(&doc.sets[set].layers, *id) else { continue };
+        let LayerKind::Fill(f) = &l.desc.kind else { continue };
+        let name = l.desc.name.clone();
+        // What the fill writes: channel, source, value.
+        let mut what = String::new();
+        for (c, ch) in f.channels.iter().enumerate().filter(|(_, c)| c.enabled) {
+            what.push_str(&format!(" {}={:?}{:.2?}", CHANNELS[c], ch.source, ch.value));
+        }
+        let base = &doc.sets[set].settings;
+        println!("{row:2} {name}:{what} | projection {:?} | set base {:.2?} {:.2?}", f.projection.mode, base.base_color, base.base_values);
+        let tree = LayerTree { desc: LayerDesc::new(0, String::new(), LayerKind::Fill(f.clone())), children: Vec::new() };
+        // The app's preview, the viewport's default look.
+        let look = crate::preview::Look::default();
+        let tex = pv_mat.render_fill(&engine, &tree, &doc.resources, look, Some(&doc.sets[set].settings));
+        let thumb = image::RgbaImage::from_raw(tex.width, tex.height, tex.read_bytes(&engine.device, &engine.queue)).context("thumb")?;
+        let big = image::imageops::resize(&thumb, t * 3, t * 3, image::imageops::FilterType::Triangle);
+        image::imageops::overlay(&mut sheet, &big, 0, row as i64 * 384);
+        // Solo: this layer (and its folders) only, without its mask.
+        let mut saved: Vec<(u64, bool, Option<bool>)> = Vec::new();
+        let mut keep: Vec<u64> = vec![*id];
+        fn parents(layers: &[Layer], id: u64, path: &mut Vec<u64>) -> bool {
+            for l in layers {
+                if l.desc.id == id {
+                    return true;
+                }
+                path.push(l.desc.id);
+                if parents(&l.children, id, path) {
+                    return true;
+                }
+                path.pop();
+            }
+            false
+        }
+        parents(&doc.sets[set].layers, *id, &mut keep);
+        visit_mut(&mut doc.sets[set].layers, &mut |l| {
+            saved.push((l.desc.id, l.desc.visible, l.desc.mask.as_ref().map(|m| m.enabled)));
+            l.desc.visible = keep.contains(&l.desc.id);
+            if l.desc.id == *id || keep.contains(&l.desc.id) {
+                if let Some(m) = &mut l.desc.mask {
+                    m.enabled = false;
+                }
+            }
+        });
+        doc.sets[set].dirty = true;
+        composite_all(&engine, &mut doc);
+        {
+            let vp = &engine.viewport;
+            let m = cam.view_proj(vp.width as f32 / vp.height as f32);
+            let env = &engine.env;
+            let rot = std::f32::consts::PI;
+            // The viewport's default grading (linear tone mapping).
+            let post = PostUniform { a: [1.0, 3.0, 0.0, 1.5], b: [0.0, 1.0, 1.0, 0.0], texel: [0.0; 4] };
+            let frame = Frame {
+                camera: CameraUniform {
+                    view_proj: m.to_cols_array_2d(),
+                    inv_view_proj: m.inverse().to_cols_array_2d(),
+                    eye: cam.eye().extend(doc.mesh.diagonal()).into(),
+                    env: [rot, 1.0, 4.0, (env.mip_count as f32 - 3.0).max(1.0)],
+                    display: [0.0, 1.0, 0.0, 1.0],
+                    sh: env.sh,
+                    light_view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
+                    light: crate::preview::viewport_key_light(env, rot),
+                    wire: [0.85, 0.85, 0.9, 0.35],
+                },
+                post,
+                mesh: Some(&doc.gpu_mesh),
+                sets: doc
+                    .sets
+                    .iter()
+                    .map(|s| DrawSet {
+                        submesh: s.submesh,
+                        base: &s.gpu.final_base,
+                        orm: &s.gpu.final_orm,
+                        normal: &s.gpu.final_normal,
+                        emissive: &s.gpu.final_emissive,
+                        display: &s.gpu.final_base,
+                        params: SetUniform { k: [0.0, 0.5, 1.0, 0.0] },
+                        visible: true,
+                        transmissive: false,
+                    })
+                    .collect(),
+                shadows: false,
+                wireframe: false,
+                wire_only: None,
+                selection: None,
+                path_traced: false,
+            };
+            let mut enc = engine.device.create_command_encoder(&Default::default());
+            engine.viewport.render(&engine.device, &engine.queue, &mut enc, &frame);
+            engine.queue.submit(Some(enc.finish()));
+        }
+        let o = engine.viewport.output();
+        let shot = image::RgbaImage::from_raw(o.width, o.height, o.read_bytes(&engine.device, &engine.queue)).context("shot")?;
+        image::imageops::overlay(&mut sheet, &shot, (t * 3) as i64, row as i64 * 384);
+        visit_mut(&mut doc.sets[set].layers, &mut |l| {
+            if let Some((_, v, m)) = saved.iter().find(|s| s.0 == l.desc.id) {
+                l.desc.visible = *v;
+                if let (Some(mk), Some(e)) = (&mut l.desc.mask, m) {
+                    mk.enabled = *e;
+                }
+            }
+        });
+
+    }
+    sheet.save(out.join("layers.png"))?;
+    println!("{} fills written to {}", fills.len(), out.join("layers.png").display());
+    Ok(())
+}
+
+pub fn mat_sheet(out: &Path) -> Result<()> {
+    std::fs::create_dir_all(out)?;
+    let mut engine = Engine::headless()?;
+    // Lit like the app: the default environment.
+    if let Some(p) = library::default_environment() {
+        let (w, h, px) = crate::engine::env::load_hdr(&p)?;
+        let e = crate::engine::env::Environment::build(&engine.device, &engine.queue, w, h, px, "default".into());
+        engine.set_environment(e);
+    }
+    let mats = library::texture_materials();
+    ensure!(!mats.is_empty(), "no texture materials found");
+    let mut pv = crate::preview::Previewer::new_material(&engine);
+    let t = crate::preview::THUMB;
+    let cols = 10u32;
+    let rows = (mats.len() as u32).div_ceil(cols);
+    let mut sheet = image::RgbaImage::new(cols * t, rows * t);
+    for (i, m) in mats.iter().enumerate() {
+        let mut resources = std::collections::HashMap::new();
+        let mut ids = std::collections::HashMap::new();
+        for (k, (stem, _)) in library::TEX_MATERIAL_MAPS.iter().enumerate() {
+            let Some(img) = m.map(stem).and_then(|p| image::open(p).ok()) else { continue };
+            let img = img.resize_exact(512, 512, image::imageops::FilterType::Triangle).to_rgba8();
+            let id = k as u64 + 1;
+            let gpu = crate::engine::texture::rgba8_with_mips(&engine.device, &engine.queue, stem, &img);
+            resources.insert(id, Resource { id, name: stem.to_string(), kind: ResKind::Texture, imported: false, encoded: Default::default(), gpu: std::sync::Arc::new(gpu), image: std::sync::Arc::new(img) });
+            ids.insert(*stem, id);
+        }
+        let mut fd = m.fill(&ids);
+        fd.projection.scale = 2.0;
+        let tree = LayerTree { desc: LayerDesc::new(0, m.name.clone(), LayerKind::Fill(Box::new(fd))), children: Vec::new() };
+        let tex = pv.render(&engine, &tree, &resources);
+        let px = tex.read_bytes(&engine.device, &engine.queue);
+        let img = image::RgbaImage::from_raw(tex.width, tex.height, px).ok_or_else(|| anyhow::anyhow!("thumbnail bytes"))?;
+        image::imageops::overlay(&mut sheet, &img, (i as u32 % cols * t) as i64, (i as u32 / cols * t) as i64);
+        println!("{:3} {:9} {}", i, m.category, m.name);
+    }
+    sheet.save(out.join("materials.png"))?;
+    println!("{} materials written to {}", mats.len(), out.join("materials.png").display());
+    Ok(())
+}
+
+/// `--matshot <dir> [name filter]`: large sphere renders of texture
+/// materials (512 px on a 1024 set), as applied and with height off.
+pub fn mat_shot(out: &Path, filter: &str) -> Result<()> {
+    std::fs::create_dir_all(out)?;
+    let mut engine = Engine::headless()?;
+    if filter != "calib" {
+        if let Some(p) = library::default_environment() {
+            let (w, h, px) = crate::engine::env::load_hdr(&p)?;
+            let e = crate::engine::env::Environment::build(&engine.device, &engine.queue, w, h, px, "default".into());
+            engine.set_environment(e);
+        }
+    }
+    let mut pv = if filter == "calib" { crate::preview::Previewer::sized(&engine, 1024, 512) } else { crate::preview::Previewer::sized_material(&engine, 2048, 512) };
+    let mut thumb = crate::preview::Previewer::new_material(&engine);
+    if filter == "calib" {
+        // Gray dielectric spheres at increasing roughness, one sheet.
+        let rs = [0.1f32, 0.3, 0.5, 0.7, 0.9];
+        let mut sheet = image::RgbaImage::new(512 * rs.len() as u32, 512);
+        for (i, r) in rs.iter().enumerate() {
+            let fd = FillDesc::material([0.5; 3], *r, 0.0);
+            let tree = LayerTree { desc: LayerDesc::new(0, "calib".into(), LayerKind::Fill(Box::new(fd))), children: Vec::new() };
+            let tex = pv.render(&engine, &tree, &std::collections::HashMap::new());
+            let img = image::RgbaImage::from_raw(tex.width, tex.height, tex.read_bytes(&engine.device, &engine.queue)).unwrap();
+            image::imageops::overlay(&mut sheet, &img, i as i64 * 512, 0);
+        }
+        sheet.save(out.join("calib.png"))?;
+        return Ok(());
+    }
+    let filter = filter.to_lowercase();
+    for m in library::texture_materials().iter().filter(|m| m.name.to_lowercase().contains(&filter)) {
+        let mut resources = std::collections::HashMap::new();
+        let mut ids = std::collections::HashMap::new();
+        for (k, (stem, _)) in library::TEX_MATERIAL_MAPS.iter().enumerate() {
+            let Some(img) = m.map(stem).and_then(|p| image::open(p).ok()) else { continue };
+            let img = img.to_rgba8();
+            let id = k as u64 + 1;
+            let gpu = crate::engine::texture::rgba8_with_mips(&engine.device, &engine.queue, stem, &img);
+            resources.insert(id, Resource { id, name: stem.to_string(), kind: ResKind::Texture, imported: false, encoded: Default::default(), gpu: std::sync::Arc::new(gpu), image: std::sync::Arc::new(img) });
+            ids.insert(*stem, id);
+        }
+        let slug: String = m.name.to_lowercase().chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect();
+        let variants: [(&str, fn(&mut FillDesc)); 3] = [
+            ("as_is", |_| {}),
+            ("no_height", |f| f.channels[CH_HEIGHT].enabled = false),
+            ("no_bump", |f| {
+                f.channels[CH_HEIGHT].enabled = false;
+                f.channels[CH_NORMAL].enabled = false;
+            }),
+        ];
+        for (v, edit) in variants {
+            let mut fd = m.fill(&ids);
+            edit(&mut fd);
+            let tree = LayerTree { desc: LayerDesc::new(0, m.name.clone(), LayerKind::Fill(Box::new(fd))), children: Vec::new() };
+            let tex = pv.render(&engine, &tree, &resources);
+            screenshot(&engine, &tex, &out.join(format!("{slug}_{v}.png")))?;
+            if v == "as_is" {
+                let t = thumb.render(&engine, &tree, &resources);
+                screenshot(&engine, &t, &out.join(format!("{slug}_thumb.png")))?;
+            }
+        }
+        println!("{}", m.name);
+    }
+    Ok(())
+}
+
+/// `--bakeshot <mesh> <dir> [res]`: bakes every texture set with the
+/// default settings and writes AO, curvature and thickness as UV-space PNGs.
+/// `--floodbench <mesh> [res]`: magic wand / bucket timings per texture
+/// set (seam links, color readback, contiguous flood).
+pub fn flood_bench(mesh_path: &Path, res: u32) -> Result<()> {
+    let engine = Engine::headless()?;
+    let m = mesh::load(mesh_path)?;
+    let doc = Document::new(&engine, m, "floodbench".into(), res);
+    for (i, s) in doc.sets.iter().enumerate() {
+        let t = Instant::now();
+        let seams = crate::flood::Seams::build(&doc.mesh, s.submesh, &s.raster);
+        let t_seams = t.elapsed();
+        let t = Instant::now();
+        let raw = crate::engine::texture::f16_bytes_to_f32(&s.gpu.final_base.read_bytes(&engine.device, &engine.queue));
+        let t_read = t.elapsed();
+        let Some(seed) = s.raster.tri.iter().position(|t| *t >= 0) else { continue };
+        let t = Instant::now();
+        let out = crate::flood::flood(&s.raster, &seams, seed, true, &|_| true);
+        let t_flood = t.elapsed();
+        let covered = s.raster.tri.iter().filter(|t| **t >= 0).count();
+        let n = out.iter().filter(|b| **b > 0).count();
+        println!(
+            "set {i} '{}': {} links {:.0} ms, readback {:.0} ms ({} values), flood {n} / {covered} texels {:.0} ms",
+            s.name,
+            seams.link_count(),
+            t_seams.as_secs_f64() * 1e3,
+            t_read.as_secs_f64() * 1e3,
+            raw.len(),
+            t_flood.as_secs_f64() * 1e3
+        );
+    }
+    Ok(())
+}
+
+pub fn bake_shot(mesh_path: &Path, out: &Path, res: u32) -> Result<()> {
+    std::fs::create_dir_all(out)?;
+    let engine = Engine::headless()?;
+    let m = mesh::load(mesh_path)?;
+    let doc = Document::new(&engine, m, "bakeshot".into(), res);
+    let tris = bake::mesh_triangles(&doc.mesh);
+    let bvh = bake::build_bvh(&doc.mesh, &tris);
+    let settings = BakeSettings::default();
+    let (p, c) = (AtomicU32::new(0), AtomicBool::new(false));
+    let gb = crate::engine::gpubake::GpuBaker::new(engine.device.clone(), engine.queue.clone(), &bvh);
+    for (i, s) in doc.sets.iter().enumerate() {
+        let t = Instant::now();
+        let b = bake::bake(&doc.mesh, s.submesh, res, &bvh, None, &settings, &p, &c, Some(&gb));
+        let gray = |v: &[f32]| image::GrayImage::from_fn(res, res, |x, y| image::Luma([(v[(y * res + x) as usize].clamp(0.0, 1.0) * 255.0 + 0.5) as u8]));
+        gray(&b.ao).save(out.join(format!("{i}_ao.png")))?;
+        gray(&b.curvature).save(out.join(format!("{i}_curvature.png")))?;
+        gray(&b.thickness).save(out.join(format!("{i}_thickness.png")))?;
+        println!("set {} '{}': {:.2}s", i, s.name, t.elapsed().as_secs_f32());
+    }
+    Ok(())
+}
+
+/// `--autouv <mesh> <dir> [smart|fast]`: unwraps the mesh (replacing its
+/// UVs), prints each set's report, writes `autouv.obj` and renders a
+/// checker on the new UVs from four angles (stretch and seams show).
+/// Triangles whose UVs are mirrored (the texture reads backwards on them):
+/// their UV winding, v up, disagrees with their facing. (mirrored, counted)
+fn mirrored_uvs(m: &crate::mesh::MeshData) -> (usize, usize) {
+    let (mut bad, mut all) = (0, 0);
+    for s in &m.submeshes {
+        for t in s.indices.chunks_exact(3) {
+            let v = |k: usize| &m.vertices[t[k] as usize];
+            let p = |k: usize| glam::Vec3::from(v(k).pos);
+            let g = (p(1) - p(0)).cross(p(2) - p(0));
+            let n = glam::Vec3::from(v(0).normal) + glam::Vec3::from(v(1).normal) + glam::Vec3::from(v(2).normal);
+            let (a, b, c) = (v(0).uv, v(1).uv, v(2).uv);
+            // Image-space v grows downward: counter-clockwise (v up) is negative here.
+            let area = (b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1]);
+            let facing = g.dot(n);
+            if area.abs() < 1e-12 || facing.abs() < 1e-12 {
+                continue;
+            }
+            all += 1;
+            bad += ((area < 0.0) != (facing > 0.0)) as usize;
+        }
+    }
+    (bad, all)
+}
+
+pub fn uv_check(mesh_path: &Path, out: &Path, method: &str) -> Result<()> {
+    std::fs::create_dir_all(out)?;
+    let mut engine = Engine::headless()?;
+    let m = mesh::load(mesh_path)?;
+    let mut settings = mesh::UvSettings::default();
+    if method == "fast" {
+        settings.method = mesh::UvMethod::Fast;
+    }
+    // "free": smart without keeping islands upright.
+    settings.smart.upright = method != "free";
+    let t = Instant::now();
+    let (m, reports) = mesh::unwrap_mesh(&m, &settings)?;
+    println!("{:?}: {} triangles in {:.1} s", settings.method, m.triangle_count(), t.elapsed().as_secs_f32());
+    for r in &reports {
+        println!(
+            "  {:<16} {:>6} tris  {:>4} islands  coverage {:>3.0} %  stretch {:.2} (worst 5 % {:.2})  seams {:.1}",
+            r.name, r.triangles, r.charts, r.coverage * 100.0, r.stretch_mean, r.stretch_p95, r.seam_length
+        );
+    }
+    let (mirrored, total) = mirrored_uvs(&m);
+    println!("  mirrored triangles: {mirrored} of {total}");
+    mesh::write_obj(&m, &out.join("autouv.obj"))?;
+    let mut doc = Document::new(&engine, m, "autouv".into(), 1024);
+    for i in 0..doc.sets.len() {
+        let mut f = FillDesc::material([0.5; 3], 0.6, 0.0);
+        f.channels[CH_COLOR] = FillChannel {
+            source: SourceKind::Procedural,
+            procedural: ProcParams::of(ProcKind::Checker),
+            value: [0.06, 0.07, 0.09],
+            value_b: [0.95, 0.55, 0.15],
+            ..Default::default()
+        };
+        f.projection = Projection { mode: ProjMode::Uv, scale: 24.0, ..Default::default() };
+        let l = doc.new_layer(&engine, i, LayerKind::Fill(Box::new(f)), None);
+        doc.insert_layer(i, l);
+    }
+    engine.viewport.resize(&engine.device, 900, 900);
+    composite_all(&engine, &mut doc);
+    for (k, (yaw, pitch)) in [(0.0f32, 0.15f32), (std::f32::consts::PI, 0.15), (1.57, 0.1), (0.8, -0.9)].into_iter().enumerate() {
+        let mut cam = OrbitCamera { yaw, pitch, ..Default::default() };
+        cam.frame(doc.mesh.bbox_min, doc.mesh.bbox_max);
+        let mut enc = engine.device.create_command_encoder(&Default::default());
+        let mut frame = frame_for(&engine, &doc, &cam, 0.0, 0.0, &pick_fn(|s: &TextureSet| &s.gpu.final_base));
+        frame.wireframe = false;
+        engine.viewport.render(&engine.device, &engine.queue, &mut enc, &frame);
+        engine.queue.submit(Some(enc.finish()));
+        screenshot(&engine, engine.viewport.output(), &out.join(format!("checker_{k}.png")))?;
+    }
+    let _ = &mut engine;
+    Ok(())
+}
+
+/// `--alphashot <dir> [mesh]`: every set alpha blended at 40% opacity (and
+/// once with transmission), rendered from three angles, to check blending.
+pub fn alpha_shot(out: &Path, mesh_path: Option<&Path>) -> Result<()> {
+    std::fs::create_dir_all(out)?;
+    let mut engine = Engine::headless()?;
+    let m = match mesh_path {
+        Some(p) => mesh::load(p)?,
+        None => {
+            let p = out.join("alpha.obj");
+            std::fs::write(&p, test_obj())?;
+            mesh::load(&p)?
+        }
+    };
+    let mut doc = Document::new(&engine, m, "alpha".into(), 1024);
+    let transmit = std::env::var("MF_TRANSMIT").is_ok();
+    // MF_TRANSMIT=<set index> picks the glass set (default 0).
+    let glass: usize = std::env::var("MF_TRANSMIT").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    for i in 0..doc.sets.len() {
+        let mut f = FillDesc::material([0.8, 0.35, 0.1], 0.3, 0.0);
+        if transmit {
+            // One set is clear glass over the others (opaque).
+            if i == glass {
+                doc.sets[i].settings.ext_channels[1] = true;
+                f = FillDesc::material([0.85, 0.93, 1.0], 0.05, 0.0);
+                f.ext[1].enabled = true;
+                f.ext[1].value = [1.0; 3];
+            }
+        } else {
+            doc.sets[i].settings.alpha_mode = AlphaMode::AlphaBlend;
+            f.channels[CH_OPACITY].enabled = true;
+            f.channels[CH_OPACITY].value = [0.4; 3];
+        }
+        let l = doc.new_layer(&engine, i, LayerKind::Fill(Box::new(f)), None);
+        doc.insert_layer(i, l);
+    }
+    engine.viewport.resize(&engine.device, 1000, 800);
+    let mut enc = engine.device.create_command_encoder(&Default::default());
+    let resources = doc.resources.clone();
+    for s in doc.sets.iter_mut() {
+        s.composite(&engine, &mut enc, &resources, None);
+    }
+    engine.queue.submit(Some(enc.finish()));
+    for (k, (yaw, pitch)) in [(0.6f32, 0.3f32), (2.4, -0.2), (4.0, 0.6)].into_iter().enumerate() {
+        let mut cam = OrbitCamera { yaw, pitch, ..Default::default() };
+        cam.frame(doc.mesh.bbox_min, doc.mesh.bbox_max);
+        if std::env::var("MF_NOSORT").is_err() {
+            let centers = crate::document::tri_centers(&doc.mesh);
+            let blended: Vec<usize> = doc.sets.iter().map(|s| s.submesh).collect();
+            let eye = cam.eye();
+            let fwd = (glam::Vec3::from(cam.target) - eye).normalize_or(glam::Vec3::NEG_Z);
+            crate::document::sort_blended(&mut doc, &engine, &centers, &blended, eye, fwd, cam.ortho);
+        }
+        // MF_PT=<spp>: the path tracer instead (MF_NODENOISE: raw).
+        let pt_spp: Option<u32> = std::env::var("MF_PT").ok().and_then(|v| v.parse().ok());
+        if let Some(spp) = pt_spp {
+            engine.pathtracer.build_scene(&engine.device, &doc, k as u64 + 1);
+            engine.pathtracer.denoise_on = std::env::var("MF_NODENOISE").is_err();
+            engine.pathtracer.reset();
+            let vp = &engine.viewport;
+            let m = cam.view_proj(vp.width as f32 / vp.height as f32);
+            let mut am = [0.0f32; 8];
+            for (i, s) in doc.sets.iter().take(8).enumerate() {
+                am[i] = s.shader_alpha();
+            }
+            let u = crate::engine::pathtrace::PtUniform {
+                inv_view_proj: m.inverse().to_cols_array_2d(),
+                eye: cam.eye().extend(doc.mesh.diagonal()).into(),
+                size: [0; 4],
+                env: [0.0, 1.0, 0.0, 4.0],
+                emi_a: [1.0; 4],
+                emi_b: [1.0; 4],
+                amode_a: [am[0], am[1], am[2], am[3]],
+                amode_b: [am[4], am[5], am[6], am[7]],
+                cut_a: [0.5; 4],
+                cut_b: [0.5; 4],
+            };
+            let slots: Vec<[&Tex; 4]> = doc.sets.iter().map(|s| [&s.gpu.final_base, &s.gpu.final_orm, &s.gpu.final_normal, &s.gpu.final_emissive]).collect();
+            for _ in 0..spp {
+                let mut enc = engine.device.create_command_encoder(&Default::default());
+                engine.pathtracer.render(&engine.device, &mut enc, u, &slots, &engine.env.view, engine.viewport.hdr());
+                engine.queue.submit(Some(enc.finish()));
+            }
+            // Open Image Denoise when it is there (else the raw render stays).
+            if engine.pathtracer.denoise_on {
+                let ok = engine.pathtracer.denoise_now(&engine.device, &engine.queue, engine.viewport.hdr());
+                println!("denoiser: {}", if ok { "Open Image Denoise" } else { "none" });
+            }
+        }
+        let mut enc = engine.device.create_command_encoder(&Default::default());
+        let mut frame = frame_for(&engine, &doc, &cam, 0.0, 0.0, &pick_fn(|s: &TextureSet| &s.gpu.final_base));
+        frame.path_traced = pt_spp.is_some();
+        frame.wireframe = false;
+        for (d, s) in frame.sets.iter_mut().zip(&doc.sets) {
+            d.params.k[0] = s.shader_alpha();
+            d.transmissive = s.settings.ext_channels[1];
+        }
+        engine.viewport.render(&engine.device, &engine.queue, &mut enc, &frame);
+        engine.queue.submit(Some(enc.finish()));
+        screenshot(&engine, engine.viewport.output(), &out.join(format!("alpha_{k}.png")))?;
+    }
+    println!("alpha shots in {}", out.display());
+    Ok(())
+}
+
+/// `--matpreviews [name filter]` (MF_PREVIEW_MISSING=1: only those without
+/// one): renders the shelf preview of every
+/// starter texture material into its folder (`preview.png`, 256 px): a
+/// sphere displaced by the height map, path traced with the denoiser in a
+/// neutral studio light, like the previews of material libraries.
+pub fn material_previews(filter: &str) -> Result<()> {
+    let mut engine = Engine::headless()?;
+    let size = 512u32;
+    engine.viewport.resize(&engine.device, size, size);
+    let spp: u32 = std::env::var("MF_PREVIEW_SPP").ok().and_then(|v| v.parse().ok()).unwrap_or(384);
+    let filter = filter.to_lowercase();
+    // MF_PREVIEW_MISSING=1: only the materials that have no preview yet.
+    let missing = std::env::var("MF_PREVIEW_MISSING").is_ok_and(|v| v == "1");
+    for m in library::texture_materials().iter().filter(|m| m.name.to_lowercase().contains(&filter) && !(missing && m.preview().is_some())) {
+        let t = Instant::now();
+        let height = m.map("height").and_then(|p| image::open(p).ok()).map(|i| i.to_rgba8());
+        // Metals keep a smooth silhouette (their height is fine relief).
+        let amount = if m.metal { 0.012 } else { 0.035 };
+        let mesh = crate::preview::displaced_sphere(height.as_ref(), 1.0, amount);
+        let mut doc = Document::new(&engine, mesh, "preview".into(), 2048);
+        doc.sets[0].layers.clear();
+        let mut ids = std::collections::HashMap::new();
+        for (stem, _) in library::TEX_MATERIAL_MAPS {
+            let Some(path) = m.map(stem) else { continue };
+            let bytes = std::fs::read(&path)?;
+            ids.insert(stem, doc.add_resource(&engine, format!("{stem}.jpg"), bytes, ResKind::Texture)?);
+        }
+        let mut fd = m.fill(&ids);
+        // The sphere's UVs already repeat the maps; the displacement is the
+        // height (no second bump from it).
+        fd.projection.scale = 1.0;
+        fd.channels[CH_HEIGHT].enabled = false;
+        let l = doc.new_layer(&engine, 0, LayerKind::Fill(Box::new(fd)), None);
+        doc.insert_layer(0, l);
+        let mut enc = engine.device.create_command_encoder(&Default::default());
+        let resources = doc.resources.clone();
+        doc.sets[0].composite(&engine, &mut enc, &resources, None);
+        engine.queue.submit(Some(enc.finish()));
+
+        let mut cam = OrbitCamera { yaw: 0.0, pitch: 0.12, fov_y: 0.5, ..Default::default() };
+        cam.frame(doc.mesh.bbox_min, doc.mesh.bbox_max);
+        cam.distance *= 0.6;
+        engine.pathtracer.build_scene(&engine.device, &doc, t.elapsed().as_nanos() as u64);
+        engine.pathtracer.denoise_on = true;
+        engine.pathtracer.bounces = 6;
+        engine.pathtracer.reset();
+        let m4 = cam.view_proj(1.0);
+        let u = crate::engine::pathtrace::PtUniform {
+            inv_view_proj: m4.inverse().to_cols_array_2d(),
+            eye: cam.eye().extend(doc.mesh.diagonal()).into(),
+            size: [0; 4],
+            // Studio light, black background (alpha from the coverage).
+            env: [0.0, 1.0, 2.0, 4.0],
+            emi_a: [1.0; 4],
+            emi_b: [1.0; 4],
+            ..Default::default()
+        };
+        let slots: Vec<[&Tex; 4]> = doc.sets.iter().map(|s| [&s.gpu.final_base, &s.gpu.final_orm, &s.gpu.final_normal, &s.gpu.final_emissive]).collect();
+        for k in 0..spp {
+            let mut enc = engine.device.create_command_encoder(&Default::default());
+            engine.pathtracer.render(&engine.device, &mut enc, u, &slots, &engine.env.view, engine.viewport.hdr());
+            engine.queue.submit(Some(enc.finish()));
+            if k % 64 == 63 {
+                engine.device.poll(wgpu::Maintain::Wait);
+            }
+        }
+        engine.pathtracer.denoise_now(&engine.device, &engine.queue, engine.viewport.hdr());
+        let mut frame = frame_for(&engine, &doc, &cam, 0.0, 0.0, &|s| &s.gpu.final_base);
+        frame.path_traced = true;
+        frame.wireframe = false;
+        frame.camera.view_proj = m4.to_cols_array_2d();
+        frame.post.a = [std::env::var("MF_PREVIEW_EXPOSURE").ok().and_then(|v| v.parse().ok()).unwrap_or(1.7), 0.0, 0.0, 1.0];
+        frame.post.b = [0.0, 1.0, 1.0, 0.0];
+        let mut enc = engine.device.create_command_encoder(&Default::default());
+        engine.viewport.render(&engine.device, &engine.queue, &mut enc, &frame);
+        engine.queue.submit(Some(enc.finish()));
+        drop(frame);
+        let out = engine.viewport.output();
+        let mut img = image::RgbaImage::from_raw(out.width, out.height, out.read_bytes(&engine.device, &engine.queue)).context("preview size")?;
+        // Transparent around the sphere: edge pixels hold the surface over
+        // black, i.e. premultiplied by their coverage.
+        if let Some(cov) = engine.pathtracer.coverage(&engine.device, &engine.queue) {
+            for (i, p) in img.pixels_mut().enumerate() {
+                let a = cov.get(i).copied().unwrap_or(1.0).clamp(0.0, 1.0);
+                if a > 0.0 {
+                    for c in 0..3 {
+                        p.0[c] = (p.0[c] as f32 / a).min(255.0) as u8;
+                    }
+                }
+                p.0[3] = (a * 255.0 + 0.5) as u8;
+            }
+        }
+        let small = image::imageops::resize(&img, 256, 256, image::imageops::FilterType::Lanczos3);
+        small.save(m.dir.join("preview.png"))?;
+        println!("{:28} {:.1}s", m.name, t.elapsed().as_secs_f32());
+    }
     Ok(())
 }

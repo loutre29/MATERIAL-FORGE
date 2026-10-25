@@ -38,6 +38,9 @@ pub const MODE_CAMERA: f32 = 0.0;
 pub const MODE_WRAP: f32 = 1.0;
 pub const MODE_UV: f32 = 2.0;
 pub const MODE_FULL: f32 = 3.0;
+/// Gradients (stamps[0] holds the line): through the camera, in UV space.
+pub const MODE_GRADIENT: f32 = 4.0;
+pub const MODE_GRADIENT_UV: f32 = 5.0;
 
 /// Which fragment entry point and target set a paint pass uses.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -50,6 +53,9 @@ pub enum PaintPass {
     EraseB,
     Mask,
     MaskErase,
+    /// The selection brush: adds to / subtracts from the selection (r8).
+    Select,
+    SelectErase,
 }
 
 pub struct PaintPipelines {
@@ -68,6 +74,9 @@ pub struct PaintPipelines {
     pub stencil: Tex,
     /// Texel rect the next draws are limited to (the stroke region).
     pub scissor: Option<[u32; 4]>,
+    /// Selection of the painted texture set (None: everything paints).
+    pub selection: Option<wgpu::TextureView>,
+    no_selection: Tex,
 }
 
 fn blend(src: wgpu::BlendFactor, dst: wgpu::BlendFactor) -> wgpu::BlendComponent {
@@ -142,6 +151,7 @@ impl PaintPipelines {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                tex_entry(6, false, false),
             ],
         });
         let load_entry = |binding| wgpu::BindGroupLayoutEntry {
@@ -186,13 +196,30 @@ impl PaintPipelines {
         let white = image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 255, 255, 255]));
         let alpha = image_texture(device, queue, "brush alpha", &white, false);
         let stencil = image_texture(device, queue, "stencil", &white, true);
-        Self { shader, bgl, mat_bgl, material: None, dummy, layout, cache: HashMap::new(), uniform, stamps, sampler, alpha, stencil, scissor: None }
+        let no_selection = super::select::shape_texture(device, queue, 1, 1, &[255]);
+        Self {
+            shader,
+            bgl,
+            mat_bgl,
+            material: None,
+            dummy,
+            layout,
+            cache: HashMap::new(),
+            uniform,
+            stamps,
+            sampler,
+            alpha,
+            stencil,
+            scissor: None,
+            selection: None,
+            no_selection,
+        }
     }
 
     /// channels: base color, roughness, metallic, height, emissive, opacity, normal.
     fn pipeline(&mut self, device: &wgpu::Device, pass: PaintPass, channels: [bool; 7]) -> &wgpu::RenderPipeline {
         let bits = channels.iter().enumerate().fold(0u8, |acc, (i, &c)| acc | ((c as u8) << i));
-        let key = (pass, if matches!(pass, PaintPass::Mask | PaintPass::MaskErase) { 0 } else { bits });
+        let key = (pass, if matches!(pass, PaintPass::Mask | PaintPass::MaskErase | PaintPass::Select | PaintPass::SelectErase) { 0 } else { bits });
         if !self.cache.contains_key(&key) {
             use wgpu::BlendFactor as B;
             use wgpu::ColorWrites as W;
@@ -238,6 +265,8 @@ impl PaintPipelines {
                     wgpu::BlendState { color: blend(B::One, B::OneMinusSrcAlpha), alpha: keep_alpha },
                     W::RED | W::GREEN,
                 )],
+                PaintPass::Select => vec![target(super::select::SEL_FORMAT, wgpu::BlendState { color: blend(B::One, B::OneMinusSrc), alpha: blend(B::One, B::OneMinusSrc) }, W::ALL)],
+                PaintPass::SelectErase => vec![target(super::select::SEL_FORMAT, wgpu::BlendState { color: blend(B::Zero, B::OneMinusSrc), alpha: blend(B::Zero, B::OneMinusSrc) }, W::ALL)],
             };
             let entry = match pass {
                 PaintPass::PaintA => "fs_paint_a",
@@ -246,6 +275,7 @@ impl PaintPipelines {
                 PaintPass::EraseB => "fs_erase_b",
                 PaintPass::Mask => "fs_mask",
                 PaintPass::MaskErase => "fs_mask_erase",
+                PaintPass::Select | PaintPass::SelectErase => "fs_select",
             };
             let p = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("paint"),
@@ -307,6 +337,10 @@ impl PaintPipelines {
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&self.alpha.view) },
                 wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&self.stencil.view) },
                 wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::TextureView(self.selection.as_ref().unwrap_or(&self.no_selection.view)),
+                },
             ],
         });
         let m = |i: usize| -> &wgpu::TextureView {

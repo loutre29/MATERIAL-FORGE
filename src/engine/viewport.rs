@@ -26,6 +26,8 @@ pub struct CameraUniform {
     pub sh: [[f32; 4]; 9],
     pub light_view_proj: [[f32; 4]; 4],
     pub light: [f32; 4],
+    /// Wireframe color (linear rgb) and opacity.
+    pub wire: [f32; 4],
 }
 
 #[repr(C)]
@@ -52,6 +54,8 @@ pub struct DrawSet<'a> {
     pub display: &'a Tex,
     pub params: SetUniform,
     pub visible: bool,
+    /// The set has the transmission channel: it sees the scene behind it.
+    pub transmissive: bool,
 }
 
 pub struct Frame<'a> {
@@ -61,6 +65,10 @@ pub struct Frame<'a> {
     pub sets: Vec<DrawSet<'a>>,
     pub shadows: bool,
     pub wireframe: bool,
+    /// Wireframe of this submesh only (polygon fill shows the active set).
+    pub wire_only: Option<usize>,
+    /// Marching ants around the active set's selection.
+    pub selection: Option<super::select::SelOverlay<'a>>,
     /// The HDR target already holds a path-traced image: post-process only.
     pub path_traced: bool,
 }
@@ -82,6 +90,12 @@ pub fn vertex_layout() -> wgpu::VertexBufferLayout<'static> {
 struct Targets {
     hdr_ms: Tex,
     hdr: Tex,
+    /// Copy of the opaque scene for transmissive sets, and its depth.
+    scene: Tex,
+    scene_depth: Tex,
+    /// Back faces of transmissive sets: normal + eye distance, own depth.
+    back: Tex,
+    back_depth: Tex,
     depth: Tex,
     out: Tex,
     bloom: Vec<Tex>,
@@ -106,10 +120,19 @@ pub struct Viewport {
     bg_pipeline: wgpu::RenderPipeline,
     mesh_pipeline: wgpu::RenderPipeline,
     blend_pipeline: wgpu::RenderPipeline,
+    /// Transmissive sets: their back faces' normals and distances, then
+    /// their front faces refracting through them over a copy of the scene.
+    backface_pipeline: wgpu::RenderPipeline,
+    transmit_front: wgpu::RenderPipeline,
+    /// MSAA depth to the R32 depth the transmission reads.
+    depth_resolve: wgpu::ComputePipeline,
+    scene_bgl: wgpu::BindGroupLayout,
     /// Depth of the opaque texels of alpha-blended sets, drawn before them
     /// so their surfaces keep their order.
     prepass_pipeline: wgpu::RenderPipeline,
     wire_pipeline: wgpu::RenderPipeline,
+    ants_bgl: wgpu::BindGroupLayout,
+    ants_pipeline: wgpu::RenderPipeline,
     shadow_pipeline: wgpu::RenderPipeline,
     bright_pipeline: wgpu::RenderPipeline,
     down_pipeline: wgpu::RenderPipeline,
@@ -117,10 +140,40 @@ pub struct Viewport {
     final_pipeline: wgpu::RenderPipeline,
 }
 
+/// The scene pass: MSAA color resolved into `hdr`, MSAA depth; `clear`
+/// starts a frame, otherwise it continues the previous pass.
+fn scene_pass<'e>(enc: &'e mut wgpu::CommandEncoder, t: &'e Targets, label: &'static str, clear: bool) -> wgpu::RenderPass<'e> {
+    enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some(label),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: &t.hdr_ms.view,
+            resolve_target: Some(&t.hdr.view),
+            ops: wgpu::Operations {
+                load: if clear { wgpu::LoadOp::Clear(wgpu::Color::BLACK) } else { wgpu::LoadOp::Load },
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+            view: &t.depth.view,
+            depth_ops: Some(wgpu::Operations {
+                load: if clear { wgpu::LoadOp::Clear(1.0) } else { wgpu::LoadOp::Load },
+                store: wgpu::StoreOp::Store,
+            }),
+            stencil_ops: None,
+        }),
+        timestamp_writes: None,
+        occlusion_query_set: None,
+    })
+}
+
 fn make_targets(device: &wgpu::Device, w: u32, h: u32) -> Targets {
     let rt = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
     let hdr_ms = Tex::with_samples(device, "hdr msaa", w, h, HDR_FORMAT, wgpu::TextureUsages::RENDER_ATTACHMENT, MSAA);
-    let hdr = Tex::new(device, "hdr", w, h, HDR_FORMAT, rt | wgpu::TextureUsages::STORAGE_BINDING);
+    let hdr = Tex::new(device, "hdr", w, h, HDR_FORMAT, rt | wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST);
+    let scene = Tex::new(device, "scene copy", w, h, HDR_FORMAT, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
+    let scene_depth = Tex::new(device, "scene depth", w, h, wgpu::TextureFormat::R32Float, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING);
+    let back = Tex::new(device, "transmission back faces", w, h, wgpu::TextureFormat::Rgba32Float, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT);
+    let back_depth = Tex::new(device, "transmission back depth", w, h, DEPTH_FORMAT, wgpu::TextureUsages::RENDER_ATTACHMENT);
     let depth = Tex::with_samples(device, "viewport depth", w, h, DEPTH_FORMAT, rt, MSAA);
     let out = Tex::new(device, "viewport out", w, h, OUT_FORMAT, rt | wgpu::TextureUsages::COPY_SRC);
     let mut bloom = Vec::new();
@@ -130,7 +183,7 @@ fn make_targets(device: &wgpu::Device, w: u32, h: u32) -> Targets {
         bh = (bh / 2).max(1);
         bloom.push(Tex::new(device, "bloom", bw, bh, HDR_FORMAT, rt));
     }
-    Targets { hdr_ms, hdr, depth, out, bloom }
+    Targets { hdr_ms, hdr, scene, scene_depth, back, back_depth, depth, out, bloom }
 }
 
 impl Viewport {
@@ -192,6 +245,7 @@ impl Viewport {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
                     count: None,
                 },
+                tex_entry(5, frag),
             ],
         });
         let mat_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -205,6 +259,38 @@ impl Viewport {
                 samp_entry(5),
                 uni_entry(6, frag),
             ],
+        });
+        let scene_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("scene bgl"),
+            entries: &[
+                tex_entry(0, frag),
+                samp_entry(1),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: frag,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: frag,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let transmit_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("transmit layout"),
+            bind_group_layouts: &[&cam_bgl, &mat_bgl, &scene_bgl],
+            push_constant_ranges: &[],
         });
         let post_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("post bgl"),
@@ -318,6 +404,65 @@ impl Viewport {
             multiview: None,
             cache: None,
         });
+        let transmit = |label: &str, cull: wgpu::Face| {
+            let targets = [Some(wgpu::ColorTargetState { format: HDR_FORMAT, blend: None, write_mask: wgpu::ColorWrites::ALL })];
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&transmit_layout),
+                vertex: wgpu::VertexState { module: &shader, entry_point: "vs_mesh", compilation_options: Default::default(), buffers: &vl },
+                fragment: Some(wgpu::FragmentState { module: &shader, entry_point: "fs_transmit", compilation_options: Default::default(), targets: &targets }),
+                primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: Some(cull), ..Default::default() },
+                depth_stencil: depth(true, wgpu::CompareFunction::Less),
+                multisample: ms,
+                multiview: None,
+                cache: None,
+            })
+        };
+        // Glass reads front-facing as counter-clockwise (the mesh winding).
+        let transmit_front = transmit("transmission front faces", wgpu::Face::Back);
+        let backface_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("transmission back faces"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState { module: &shader, entry_point: "vs_mesh", compilation_options: Default::default(), buffers: &vl },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_backface",
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState { format: wgpu::TextureFormat::Rgba32Float, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+            }),
+            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: Some(wgpu::Face::Front), ..Default::default() },
+            depth_stencil: depth(true, wgpu::CompareFunction::Less),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+        let resolve_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("depth resolve"),
+            source: wgpu::ShaderSource::Wgsl(
+                r#"
+@group(0) @binding(0) var src: texture_depth_multisampled_2d;
+@group(0) @binding(1) var dst: texture_storage_2d<r32float, write>;
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) g: vec3<u32>) {
+    let d = textureDimensions(dst);
+    if g.x >= d.x || g.y >= d.y { return; }
+    // The nearest sample: thin edges keep the front surface.
+    var z = 1.0;
+    for (var s = 0; s < 4; s++) { z = min(z, textureLoad(src, vec2<i32>(g.xy), s)); }
+    textureStore(dst, vec2<i32>(g.xy), vec4<f32>(z, 0.0, 0.0, 1.0));
+}
+"#
+                .into(),
+            ),
+        });
+        let depth_resolve = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("depth resolve"),
+            layout: None,
+            module: &resolve_module,
+            entry_point: "main",
+            compilation_options: Default::default(),
+            cache: None,
+        });
         let blend_pipeline = pipe(
             "mesh alpha blend",
             &layout,
@@ -340,6 +485,29 @@ impl Viewport {
             depth(false, wgpu::CompareFunction::LessEqual),
             ms,
         );
+        let ants_bgl = super::select::ants_bgl(device);
+        let ants_module = super::select::ants_module(device);
+        let ants_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("ants layout"),
+            bind_group_layouts: &[&cam_bgl, &ants_bgl],
+            push_constant_ranges: &[],
+        });
+        let ants_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("selection ants"),
+            layout: Some(&ants_layout),
+            vertex: wgpu::VertexState { module: &ants_module, entry_point: "vs_mesh", compilation_options: Default::default(), buffers: &vl },
+            fragment: Some(wgpu::FragmentState {
+                module: &ants_module,
+                entry_point: "fs_ants",
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState { format: HDR_FORMAT, blend: Some(alpha_blend), write_mask: wgpu::ColorWrites::ALL })],
+            }),
+            primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
+            depth_stencil: depth(false, wgpu::CompareFunction::LessEqual),
+            multisample: ms,
+            multiview: None,
+            cache: None,
+        });
         let shadow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("shadow"),
             layout: Some(&shadow_layout),
@@ -460,8 +628,14 @@ impl Viewport {
             bg_pipeline,
             mesh_pipeline,
             blend_pipeline,
+            backface_pipeline,
+            transmit_front,
+            depth_resolve,
+            scene_bgl,
             prepass_pipeline,
             wire_pipeline,
+            ants_bgl,
+            ants_pipeline,
             shadow_pipeline,
             bright_pipeline,
             down_pipeline,
@@ -488,6 +662,7 @@ impl Viewport {
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(sampler) },
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&shadow.view) },
                 wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(shadow_sampler) },
+                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&env.spec_view) },
             ],
         })
     }
@@ -606,6 +781,10 @@ impl Viewport {
                 (s.submesh, bg, s.params.k[0] > 1.5)
             })
             .collect();
+        // Transmissive sets (alpha blended or not) draw after the opaque
+        // scene, over a copy of it.
+        let transmissive: Vec<bool> = frame.sets.iter().filter(|s| s.visible).map(|s| s.transmissive).collect();
+        let any_transmit = transmissive.iter().any(|t| *t);
 
         if frame.shadows && !frame.path_traced {
             if let Some(mesh) = frame.mesh {
@@ -632,37 +811,17 @@ impl Viewport {
         }
 
         if !frame.path_traced {
-            let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("viewport"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &t.hdr_ms.view,
-                    resolve_target: Some(&t.hdr.view),
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &t.depth.view,
-                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            rp.set_bind_group(0, &self.cam_bg, &[]);
-            rp.set_pipeline(&self.bg_pipeline);
-            rp.draw(0..3, 0..1);
-            if let Some(mesh) = frame.mesh {
-                rp.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                // Opaque sets, then the depth of the blended sets' opaque
-                // texels, then the blended sets over it.
-                for pass in 0..3 {
-                    let pass_blend = pass > 0;
-                    rp.set_pipeline(match pass {
-                        0 => &self.mesh_pipeline,
-                        1 => &self.prepass_pipeline,
-                        _ => &self.blend_pipeline,
-                    });
-                    for (sub, bg, blended) in &mats {
-                        if *blended != pass_blend {
+            // Background and opaque sets.
+            {
+                let mut rp = scene_pass(enc, t, "viewport opaque", true);
+                rp.set_bind_group(0, &self.cam_bg, &[]);
+                rp.set_pipeline(&self.bg_pipeline);
+                rp.draw(0..3, 0..1);
+                if let Some(mesh) = frame.mesh {
+                    rp.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                    rp.set_pipeline(&self.mesh_pipeline);
+                    for ((sub, bg, blended), tr) in mats.iter().zip(&transmissive) {
+                        if *blended || *tr {
                             continue;
                         }
                         let (b, n) = mesh.submeshes[*sub].draw_indices();
@@ -671,13 +830,112 @@ impl Viewport {
                         rp.draw_indexed(0..n, 0, 0..1);
                     }
                 }
-                if frame.wireframe {
+            }
+            // Transmissive sets see a copy of what is drawn so far (color
+            // and depth): their back faces over the opaque scene, then their
+            // front faces over that.
+            let snapshot = |enc: &mut wgpu::CommandEncoder| {
+                enc.copy_texture_to_texture(t.hdr.texture.as_image_copy(), t.scene.texture.as_image_copy(), wgpu::Extent3d { width: t.hdr.width, height: t.hdr.height, depth_or_array_layers: 1 });
+                let depth_view = t.depth.texture.create_view(&wgpu::TextureViewDescriptor { aspect: wgpu::TextureAspect::DepthOnly, ..Default::default() });
+                let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("depth resolve"),
+                    layout: &self.depth_resolve.get_bind_group_layout(0),
+                    entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&depth_view) }, tv(1, &t.scene_depth)],
+                });
+                let mut cp = enc.begin_compute_pass(&Default::default());
+                cp.set_pipeline(&self.depth_resolve);
+                cp.set_bind_group(0, &bg, &[]);
+                cp.dispatch_workgroups(t.hdr.width.div_ceil(8), t.hdr.height.div_ceil(8), 1);
+            };
+            let scene_bg = any_transmit.then(|| {
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("scene bg"),
+                    layout: &self.scene_bgl,
+                    entries: &[
+                        tv(0, &t.scene),
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.post_sampler) },
+                        tv(2, &t.scene_depth),
+                        tv(3, &t.back),
+                    ],
+                })
+            });
+            if let (Some(_), Some(mesh)) = (&scene_bg, frame.mesh) {
+                // The opaque scene (color and depth), then the back faces.
+                snapshot(enc);
+                let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("transmission back faces"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &t.back.view,
+                        resolve_target: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &t.back_depth.view,
+                        depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Discard }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                rp.set_bind_group(0, &self.cam_bg, &[]);
+                rp.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                rp.set_pipeline(&self.backface_pipeline);
+                for ((sub, bg, _), tr) in mats.iter().zip(&transmissive) {
+                    if *tr {
+                        let (b, n) = mesh.submeshes[*sub].draw_indices();
+                        rp.set_bind_group(1, bg, &[]);
+                        rp.set_index_buffer(b.slice(..), wgpu::IndexFormat::Uint32);
+                        rp.draw_indexed(0..n, 0, 0..1);
+                    }
+                }
+            }
+            let mut rp = scene_pass(enc, t, "viewport transparent", false);
+            rp.set_bind_group(0, &self.cam_bg, &[]);
+            if let Some(mesh) = frame.mesh {
+                rp.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                if let Some(sbg) = &scene_bg {
+                    rp.set_pipeline(&self.transmit_front);
+                    rp.set_bind_group(2, sbg, &[]);
+                    for ((sub, bg, _), tr) in mats.iter().zip(&transmissive) {
+                        if !*tr {
+                            continue;
+                        }
+                        let (b, n) = mesh.submeshes[*sub].draw_indices();
+                        rp.set_bind_group(1, bg, &[]);
+                        rp.set_index_buffer(b.slice(..), wgpu::IndexFormat::Uint32);
+                        rp.draw_indexed(0..n, 0, 0..1);
+                    }
+                }
+                // The depth of the blended sets' opaque texels, then the
+                // blended sets over it (back to front).
+                for pipeline in [&self.prepass_pipeline, &self.blend_pipeline] {
+                    rp.set_pipeline(pipeline);
+                    for ((sub, bg, blended), tr) in mats.iter().zip(&transmissive) {
+                        if !*blended || *tr {
+                            continue;
+                        }
+                        let (b, n) = mesh.submeshes[*sub].draw_indices();
+                        rp.set_bind_group(1, bg, &[]);
+                        rp.set_index_buffer(b.slice(..), wgpu::IndexFormat::Uint32);
+                        rp.draw_indexed(0..n, 0, 0..1);
+                    }
+                }
+                if frame.wireframe || frame.wire_only.is_some() {
                     rp.set_pipeline(&self.wire_pipeline);
-                    for (sub, _, _) in &mats {
+                    for (sub, _, _) in mats.iter().filter(|m| frame.wireframe || frame.wire_only == Some(m.0)) {
                         let s = &mesh.submeshes[*sub];
                         rp.set_index_buffer(s.edge_buffer.slice(..), wgpu::IndexFormat::Uint32);
                         rp.draw_indexed(0..s.edge_count, 0, 0..1);
                     }
+                }
+                if let Some(a) = &frame.selection {
+                    let u = super::select::AntsUniform { k: [a.phase, 0.0, 0.0, 0.0], xform: [0.0; 4], offs: [0.0; 4] };
+                    let bg = super::select::ants_bg(device, &self.ants_bgl, a, u);
+                    let (b, n) = mesh.submeshes[a.submesh].draw_indices();
+                    rp.set_pipeline(&self.ants_pipeline);
+                    rp.set_bind_group(1, &bg, &[]);
+                    rp.set_index_buffer(b.slice(..), wgpu::IndexFormat::Uint32);
+                    rp.draw_indexed(0..n, 0, 0..1);
                 }
             }
         }

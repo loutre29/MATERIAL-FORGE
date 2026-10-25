@@ -476,7 +476,7 @@ pub struct BakeSettings {
 impl Default for BakeSettings {
     fn default() -> Self {
         Self {
-            ao_samples: 32,
+            ao_samples: 64,
             ao_distance: 0.15,
             cage_distance: 0.02,
             high_poly: None,
@@ -915,52 +915,40 @@ pub fn bake(
         .collect();
     let px: Vec<Px> = rows.into_iter().flatten().collect();
 
-    // Curvature: normal divergence between neighbouring texels, plus a
-    // falloff around sharp geometric edges so hard-surface low polys work.
-    let raw_curv: Vec<f32> = (0..n)
-        .into_par_iter()
-        .map(|i| {
-            let Some((p, nw, _)) = shading[i] else { return 0.0 };
-            let (x, y) = ((i % hres) as i64, (i / hres) as i64);
-            let mut acc = 0.0;
-            let mut cnt = 0.0;
-            for (dx, dy) in [(1i64, 0i64), (0, 1)] {
-                let get = |sx: i64, sy: i64| {
-                    if sx < 0 || sy < 0 || sx >= hres as i64 || sy >= hres as i64 {
-                        return None;
-                    }
-                    shading[(sy as usize) * hres + sx as usize].map(|(q, m, _)| (q, m))
-                };
-                let a = get(x - dx, y - dy).unwrap_or((p, nw));
-                let b = get(x + dx, y + dy).unwrap_or((p, nw));
-                let dp = b.0 - a.0;
-                let l2 = dp.length_squared();
-                if l2 > 1e-20 {
-                    acc += (b.1 - a.1).dot(dp) / l2;
-                    cnt += 1.0;
-                }
-            }
-            if cnt > 0.0 {
-                acc / cnt
-            } else {
-                0.0
-            }
-        })
-        .collect();
-    // Curvature relative to the object size: a bend whose radius is ~1% of
-    // the diagonal reads as a strong edge, a whole sphere stays near neutral.
-    let scale = 1.0 / (diag * 0.01);
+    // Curvature from the mesh (like Painter's "from mesh" curvature): per
+    // welded vertex from the face normals across its edges, smoothed over
+    // its neighbours, interpolated per texel; plus a falloff around sharp
+    // geometric edges so hard-surface low polys read.
+    let vcurv = vertex_curvature(mesh, sub);
+    // Relative to this set's own curvature range: broad smooth areas stay
+    // near mid gray, bevels and creases read (a scale tied to the object
+    // size saturates every detail of a large model).
+    let range = {
+        let mut a: Vec<f32> = vcurv.value.iter().map(|k| k.abs()).filter(|k| k.is_finite()).collect();
+        a.sort_by(|x, y| x.total_cmp(y));
+        // Floor: a bend of radius 5% of the object reads, a whole sphere
+        // stays near mid gray.
+        a.get(((a.len() as f32 - 1.0) * 0.9) as usize).copied().unwrap_or(0.0).max(20.0 / diag.max(1e-9))
+    };
     let width = settings.edge_width * diag;
     let grid = EdgeGrid::new(sharp_edges(mesh), width.max(diag * 1e-4) * 2.0);
     let curv_hi: Vec<f32> = (0..n)
         .into_par_iter()
         .map(|i| {
             let Some((_, _, s)) = shading[i] else { return 0.5 };
-            let smooth = (raw_curv[i] / scale).tanh();
+            let t = raster.tri[i] as usize;
+            let [w1, w2] = raster.bary[i];
+            let k = vcurv.at(t, [1.0 - w1 - w2, w1, w2]);
+            let smooth = (k / range * 0.8).tanh();
             let edge = grid.query(s.pos, width);
             (0.5 + 0.5 * (smooth + edge).clamp(-1.0, 1.0)).clamp(0.0, 1.0)
         })
         .collect();
+
+    // Ray-traced maps are denoised in UV space, edge-aware (world distance
+    // and normal), so nothing bleeds across seams or folds.
+    let ao_hi = denoise(&px.iter().map(|p| p.ao).collect::<Vec<_>>(), &shading, hres, 2 * aa as usize);
+    let thick_hi = denoise(&px.iter().map(|p| p.thick).collect::<Vec<_>>(), &shading, hres, 2 * aa as usize);
 
     // Downsample the supersampled maps, averaging covered samples only.
     let res = res as usize;
@@ -986,9 +974,9 @@ pub fn bake(
                     let Some((_, nw, _)) = shading[i] else { continue };
                     let p = &px[i];
                     cnt += 1.0;
-                    ao += p.ao;
+                    ao += ao_hi[i];
                     cu += curv_hi[i];
-                    th += p.thick;
+                    th += thick_hi[i];
                     nn += Vec3::new(p.normal[0], p.normal[1], p.normal[2]);
                     wn += nw;
                     id += Vec3::new(p.id[0], p.id[1], p.id[2]);
@@ -1010,4 +998,150 @@ pub fn bake(
         }
     }
     out
+}
+
+/// Mean curvature per welded vertex of a submesh (positive convex).
+struct VertexCurvature {
+    /// Welded vertex of each corner of the submesh's triangles.
+    corner: Vec<u32>,
+    value: Vec<f32>,
+}
+
+impl VertexCurvature {
+    /// Curvature at barycentric `w` of triangle `t`.
+    fn at(&self, t: usize, w: [f32; 3]) -> f32 {
+        (0..3).map(|k| self.corner.get(t * 3 + k).map_or(0.0, |&v| self.value[v as usize]) * w[k]).sum()
+    }
+}
+
+fn vertex_curvature(mesh: &MeshData, sub: usize) -> VertexCurvature {
+    let idx = &mesh.submeshes[sub].indices;
+    let q = (mesh.diagonal() * 1e-5).max(1e-9);
+    let mut weld: HashMap<[i64; 3], u32> = HashMap::new();
+    let mut pos: Vec<Vec3> = Vec::new();
+    let corner: Vec<u32> = idx
+        .iter()
+        .map(|&v| {
+            let p = Vec3::from(mesh.vertices[v as usize].pos);
+            let k = [(p.x / q).round() as i64, (p.y / q).round() as i64, (p.z / q).round() as i64];
+            *weld.entry(k).or_insert_with(|| {
+                pos.push(p);
+                pos.len() as u32 - 1
+            })
+        })
+        .collect();
+    let nv = pos.len();
+    // Area-weighted face normals per welded vertex (geometric, so split
+    // normals at hard edges still read as edges).
+    let mut nrm = vec![Vec3::ZERO; nv];
+    for t in corner.chunks_exact(3) {
+        let (a, b, c) = (pos[t[0] as usize], pos[t[1] as usize], pos[t[2] as usize]);
+        let f = (b - a).cross(c - a);
+        for &v in t {
+            nrm[v as usize] += f;
+        }
+    }
+    let nrm: Vec<Vec3> = nrm.into_iter().map(|n| n.normalize_or_zero()).collect();
+    // Faces on each edge: sharp edges (over ~32 degrees) are left to the
+    // sharp edge falloff, so they do not bleed over whole low-poly faces.
+    let mut edge_faces: HashMap<(u32, u32), Vec<Vec3>> = HashMap::new();
+    for t in corner.chunks_exact(3) {
+        let (a, b, c) = (pos[t[0] as usize], pos[t[1] as usize], pos[t[2] as usize]);
+        let f = (b - a).cross(c - a).normalize_or_zero();
+        for k in 0..3 {
+            let (u, v) = (t[k], t[(k + 1) % 3]);
+            edge_faces.entry((u.min(v), u.max(v))).or_default().push(f);
+        }
+    }
+    let mut sum = vec![0.0f32; nv];
+    let mut cnt = vec![0.0f32; nv];
+    let mut nbr: Vec<Vec<u32>> = vec![Vec::new(); nv];
+    let mut seen = std::collections::HashSet::new();
+    for t in corner.chunks_exact(3) {
+        for k in 0..3 {
+            let (a, b) = (t[k], t[(k + 1) % 3]);
+            if a == b || !seen.insert((a.min(b), a.max(b))) {
+                continue;
+            }
+            let sharp = edge_faces.get(&(a.min(b), a.max(b))).is_some_and(|f| f.len() == 2 && f[0].dot(f[1]) < 0.85);
+            if sharp {
+                continue;
+            }
+            let d = pos[b as usize] - pos[a as usize];
+            let l2 = d.length_squared();
+            if l2 < 1e-20 {
+                continue;
+            }
+            let kv = (nrm[b as usize] - nrm[a as usize]).dot(d) / l2;
+            for v in [a, b] {
+                sum[v as usize] += kv;
+                cnt[v as usize] += 1.0;
+            }
+            nbr[a as usize].push(b);
+            nbr[b as usize].push(a);
+        }
+    }
+    let mut value: Vec<f32> = (0..nv).map(|v| if cnt[v] > 0.0 { sum[v] / cnt[v] } else { 0.0 }).collect();
+    // Two smoothing passes over the one-ring.
+    for _ in 0..2 {
+        value = (0..nv)
+            .map(|v| {
+                let n = &nbr[v];
+                if n.is_empty() {
+                    return value[v];
+                }
+                let m = n.iter().map(|&u| value[u as usize]).sum::<f32>() / n.len() as f32;
+                value[v] * 0.5 + m * 0.5
+            })
+            .collect();
+    }
+    VertexCurvature { corner, value }
+}
+
+/// Edge-aware blur of a texel map (covered texels only): neighbours within
+/// `radius` texels weigh by world distance and normal agreement.
+fn denoise(v: &[f32], shading: &[Option<(Vec3, Vec3, Surface)>], res: usize, radius: usize) -> Vec<f32> {
+    let r = radius.max(1) as i64;
+    (0..v.len())
+        .into_par_iter()
+        .map(|i| {
+            let Some((p, n, _)) = shading[i] else { return v[i] };
+            let (x, y) = ((i % res) as i64, (i / res) as i64);
+            // World size of a texel here, from the nearest covered neighbour.
+            let mut texel = f32::MAX;
+            for (dx, dy) in [(1i64, 0i64), (-1, 0), (0, 1), (0, -1)] {
+                let (sx, sy) = (x + dx, y + dy);
+                if sx >= 0 && sy >= 0 && sx < res as i64 && sy < res as i64 {
+                    if let Some((q, _, _)) = shading[sy as usize * res + sx as usize] {
+                        texel = texel.min(q.distance(p));
+                    }
+                }
+            }
+            if texel == f32::MAX || texel <= 0.0 {
+                return v[i];
+            }
+            let sigma = texel * r as f32 * 0.75;
+            let inv = 1.0 / (2.0 * sigma * sigma);
+            let (mut acc, mut wsum) = (0.0f32, 0.0f32);
+            for dy in -r..=r {
+                for dx in -r..=r {
+                    let (sx, sy) = (x + dx, y + dy);
+                    if sx < 0 || sy < 0 || sx >= res as i64 || sy >= res as i64 {
+                        continue;
+                    }
+                    let j = sy as usize * res + sx as usize;
+                    let Some((q, m, _)) = shading[j] else { continue };
+                    let nd = n.dot(m).max(0.0);
+                    let w = (-(q - p).length_squared() * inv).exp() * nd * nd * nd * nd;
+                    acc += v[j] * w;
+                    wsum += w;
+                }
+            }
+            if wsum > 0.0 {
+                acc / wsum
+            } else {
+                v[i]
+            }
+        })
+        .collect()
 }

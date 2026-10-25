@@ -174,82 +174,299 @@ impl Default for BrushMaterial {
 pub struct BrushPreset {
     pub name: String,
     pub settings: BrushSettings,
+    /// Tip from the starter alphas (path under `starter_assets/alphas`),
+    /// imported into the project when the preset is applied; `settings`
+    /// keep a built-in alpha for when the file is missing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alpha_file: Option<String>,
+    /// Shelf folder.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub folder: String,
 }
 
+impl BrushPreset {
+    pub fn new(name: String, settings: BrushSettings) -> Self {
+        BrushPreset { name, settings, alpha_file: None, folder: String::new() }
+    }
+
+    /// Its tip as a grayscale image (the starter file when there is one).
+    pub fn tip_image(&self) -> image::GrayImage {
+        let file = self.alpha_file.as_deref().and_then(crate::library::starter_alpha).and_then(|p| crate::imageio::open(&p).ok());
+        match file {
+            Some(img) => img.to_luma8(),
+            None => {
+                let k = match self.settings.alpha {
+                    AlphaSource::Builtin(k) => k,
+                    AlphaSource::Resource(_) => AlphaKind::Round,
+                };
+                image::DynamicImage::ImageRgba8(alpha_image(k)).to_luma8()
+            }
+        }
+    }
+
+    /// Shelf thumbnail: a stroke drawn with the preset.
+    pub fn thumbnail(&self, size: u32) -> image::RgbaImage {
+        let round = self.alpha_file.is_none() && self.settings.alpha == AlphaSource::Builtin(AlphaKind::Round);
+        stroke_image(&self.tip_image(), &self.settings, round, size, size)
+    }
+}
+
+/// The starter brushes, by shelf folder. Tips come from the starter alphas.
 pub fn builtin_brushes() -> Vec<BrushPreset> {
-    let b = |name: &str, f: &dyn Fn(&mut BrushSettings)| {
-        let mut s = BrushSettings::default();
+    let mut out = Vec::new();
+    let mut add = |folder: &str, name: &str, file: Option<&str>, fallback: AlphaKind, f: &dyn Fn(&mut BrushSettings)| {
+        let mut s = BrushSettings { alpha: AlphaSource::Builtin(fallback), ..Default::default() };
         f(&mut s);
-        BrushPreset { name: name.into(), settings: s }
+        out.push(BrushPreset { name: name.into(), settings: s, alpha_file: file.map(|f| format!("{f}.png")), folder: folder.into() });
     };
-    vec![
-        b("Basic hard", &|s| {
-            s.hardness = 0.95;
-            s.flow = 1.0;
-        }),
-        b("Basic soft", &|s| {
-            s.hardness = 0.0;
-            s.flow = 0.5;
-        }),
-        b("Airbrush", &|s| {
-            s.hardness = 0.0;
-            s.flow = 0.08;
-            s.size = 60.0;
-        }),
-        b("Square", &|s| {
-            s.alpha = AlphaSource::Builtin(AlphaKind::Square);
-            s.flow = 1.0;
-        }),
-        b("Chalk", &|s| {
-            s.alpha = AlphaSource::Builtin(AlphaKind::Chalk);
-            s.angle_jitter = 180.0;
-            s.flow = 0.7;
-        }),
-        b("Spray", &|s| {
-            s.alpha = AlphaSource::Builtin(AlphaKind::Spray);
-            s.angle_jitter = 180.0;
-            s.spacing = 0.3;
-            s.flow = 0.8;
-        }),
-        b("Splatter", &|s| {
-            s.alpha = AlphaSource::Builtin(AlphaKind::Splatter);
-            s.angle_jitter = 180.0;
-            s.size_jitter = 0.5;
-            s.position_jitter = 0.6;
-            s.spacing = 0.6;
-            s.flow = 1.0;
-        }),
-        b("Grunge dabber", &|s| {
-            s.alpha = AlphaSource::Builtin(AlphaKind::Grunge);
-            s.angle_jitter = 180.0;
-            s.spacing = 0.5;
-            s.flow = 0.8;
-        }),
-        b("Scratch", &|s| {
-            s.alpha = AlphaSource::Builtin(AlphaKind::Line);
-            s.follow_path = true;
-            s.spacing = 0.05;
-            s.flow = 0.9;
-            s.size = 18.0;
-        }),
-        b("Star stamp", &|s| {
-            s.alpha = AlphaSource::Builtin(AlphaKind::Star);
-            s.spacing = 1.2;
-            s.flow = 1.0;
-        }),
-        b("Clouds", &|s| {
-            s.alpha = AlphaSource::Builtin(AlphaKind::Cloud);
-            s.angle_jitter = 180.0;
-            s.size_jitter = 0.3;
-            s.flow = 0.35;
-            s.spacing = 0.25;
-        }),
-        b("Ring", &|s| {
-            s.alpha = AlphaSource::Builtin(AlphaKind::Ring);
-            s.spacing = 1.0;
-            s.flow = 1.0;
-        }),
-    ]
+    use AlphaKind::*;
+    // Basic tips.
+    add("Basic", "Basic hard", None, Round, &|s| {
+        s.hardness = 0.95;
+        s.flow = 1.0;
+    });
+    add("Basic", "Basic soft", None, Round, &|s| {
+        s.hardness = 0.0;
+        s.flow = 0.5;
+    });
+    add("Basic", "Airbrush", None, Round, &|s| {
+        s.hardness = 0.0;
+        s.flow = 0.08;
+    });
+    add("Basic", "Square", Some("Brush tips/Square Soft"), SoftSquare, &|s| s.flow = 1.0);
+    // Artistic: tips that follow the stroke like a real tool.
+    add("Artistic", "Pencil", Some("Brush tips/Pencil"), Chalk, &|s| {
+        s.follow_path = true;
+        s.spacing = 0.04;
+        s.flow = 0.7;
+        s.angle_jitter = 8.0;
+    });
+    add("Artistic", "Marker", Some("Brush tips/Marker"), SoftSquare, &|s| {
+        s.spacing = 0.03;
+        s.flow = 0.35;
+        s.angle = 35.0;
+    });
+    add("Artistic", "Chalk", Some("Brush tips/Chalk"), Chalk, &|s| {
+        s.angle_jitter = 180.0;
+        s.spacing = 0.15;
+        s.flow = 0.7;
+    });
+    add("Artistic", "Charcoal", Some("Brush tips/Charcoal"), Chalk, &|s| {
+        s.follow_path = true;
+        s.spacing = 0.06;
+        s.flow = 0.5;
+        s.angle_jitter = 6.0;
+    });
+    add("Artistic", "Dry brush", Some("Brush tips/Dry Brush"), Grunge, &|s| {
+        s.follow_path = true;
+        s.spacing = 0.03;
+        s.flow = 0.35;
+    });
+    add("Artistic", "Bristles", Some("Brush tips/Bristles"), Spray, &|s| {
+        s.follow_path = true;
+        s.angle = 90.0;
+        s.spacing = 0.02;
+        s.flow = 0.45;
+    });
+    add("Artistic", "Sponge", Some("Brush tips/Sponge"), Spray, &|s| {
+        s.angle_jitter = 180.0;
+        s.size_jitter = 0.2;
+        s.spacing = 0.35;
+        s.flow = 0.8;
+    });
+    add("Artistic", "Watercolor", Some("Brush tips/Watercolor"), Cloud, &|s| {
+        s.angle_jitter = 180.0;
+        s.size_jitter = 0.15;
+        s.spacing = 0.25;
+        s.flow = 0.25;
+    });
+    // Grunge: dabbed, rotated and scattered.
+    let dab = |s: &mut BrushSettings, spacing: f32, size_jitter: f32, flow: f32| {
+        s.angle_jitter = 180.0;
+        s.spacing = spacing;
+        s.size_jitter = size_jitter;
+        s.flow = flow;
+    };
+    add("Grunge", "Spray", Some("Grunge/Spray"), Spray, &|s| dab(s, 0.3, 0.0, 0.8));
+    add("Grunge", "Spray dense", Some("Grunge/Spray Dense"), Spray, &|s| dab(s, 0.25, 0.0, 0.9));
+    add("Grunge", "Splatter", Some("Grunge/Splatter 1"), Splatter, &|s| {
+        dab(s, 0.8, 0.5, 1.0);
+        s.position_jitter = 0.6;
+    });
+    add("Grunge", "Splatter heavy", Some("Grunge/Splatter 3"), Splatter, &|s| {
+        dab(s, 1.2, 0.3, 1.0);
+        s.position_jitter = 0.4;
+    });
+    add("Grunge", "Dust", Some("Grunge/Dust"), Spray, &|s| dab(s, 0.5, 0.4, 0.5));
+    add("Grunge", "Dirt spots", Some("Grunge/Dirt Spots"), Grunge, &|s| {
+        dab(s, 0.6, 0.4, 0.8);
+        s.position_jitter = 0.3;
+    });
+    add("Grunge", "Speckles", Some("Grunge/Speckles"), Spray, &|s| dab(s, 0.4, 0.2, 0.9));
+    add("Grunge", "Scratches", Some("Grunge/Scratches"), Line, &|s| dab(s, 0.8, 0.3, 0.9));
+    add("Grunge", "Scratch line", Some("Brush tips/Line"), Line, &|s| {
+        s.follow_path = true;
+        s.spacing = 0.05;
+        s.flow = 0.9;
+    });
+    add("Grunge", "Chipped paint", Some("Grunge/Chipped Paint"), Grunge, &|s| dab(s, 0.6, 0.4, 1.0));
+    add("Grunge", "Cracks", Some("Grunge/Cracks"), Grunge, &|s| dab(s, 1.0, 0.3, 1.0));
+    add("Grunge", "Rust spots", Some("Grunge/Rust Spots"), Grunge, &|s| dab(s, 0.5, 0.3, 0.8));
+    add("Grunge", "Stains", Some("Grunge/Stain"), Cloud, &|s| dab(s, 0.8, 0.3, 0.6));
+    add("Grunge", "Water drops", Some("Grunge/Water Drop Mark"), Ring, &|s| {
+        dab(s, 1.0, 0.5, 0.8);
+        s.position_jitter = 0.8;
+    });
+    // Leaks hang down the screen: no rotation.
+    add("Grunge", "Leaks", Some("Grunge/Leaks"), Cloud, &|s| {
+        s.size_jitter = 0.25;
+        s.position_jitter = 0.2;
+        s.spacing = 0.7;
+        s.flow = 0.7;
+    });
+    add("Grunge", "Drips", Some("Grunge/Drips"), Cloud, &|s| {
+        s.size_jitter = 0.25;
+        s.spacing = 0.8;
+        s.flow = 0.9;
+    });
+    // Stitches and seams: the tip follows the path, one element per stamp
+    // (spacing = the element's length, so the line repeats evenly).
+    let seam = |s: &mut BrushSettings, spacing: f32| {
+        s.follow_path = true;
+        s.spacing = spacing;
+        s.flow = 1.0;
+    };
+    let st = "Stitches and hardware";
+    add("Stitches", "Stitch", Some(&format!("{st}/Stitch")), Line, &|s| seam(s, 1.0));
+    add("Stitches", "Stitch double", Some(&format!("{st}/Stitch Double")), Line, &|s| seam(s, 0.95));
+    add("Stitches", "Stitch slanted", Some(&format!("{st}/Stitch Slanted")), Line, &|s| seam(s, 0.7));
+    add("Stitches", "Cross stitch", Some(&format!("{st}/Cross Stitch")), Line, &|s| seam(s, 0.7));
+    add("Stitches", "Zigzag stitch", Some(&format!("{st}/Zigzag Stitch")), Line, &|s| seam(s, 0.76));
+    add("Stitches", "Blanket stitch", Some(&format!("{st}/Blanket Stitch")), Line, &|s| seam(s, 0.8));
+    add("Stitches", "Dashed line", Some(&format!("{st}/Dash")), Line, &|s| seam(s, 1.0));
+    add("Stitches", "Dotted line", Some(&format!("{st}/Dots Line")), Line, &|s| seam(s, 1.06));
+    add("Stitches", "Seam groove", Some(&format!("{st}/Seam Groove")), Line, &|s| seam(s, 0.08));
+    add("Stitches", "Seam ridge", Some(&format!("{st}/Seam Ridge")), Line, &|s| seam(s, 0.08));
+    add("Stitches", "Perforation", Some(&format!("{st}/Perforation")), Round, &|s| seam(s, 0.7));
+    add("Stitches", "Chain", Some(&format!("{st}/Chain Link")), Ring, &|s| seam(s, 0.62));
+    add("Stitches", "Zipper", Some(&format!("{st}/Zipper Tooth")), Line, &|s| seam(s, 0.45));
+    add("Stitches", "Tire tread", Some(&format!("{st}/Tread")), Line, &|s| seam(s, 0.8));
+    // Hardware: spaced along the path.
+    let spaced = |s: &mut BrushSettings, spacing: f32| {
+        s.spacing = spacing;
+        s.flow = 1.0;
+    };
+    add("Hardware", "Rivets", Some(&format!("{st}/Rivet")), Round, &|s| spaced(s, 2.5));
+    add("Hardware", "Rivets flat", Some(&format!("{st}/Rivet Flat")), Round, &|s| spaced(s, 2.5));
+    add("Hardware", "Screws cross", Some(&format!("{st}/Screw Cross")), Round, &|s| {
+        spaced(s, 3.0);
+        s.angle_jitter = 180.0;
+    });
+    add("Hardware", "Screws slotted", Some(&format!("{st}/Screw Slotted")), Round, &|s| {
+        spaced(s, 3.0);
+        s.angle_jitter = 180.0;
+    });
+    add("Hardware", "Hex bolts", Some(&format!("{st}/Bolt Hex")), Round, &|s| spaced(s, 2.5));
+    // Stamps and decals.
+    add("Stamps", "Hazard stripes", Some("Symbols/Hazard Stripes"), Square, &|s| seam(s, 0.9));
+    add("Stamps", "Warning sign", Some("Symbols/Warning"), Star, &|s| {
+        s.spacing = 2.0;
+        s.flow = 1.0;
+    });
+    add("Stamps", "Star", Some("Shapes/Star"), Star, &|s| {
+        s.spacing = 1.5;
+        s.flow = 1.0;
+    });
+    add("Stamps", "Hearts", Some("Shapes/Heart"), Star, &|s| {
+        s.spacing = 1.3;
+        s.size_jitter = 0.4;
+        s.angle_jitter = 25.0;
+        s.position_jitter = 0.5;
+        s.flow = 1.0;
+    });
+    out
+}
+
+/// A stroke drawn with `alpha` along an S curve, gray on black (shelf
+/// thumbnails and the brush preview). `round`: the analytic round tip,
+/// whose edge follows the hardness; image tips are used as they are, like
+/// the paint shader does.
+pub fn stroke_image(alpha: &image::GrayImage, b: &BrushSettings, round: bool, w: u32, h: u32) -> image::RgbaImage {
+    let (wf, hf) = (w as f32, h as f32);
+    let rad = hf.min(wf) * 0.11;
+    // Sampled at about the stamp's size: no aliasing from a large tip.
+    let n = ((rad * 4.0) as u32).clamp(8, alpha.width().max(8));
+    let tip = image::imageops::resize(alpha, n, n, image::imageops::FilterType::Triangle);
+    let step = (b.spacing * rad * 2.0).max(0.6);
+    let curve = |t: f32| -> (f32, f32) { (wf * 0.13 + t * wf * 0.74, hf * 0.5 - (t * std::f32::consts::TAU).sin() * hf * 0.22) };
+    let mut acc = vec![0.0f32; (w * h) as usize];
+    let mut rng = 0x2545_F491_4F6C_DD1Du64;
+    let mut rand = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        (rng >> 40) as f32 / (1u64 << 24) as f32
+    };
+    let mut prev = curve(0.0);
+    let mut dir = {
+        let n = curve(0.001);
+        let d = (n.0 - prev.0, n.1 - prev.1);
+        let l = (d.0 * d.0 + d.1 * d.1).sqrt().max(1e-6);
+        (d.0 / l, d.1 / l)
+    };
+    let mut travelled = step;
+    let mut t = 0.0f32;
+    while t <= 1.0 {
+        let c = curve(t);
+        let d = (c.0 - prev.0, c.1 - prev.1);
+        let l = (d.0 * d.0 + d.1 * d.1).sqrt();
+        if l > 1e-6 {
+            dir = (d.0 / l, d.1 / l);
+        }
+        travelled += l;
+        prev = c;
+        t += 0.0005;
+        if travelled < step {
+            continue;
+        }
+        travelled -= step;
+        let (r1, r2, r3, r4, r5) = (rand(), rand(), rand(), rand(), rand());
+        let size = rad * (1.0 + (r1 * 2.0 - 1.0) * b.size_jitter).max(0.05);
+        // Faint flows still read in a thumbnail.
+        let weight = (0.3 + 0.7 * b.flow) * (1.0 - r2 * b.flow_jitter);
+        let mut angle = b.angle.to_radians() + (r3 * 2.0 - 1.0) * b.angle_jitter.to_radians();
+        if b.follow_path {
+            angle += dir.1.atan2(dir.0);
+        }
+        let (cx, cy) = (c.0 + (r4 * 2.0 - 1.0) * b.position_jitter * rad, c.1 + (r5 * 2.0 - 1.0) * b.position_jitter * rad);
+        let (sa, ca) = angle.sin_cos();
+        let reach = size * std::f32::consts::SQRT_2;
+        let (x0, x1) = ((cx - reach).floor().max(0.0) as i64, ((cx + reach).ceil() as i64).min(w as i64 - 1));
+        let (y0, y1) = ((cy - reach).floor().max(0.0) as i64, ((cy + reach).ceil() as i64).min(h as i64 - 1));
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                let (dx, dy) = ((x as f32 + 0.5 - cx) / size, (y as f32 + 0.5 - cy) / size);
+                let (u, v) = (dx * ca + dy * sa, -dx * sa + dy * ca);
+                if u.abs() >= 1.0 || v.abs() >= 1.0 {
+                    continue;
+                }
+                let a = if round {
+                    let r = (u * u + v * v).sqrt();
+                    1.0 - smooth(b.hardness.clamp(0.0, 0.99), 1.0, r)
+                } else {
+                    let px = (((u * 0.5 + 0.5) * n as f32) as u32).min(n - 1);
+                    let py = (((v * 0.5 + 0.5) * n as f32) as u32).min(n - 1);
+                    tip.get_pixel(px, py).0[0] as f32 / 255.0
+                };
+                let o = &mut acc[(y as u32 * w + x as u32) as usize];
+                *o += (1.0 - *o) * a * weight;
+            }
+        }
+    }
+    image::RgbaImage::from_fn(w, h, |x, y| {
+        let g = (acc[(y * w + x) as usize].clamp(0.0, 1.0).powf(1.0 / 2.2) * 255.0) as u8;
+        image::Rgba([g, g, g, 255])
+    })
 }
 
 // ---------------------------------------------------------------- alpha shapes
@@ -365,6 +582,9 @@ pub struct View {
     pub ppp: f32,
     /// Orthographic camera: world units per pixel, constant with depth.
     pub ortho_wpp: Option<f32>,
+    /// 2D view rotation (radians): UV stamps turn back by it, so a tip
+    /// keeps its angle on screen.
+    pub uv_rot: f32,
 }
 
 impl View {
@@ -407,11 +627,14 @@ pub struct Stroke {
     pub moved: Vec2,
     /// Pen pressure in [0, 1] (1 for a mouse).
     pub pressure: f32,
+    /// A stamp was placed (follow-path strokes place their first one on the
+    /// first move, when the direction is known).
+    placed: bool,
 }
 
 impl Stroke {
     pub fn new(space: Space, set: usize, seed: u64) -> Self {
-        Stroke { space, last: None, carry: 0.0, lazy_anchor: None, rng: seed | 1, set, moved: Vec2::ZERO, pressure: 1.0 }
+        Stroke { space, last: None, carry: 0.0, lazy_anchor: None, rng: seed | 1, set, moved: Vec2::ZERO, pressure: 1.0, placed: false }
     }
 
     pub fn last_point(&self) -> Option<Vec2> {
@@ -455,6 +678,12 @@ impl Stroke {
         let mut pts = Vec::new();
         let step = (brush.size * 2.0 * brush.spacing).max(0.5);
         match self.last {
+            None if brush.follow_path => {
+                // The first stamp lands here once the stroke has a direction.
+                self.last = Some(to);
+                self.carry = step;
+                return Vec::new();
+            }
             None => {
                 pts.push((to, Vec2::X));
             }
@@ -475,10 +704,21 @@ impl Stroke {
             }
         }
         self.last = Some(to);
+        self.placed |= !pts.is_empty();
         let mut out = Vec::new();
         for (p, dir) in pts {
             self.stamp_at(p, dir, brush, view, doc, to_uv, uv_per_point, &mut out);
         }
+        out
+    }
+
+    /// End of the stroke: a follow-path click that never moved still
+    /// places its one stamp.
+    pub fn finish(&mut self, brush: &BrushSettings, view: &View, doc: &Document, to_uv: &dyn Fn(Vec2) -> Vec2, uv_per_point: f32) -> Vec<Stamp> {
+        let Some(p) = self.last.filter(|_| !self.placed) else { return Vec::new() };
+        self.placed = true;
+        let mut out = Vec::new();
+        self.stamp_at(p, Vec2::X, brush, view, doc, to_uv, uv_per_point, &mut out);
         out
     }
 
@@ -515,7 +755,7 @@ impl Stroke {
                 out.push(Stamp {
                     pos: [uv.x, uv.y, 0.0, size * uv_per_point],
                     nrm: [0.0, 0.0, 1.0, weight],
-                    ext: [angle, 0.0, 0.0, 0.0],
+                    ext: [angle - view.uv_rot, 0.0, 0.0, 0.0],
                 });
             }
             Space::Wrap => {

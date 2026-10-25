@@ -13,6 +13,10 @@ pub struct Environment {
     pub texture: wgpu::Texture,
     pub view: wgpu::TextureView,
     pub mip_count: u32,
+    /// GGX-prefiltered reflections: mip k is roughness k / (SPEC_LEVELS - 1).
+    #[allow(dead_code)]
+    pub spec_texture: wgpu::Texture,
+    pub spec_view: wgpu::TextureView,
     /// Diffuse radiance coefficients (already convolved and divided by pi).
     pub sh: [[f32; 4]; 9],
     pub name: String,
@@ -103,6 +107,74 @@ fn downsample(w: u32, h: u32, src: &[[f32; 4]]) -> (u32, u32, Vec<[f32; 4]>) {
         }
     }
     (nw, nh, out)
+}
+
+/// Roughness levels of `Environment::spec_view` (viewport.wgsl knows it).
+pub const SPEC_LEVELS: u32 = 6;
+
+/// Convolves `src` (equirect with its mip chain) with GGX lobes into a
+/// texture whose mips are roughness 0, 0.2 ... 1 (`prefilter.wgsl`).
+fn prefilter(device: &wgpu::Device, queue: &wgpu::Queue, src: &wgpu::TextureView, w: u32, h: u32) -> wgpu::Texture {
+    use wgpu::util::DeviceExt;
+    let (bw, bh) = (w.min(1024), h.min(512));
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("environment specular"),
+        size: wgpu::Extent3d { width: bw, height: bh, depth_or_array_layers: 1 },
+        mip_level_count: SPEC_LEVELS,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba16Float,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
+        view_formats: &[],
+    });
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("prefilter"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/prefilter.wgsl").into()),
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("prefilter"),
+        layout: None,
+        module: &module,
+        entry_point: "main",
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        address_mode_u: wgpu::AddressMode::Repeat,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
+    });
+    let mut enc = device.create_command_encoder(&Default::default());
+    for level in 0..SPEC_LEVELS {
+        let rough = level as f32 / (SPEC_LEVELS - 1) as f32;
+        let samples = if level == 0 { 1.0 } else { 256.0 };
+        let u = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("prefilter params"),
+            contents: bytemuck::cast_slice(&[rough, w as f32, h as f32, samples]),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let view = tex.create_view(&wgpu::TextureViewDescriptor { base_mip_level: level, mip_level_count: Some(1), ..Default::default() });
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("prefilter"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: u.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(src) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&sampler) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&view) },
+            ],
+        });
+        let (lw, lh) = ((bw >> level).max(1), (bh >> level).max(1));
+        let mut pass = enc.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &bg, &[]);
+        pass.dispatch_workgroups(lw.div_ceil(8), lh.div_ceil(8), 1);
+    }
+    queue.submit(Some(enc.finish()));
+    tex
 }
 
 fn sh_basis(d: Vec3) -> [f32; 9] {
@@ -205,6 +277,8 @@ impl Environment {
         for i in 0..9 {
             sh4[i] = [sh[i][0], sh[i][1], sh[i][2], 0.0];
         }
-        Environment { texture, view, mip_count, sh: sh4, name }
+        let spec_texture = prefilter(device, queue, &view, w, h);
+        let spec_view = spec_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        Environment { texture, view, mip_count, spec_texture, spec_view, sh: sh4, name }
     }
 }

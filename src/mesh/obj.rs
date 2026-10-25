@@ -87,6 +87,7 @@ pub fn load(path: &Path) -> Result<RawMesh> {
                         // OBJ UVs are OpenGL style (v up); store image space.
                         raw.uvs.push([t[0], 1.0 - t[1]]);
                         raw.normals.push(ni.map_or([0.0, 1.0, 0.0], |n| nor[n]));
+                        raw.normal_missing.push(ni.is_none());
                         raw.colors.push(vcol[vi]);
                         (raw.positions.len() - 1) as u32
                     });
@@ -97,11 +98,15 @@ pub fn load(path: &Path) -> Result<RawMesh> {
                 }
                 let g = *group_of.entry(current.clone()).or_insert_with(|| {
                     raw.groups.push((current.clone(), Vec::new(), Vec::new()));
+                    raw.polys.push(Vec::new());
                     raw.groups.len() - 1
                 });
+                let poly = raw.next_poly;
+                raw.next_poly += 1;
                 for k in 1..corners.len() - 1 {
                     raw.groups[g].1.extend_from_slice(&[corners[0], corners[k], corners[k + 1]]);
                     raw.groups[g].2.push(object);
+                    raw.polys[g].push(poly);
                 }
             }
             _ => {}
@@ -115,8 +120,8 @@ pub fn load(path: &Path) -> Result<RawMesh> {
             raw.notes.push("Some faces have no UVs; they were placed at UV (0,0).".into());
         }
     }
-    if missing_normal {
-        raw.normals.clear();
+    if !missing_normal {
+        raw.normal_missing.clear();
     }
     if !has_vcol {
         raw.colors.clear();

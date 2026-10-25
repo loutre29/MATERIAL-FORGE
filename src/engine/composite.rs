@@ -22,6 +22,8 @@ pub struct ClearU {
     pub mrh: [f32; 4],
     pub emi: [f32; 4],
     pub nrm: [f32; 4],
+    /// The optional channel groups (`document::XG`).
+    pub x: [[f32; 4]; 3],
 }
 
 #[repr(C)]
@@ -89,8 +91,11 @@ pub struct FillU {
     /// Position map space to projection space, normal rotation (rows).
     pub xf: [[f32; 4]; 3],
     pub nr: [[f32; 4]; 3],
+    /// UV projection: stretch u, v, wrap, filter; pivot u, v.
+    pub uvx: [f32; 4],
+    pub uvp: [f32; 4],
     /// The seven core channels, then the optional ones.
-    pub ch: [ChanSrcU; 9],
+    pub ch: [ChanSrcU; 21],
 }
 
 #[repr(C)]
@@ -175,9 +180,13 @@ struct TileU {
     inner: [i32; 4],
 }
 
+/// Textures of one accumulator: col, mrh, emi, nrm, then the optional
+/// channel groups (1x1 unless the run needs them, see `Arena::acc`).
+const ACC: usize = 7;
+
 #[derive(Default)]
 struct Arena {
-    acc: Vec<[Tex; 4]>,
+    acc: Vec<[Tex; ACC]>,
     acc_free: Vec<usize>,
     mask: Vec<Tex>,
     mask_free: Vec<usize>,
@@ -202,16 +211,25 @@ struct PrefixCache {
     set: u64,
     key: u64,
     res: u32,
-    tex: [Tex; 4],
+    /// Holds the optional groups too.
+    ext: bool,
+    tex: [Tex; ACC],
 }
 
 impl Arena {
-    fn acc(&mut self, d: &wgpu::Device, size: u32) -> usize {
+    /// A free accumulator; `ext`: with full size optional groups.
+    fn acc(&mut self, d: &wgpu::Device, size: u32, ext: bool) -> usize {
+        let x = |l, ext: bool| if ext { Tex::new(d, l, size, size, RGBA, scratch_usage()) } else { Tex::new(d, l, 1, 1, RGBA, scratch_usage()) };
         if let Some(i) = self.acc_free.pop() {
+            if ext && self.acc[i][4].width == 1 {
+                for k in 4..ACC {
+                    self.acc[i][k] = x("acc x", true);
+                }
+            }
             return i;
         }
         let t = |l| Tex::new(d, l, size, size, RGBA, scratch_usage());
-        self.acc.push([t("acc col"), t("acc mrh"), t("acc emi"), t("acc nrm")]);
+        self.acc.push([t("acc col"), t("acc mrh"), t("acc emi"), t("acc nrm"), x("acc x0", ext), x("acc x1", ext), x("acc x2", ext)]);
         self.acc.len() - 1
     }
     fn mask(&mut self, d: &wgpu::Device, size: u32) -> usize {
@@ -372,9 +390,22 @@ struct Ctx<'a> {
     inner: Region,
     tile: wgpu::Buffer,
     masks: &'a MaskPolicy,
+    /// The set uses optional channel groups: accumulators carry them.
+    ext: bool,
 }
 
 impl Ctx<'_> {
+    fn acc(&mut self) -> usize {
+        self.arena.acc(self.device, self.size, self.ext)
+    }
+    /// Accumulator textures copied between tiles and caches.
+    fn acc_count(&self) -> usize {
+        if self.ext {
+            ACC
+        } else {
+            4
+        }
+    }
     fn extent(&self) -> (u32, u32) {
         (self.scratch[2] - self.scratch[0], self.scratch[3] - self.scratch[1])
     }
@@ -593,19 +624,30 @@ impl Compositor {
         let split = split.min(plan.len());
         let hit = prefix.is_some()
             && self.prefix.borrow().as_ref().is_some_and(|p| p.set == set.uid && p.key == key && p.res == res);
+        let ext = set.ext_on();
+        let hit = hit && self.prefix.borrow().as_ref().is_some_and(|p| p.ext == ext);
         let store_prefix = prefix.is_some() && !hit && full;
         if store_prefix {
             let mut pc = self.prefix.borrow_mut();
-            if !pc.as_ref().is_some_and(|p| p.res == res) {
+            if !pc.as_ref().is_some_and(|p| p.res == res && p.ext == ext) {
                 let t = |l| Tex::new(device, l, res, res, RGBA, copy_usage());
-                *pc = Some(PrefixCache { set: set.uid, key, res, tex: [t("prefix col"), t("prefix mrh"), t("prefix emi"), t("prefix nrm")] });
+                let x = |l| if ext { t(l) } else { Tex::new(device, l, 1, 1, RGBA, copy_usage()) };
+                *pc = Some(PrefixCache {
+                    set: set.uid,
+                    key,
+                    res,
+                    ext,
+                    tex: [t("prefix col"), t("prefix mrh"), t("prefix emi"), t("prefix nrm"), x("prefix x0"), x("prefix x1"), x("prefix x2")],
+                });
             }
         }
 
         let mut arenas = self.arenas.borrow_mut();
         let arena = arenas.entry(size).or_default();
-        let finals = [&set.final_base, &set.final_orm, &set.final_normal, &set.final_emissive];
+        let finals = [&set.final_base, &set.final_orm, &set.final_normal, &set.final_emissive, &set.final_ext[0], &set.final_ext[1], &set.final_ext[2]];
         let mip0: Vec<wgpu::TextureView> = finals.iter().map(|t| t.mip_view(0)).collect();
+        let mut fin = fin;
+        fin.k[2] = ext as u32 as f32;
         let fin_u = ubuf(device, bytemuck::bytes_of(&fin));
         let mut touched: Option<Region> = None;
         for inner in chunks(area, tile) {
@@ -618,25 +660,16 @@ impl Compositor {
             let (sx, sy) = (scratch[0], scratch[1]);
             let (sw, sh) = (scratch[2] - sx, scratch[3] - sy);
             let tb = tile_buf(device, (sx, sy), (sw, sh), res, (sx, sy), inner);
-            let mut ctx = Ctx { device, enc: &mut *enc, set, arena: &mut *arena, size, capture, scratch, inner, tile: tb, masks: &masks };
-            let cur = ctx.arena.acc(device, size);
+            let mut ctx = Ctx { device, enc: &mut *enc, set, arena: &mut *arena, size, capture, scratch, inner, tile: tb, masks: &masks, ext };
+            let cur = ctx.acc();
             if hit {
                 let pc = self.prefix.borrow();
                 let pc = pc.as_ref().unwrap();
-                for k in 0..4 {
+                for k in 0..ctx.acc_count() {
                     copy_rect(ctx.enc, &pc.tex[k], (sx, sy), &ctx.arena.acc[cur][k], (0, 0), sw, sh);
                 }
             } else {
-                let u = ubuf(device, bytemuck::bytes_of(&clear));
-                let a = &ctx.arena.acc[cur];
-                dispatch(
-                    device,
-                    ctx.enc,
-                    &self.p.clear,
-                    &[u.as_entire_binding_entry(0), tv(1, &a[0].view), tv(2, &a[1].view), tv(3, &a[2].view), tv(4, &a[3].view)],
-                    &ctx.tile,
-                    ctx.extent(),
-                );
+                self.clear_pass(&mut ctx, &clear, cur);
             }
             let cur = if hit {
                 cur
@@ -646,7 +679,7 @@ impl Compositor {
                     let pc = self.prefix.borrow();
                     let p = pc.as_ref().unwrap();
                     let (lo, w, h) = ctx.inner_local();
-                    for k in 0..4 {
+                    for k in 0..ctx.acc_count() {
                         copy_rect(ctx.enc, &ctx.arena.acc[cur][k], lo, &p.tex[k], (inner[0], inner[1]), w, h);
                     }
                 }
@@ -675,6 +708,12 @@ impl Compositor {
                         tv(9, &mip0[1]),
                         tv(10, &mip0[2]),
                         tv(11, &mip0[3]),
+                        tv(12, &a[4].view),
+                        tv(13, &a[5].view),
+                        tv(14, &a[6].view),
+                        tv(15, &mip0[4]),
+                        tv(16, &mip0[5]),
+                        tv(17, &mip0[6]),
                     ],
                     &ft,
                     (d[2] - d[0], d[3] - d[1]),
@@ -693,7 +732,7 @@ impl Compositor {
 
         // Mips of the texels that changed.
         let Some(t) = touched else { return };
-        for f in finals {
+        for f in finals.into_iter().filter(|f| f.width == res) {
             for level in 1..f.mips {
                 let src = f.mip_view(level - 1);
                 let dst = f.mip_view(level);
@@ -780,20 +819,9 @@ impl Compositor {
             let scratch = [inner[0].saturating_sub(halo), inner[1].saturating_sub(halo), (inner[2] + halo).min(res), (inner[3] + halo).min(res)];
             let (sx, sy) = (scratch[0], scratch[1]);
             let tb = tile_buf(device, (sx, sy), (scratch[2] - sx, scratch[3] - sy), res, (sx, sy), inner);
-            let mut ctx = Ctx { device, enc: &mut *enc, set, arena: &mut *arena, size, capture: None, scratch, inner, tile: tb, masks: &masks };
-            let cur = ctx.arena.acc(device, size);
-            {
-                let u = ubuf(device, bytemuck::bytes_of(&clear));
-                let a = &ctx.arena.acc[cur];
-                dispatch(
-                    device,
-                    ctx.enc,
-                    &self.p.clear,
-                    &[u.as_entire_binding_entry(0), tv(1, &a[0].view), tv(2, &a[1].view), tv(3, &a[2].view), tv(4, &a[3].view)],
-                    &ctx.tile,
-                    ctx.extent(),
-                );
-            }
+            let mut ctx = Ctx { device, enc: &mut *enc, set, arena: &mut *arena, size, capture: None, scratch, inner, tile: tb, masks: &masks, ext: false };
+            let cur = ctx.acc();
+            self.clear_pass(&mut ctx, &clear, cur);
             let cur = self.exec_list(&mut ctx, plan, cur, false);
             let (lo, w, h) = ctx.inner_local();
             for k in 0..4 {
@@ -801,6 +829,14 @@ impl Compositor {
             }
             ctx.arena.acc_free.push(cur);
         }
+    }
+
+    fn clear_pass(&self, ctx: &mut Ctx, clear: &ClearU, cur: usize) {
+        let u = ubuf(ctx.device, bytemuck::bytes_of(clear));
+        let a = &ctx.arena.acc[cur];
+        let mut e = vec![u.as_entire_binding_entry(0)];
+        e.extend((0..ACC).map(|k| tv(1 + k as u32, &a[k].view)));
+        dispatch(ctx.device, ctx.enc, &self.p.clear, &e, &ctx.tile, ctx.extent());
     }
 
     fn exec_list(&self, ctx: &mut Ctx, plan: &[Plan], mut cur: usize, keep_input: bool) -> usize {
@@ -819,7 +855,7 @@ impl Compositor {
         let mask = node.mask().map(|m| self.eval_mask(ctx, m, cur));
         let out = match node {
             Plan::Paint { blend, tex, .. } => {
-                let o = ctx.arena.acc(ctx.device, ctx.size);
+                let o = ctx.acc();
                 let views = [
                     &tex.color.view,
                     &tex.vals.view,
@@ -832,22 +868,22 @@ impl Compositor {
                 o
             }
             Plan::Fill { fill, textures, .. } => {
-                let o = ctx.arena.acc(ctx.device, ctx.size);
+                let o = ctx.acc();
                 self.fill_pass(ctx, fill, textures, cur, mask, o);
                 o
             }
             Plan::Filter { params, blur_radius, .. } => {
                 let blurred = if *blur_radius > 0.0 {
-                    let t1 = ctx.arena.acc(ctx.device, ctx.size);
+                    let t1 = ctx.acc();
                     self.acc_blur(ctx, cur, t1, [1, 0], *blur_radius);
-                    let t2 = ctx.arena.acc(ctx.device, ctx.size);
+                    let t2 = ctx.acc();
                     self.acc_blur(ctx, t1, t2, [0, 1], *blur_radius);
                     ctx.arena.acc_free.push(t1);
                     Some(t2)
                 } else {
                     None
                 };
-                let o = ctx.arena.acc(ctx.device, ctx.size);
+                let o = ctx.acc();
                 let mut u = *params;
                 u.k[2] = mask.is_some() as u32;
                 let ub = ubuf(ctx.device, bytemuck::bytes_of(&u));
@@ -875,6 +911,12 @@ impl Compositor {
                             tv(11, &out[1].view),
                             tv(12, &out[2].view),
                             tv(13, &out[3].view),
+                            tv(14, &a[4].view),
+                            tv(15, &a[5].view),
+                            tv(16, &a[6].view),
+                            tv(17, &out[4].view),
+                            tv(18, &out[5].view),
+                            tv(19, &out[6].view),
                         ],
                         &ctx.tile,
                         ctx.extent(),
@@ -893,7 +935,7 @@ impl Compositor {
                     }
                     return cur;
                 }
-                let o = ctx.arena.acc(ctx.device, ctx.size);
+                let o = ctx.acc();
                 let mut u = *params;
                 u.flags[0] = mask.is_some() as u32;
                 let ub = ubuf(ctx.device, bytemuck::bytes_of(&u));
@@ -921,6 +963,15 @@ impl Compositor {
                             tv(11, &out[1].view),
                             tv(12, &out[2].view),
                             tv(13, &out[3].view),
+                            tv(14, &b[4].view),
+                            tv(15, &b[5].view),
+                            tv(16, &b[6].view),
+                            tv(17, &f[4].view),
+                            tv(18, &f[5].view),
+                            tv(19, &f[6].view),
+                            tv(20, &out[4].view),
+                            tv(21, &out[5].view),
+                            tv(22, &out[6].view),
                         ],
                         &ctx.tile,
                         ctx.extent(),
@@ -978,6 +1029,12 @@ impl Compositor {
                 tv(13, &o[1].view),
                 tv(14, &o[2].view),
                 tv(15, &o[3].view),
+                tv(16, &a[4].view),
+                tv(17, &a[5].view),
+                tv(18, &a[6].view),
+                tv(19, &o[4].view),
+                tv(20, &o[5].view),
+                tv(21, &o[6].view),
             ],
             &ctx.tile,
             ctx.extent(),
@@ -1017,6 +1074,12 @@ impl Compositor {
                 tv(17, &o[1].view),
                 tv(18, &o[2].view),
                 tv(19, &o[3].view),
+                tv(20, &a[4].view),
+                tv(21, &a[5].view),
+                tv(22, &a[6].view),
+                tv(23, &o[4].view),
+                tv(24, &o[5].view),
+                tv(25, &o[6].view),
             ],
             &ctx.tile,
             ctx.extent(),
@@ -1043,6 +1106,12 @@ impl Compositor {
                 tv(7, &o[1].view),
                 tv(8, &o[2].view),
                 tv(9, &o[3].view),
+                tv(10, &a[4].view),
+                tv(11, &a[5].view),
+                tv(12, &a[6].view),
+                tv(13, &o[4].view),
+                tv(14, &o[5].view),
+                tv(15, &o[6].view),
             ],
             &ctx.tile,
             ctx.extent(),

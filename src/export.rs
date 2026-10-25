@@ -28,12 +28,21 @@ pub enum Src {
     EmissiveB,
     SpecularLevel,
     Transmission,
+    /// An optional channel past the first two (`document::EXT_NAMES`).
+    Ext(u8),
     One,
     Zero,
 }
 
 impl Src {
-    pub const ALL: [Src; 21] = [
+    /// Every source, the optional channels before the constants.
+    pub fn all() -> Vec<Src> {
+        let mut v: Vec<Src> = Self::BASE[..Self::BASE.len() - 2].to_vec();
+        v.extend((2..crate::document::NEXT as u8).map(Src::Ext));
+        v.extend([Src::One, Src::Zero]);
+        v
+    }
+    const BASE: [Src; 21] = [
         Src::BaseR,
         Src::BaseG,
         Src::BaseB,
@@ -77,6 +86,7 @@ impl Src {
             Src::EmissiveB => "Emissive B",
             Src::SpecularLevel => "Specular level",
             Src::Transmission => "Transmission",
+            Src::Ext(i) => crate::document::EXT_NAMES.get(i as usize).copied().unwrap_or("Optional channel"),
             Src::One => "White (1)",
             Src::Zero => "Black (0)",
         }
@@ -265,6 +275,8 @@ pub struct SetMaps {
     pub orm: Vec<f32>,
     pub normal: Vec<f32>,
     pub emissive: Vec<f32>,
+    /// The optional groups' finals (None while the set does not use the group).
+    pub ext: [Option<Vec<f32>>; 3],
     /// Texels kept by the padding mode (None = keep all).
     pub keep: Option<Vec<bool>>,
 }
@@ -278,6 +290,7 @@ pub fn read_maps(engine: &Engine, doc: &Document, set: usize) -> SetMaps {
         orm: read(&s.gpu.final_orm),
         normal: read(&s.gpu.final_normal),
         emissive: read(&s.gpu.final_emissive),
+        ext: std::array::from_fn(|g| (s.gpu.final_ext[g].width == s.resolution()).then(|| read(&s.gpu.final_ext[g]))),
         keep: None,
     }
 }
@@ -327,6 +340,13 @@ fn sample(m: &SetMaps, i: usize, s: Src) -> f32 {
         // Optional channels live in the spare .w of the emissive / normal finals.
         Src::SpecularLevel => m.emissive[b + 3],
         Src::Transmission => m.normal[b + 3],
+        Src::Ext(e) => {
+            let e = e as usize;
+            match crate::document::ext_slot(e) {
+                Some((g, k)) => m.ext[g].as_ref().map(|v| v[b + k]).unwrap_or(crate::document::EXT_DEFAULTS[e]),
+                None => 0.0,
+            }
+        }
         Src::One => 1.0,
         Src::Zero => 0.0,
     }
@@ -426,6 +446,23 @@ fn write(path: &Path, format: FileFormat, ch: usize, res: u32, data: &[f32]) -> 
         }
     }
     Ok(())
+}
+
+/// The files `export_set` would write for one set.
+pub fn planned_paths(dir: &Path, mesh_name: &str, set_name: &str, preset: &ExportPreset, opts: &ExportOptions) -> Vec<PathBuf> {
+    preset
+        .maps
+        .iter()
+        .filter(|m| m.enabled && !m.channels.is_empty())
+        .map(|out| {
+            let name = opts
+                .pattern
+                .replace("$mesh", &sanitize(mesh_name))
+                .replace("$set", &sanitize(set_name))
+                .replace("$map", &sanitize(&out.suffix));
+            dir.join(format!("{}.{}", name, opts.format.ext()))
+        })
+        .collect()
 }
 
 pub fn export_set(

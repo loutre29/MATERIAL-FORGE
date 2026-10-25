@@ -1,6 +1,7 @@
-//! Shelf content: built-in materials, smart materials and smart masks
-//! (authored here from procedurals and generators), and the user library in
-//! %APPDATA%\SP_RETRO\library.
+//! Shelf content: built-in materials and smart masks (authored here from
+//! procedurals and generators), the starter smart materials (scanned
+//! texture materials with generator and grunge masks), and the user library
+//! in %APPDATA%\SP_RETRO\library.
 
 use crate::document::*;
 use anyhow::Result;
@@ -14,6 +15,37 @@ pub fn library_dir() -> PathBuf {
     }
     let base = std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
     base.join("SP_RETRO").join("library")
+}
+
+/// Recently opened or saved projects, newest first (File > Open recent).
+fn recent_file() -> PathBuf {
+    library_dir().parent().map(|p| p.join("recent.json")).unwrap_or_else(|| PathBuf::from("recent.json"))
+}
+
+/// The recent projects that still exist, newest first (at most 10).
+pub fn recent_projects() -> Vec<PathBuf> {
+    let list: Vec<PathBuf> = std::fs::read(recent_file()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    list.into_iter().filter(|p| p.is_file()).take(10).collect()
+}
+
+/// Puts `p` first in the recent projects.
+pub fn add_recent(p: &Path) {
+    let p = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let mut list = recent_projects();
+    list.retain(|q| std::fs::canonicalize(q).map_or(true, |q| q != p));
+    list.insert(0, p);
+    list.truncate(10);
+    if let Ok(json) = serde_json::to_vec_pretty(&list) {
+        let f = recent_file();
+        if let Some(d) = f.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        let _ = std::fs::write(f, json);
+    }
+}
+
+pub fn clear_recent() {
+    let _ = std::fs::remove_file(recent_file());
 }
 
 pub fn sub_dir(name: &str) -> PathBuf {
@@ -313,14 +345,16 @@ fn paint_over(color: [f32; 3], rough: f32, metal: f32) -> FillDesc {
     fill(uni(color), gray(rough), gray(metal))
 }
 
-pub struct SmartMaterialPreset {
+pub struct ProceduralSmartMaterial {
     pub name: &'static str,
     pub tree: LayerTree,
 }
 
-pub fn smart_materials() -> Vec<SmartMaterialPreset> {
+/// Procedural layer stacks (no texture files): the self test and the
+/// benchmark use them; the shelf shows `smart_materials`.
+pub fn procedural_smart_materials() -> Vec<ProceduralSmartMaterial> {
     use MaskBlend::*;
-    let sm = |name, tree| SmartMaterialPreset { name, tree };
+    let sm = |name, tree| ProceduralSmartMaterial { name, tree };
     vec![
         sm("Steel painted worn", folder("Steel painted worn", vec![
             fill_layer("Steel", material("Steel polished"), None),
@@ -418,6 +452,257 @@ pub fn smart_materials() -> Vec<SmartMaterialPreset> {
     ]
 }
 
+// ---------------------------------------------------------------- starter smart materials
+
+/// A starter smart material: scanned texture materials with generator and
+/// grunge masks. The tree reads `textures` (absolute paths) through
+/// placeholder resource ids, replaced by project resources when applied.
+pub struct SmartMaterialPreset {
+    pub name: String,
+    pub tree: LayerTree,
+    pub textures: Vec<(u64, PathBuf)>,
+}
+
+/// First placeholder resource id of a starter smart material.
+const PLACEHOLDER: u64 = 1 << 48;
+
+struct Recipe<'a> {
+    mats: &'a [TexMaterial],
+    textures: Vec<(u64, PathBuf)>,
+    missing: bool,
+}
+
+impl Recipe<'_> {
+    fn file(&mut self, path: PathBuf) -> u64 {
+        if let Some((id, _)) = self.textures.iter().find(|(_, p)| *p == path) {
+            return *id;
+        }
+        let id = PLACEHOLDER + self.textures.len() as u64;
+        self.textures.push((id, path));
+        id
+    }
+
+    /// The fill of a starter texture material, by name.
+    fn mat(&mut self, name: &str) -> FillDesc {
+        let Some(m) = self.mats.iter().find(|m| m.name == name).cloned() else {
+            self.missing = true;
+            return FillDesc::default();
+        };
+        let mut ids = std::collections::HashMap::new();
+        for (stem, _) in TEX_MATERIAL_MAPS {
+            if let Some(p) = m.map(stem) {
+                ids.insert(stem, self.file(p));
+            }
+        }
+        m.fill(&ids)
+    }
+
+    /// A mask fill from a starter grayscale texture (`textures/<rel>.png`)
+    /// tiled `scale` times over the UVs; a procedural grunge without it.
+    fn grunge(&mut self, rel: &str, scale: f32) -> MaskEffectKind {
+        let path = starter_dir().map(|d| d.join("textures").join(format!("{rel}.png"))).filter(|p| p.is_file());
+        match path {
+            Some(p) => MaskEffectKind::Fill {
+                value: 1.0,
+                source: SourceKind::Texture,
+                texture: Some(self.file(p)),
+                procedural: ProcParams::of(ProcKind::Grunge),
+                projection: Projection { mode: ProjMode::Uv, scale, ..Default::default() },
+                range: [0.0, 1.0],
+            },
+            None => procm(ProcKind::Grunge, 4.0, |_| {}),
+        }
+    }
+}
+
+/// The lowest part of the object (mud, moss from the ground).
+fn low_band(level: f32) -> MaskEffectKind {
+    gen(Generator::PositionGradient, |g| {
+        g.axis = 1;
+        g.invert = true;
+        g.level = level;
+        g.contrast = 4.0;
+        g.noise = 0.3;
+    })
+}
+
+/// Multiplies a fill's color (texture maps included).
+fn tinted(mut f: FillDesc, rgb: [f32; 3]) -> FillDesc {
+    f.channels[CH_COLOR].value = rgb;
+    f
+}
+
+fn levels(lo: f32, hi: f32) -> MaskEffectKind {
+    MaskEffectKind::Levels { in_lo: lo, in_hi: hi, gamma: 1.0, out_lo: 0.0, out_hi: 1.0 }
+}
+
+fn up_light(level: f32, contrast: f32) -> MaskEffectKind {
+    gen(Generator::Light, |g| {
+        g.dir = [0.0, 1.0, 0.0];
+        g.level = level;
+        g.contrast = contrast;
+    })
+}
+
+/// The starter smart materials, built on the starter texture materials
+/// (a recipe whose material is missing is left out).
+pub fn smart_materials() -> Vec<SmartMaterialPreset> {
+    use MaskBlend::*;
+    let mats = texture_materials();
+    let mut out = Vec::new();
+    let mut sm = |name: &str, build: &dyn Fn(&mut Recipe) -> Vec<LayerTree>| {
+        let mut r = Recipe { mats: &mats, textures: Vec::new(), missing: false };
+        let layers = build(&mut r);
+        if !r.missing {
+            out.push(SmartMaterialPreset { name: name.into(), tree: folder(name, layers), textures: r.textures });
+        }
+    };
+    // Metals.
+    sm("Steel painted worn", &|r| vec![
+        fill_layer("Steel", r.mat("Worn Steel"), None),
+        fill_layer("Paint", paint_over([0.32, 0.04, 0.02], 0.42, 0.0), Some(mask(1.0, vec![
+            effect(Subtract, 1.0, gen(Generator::EdgeWear, |g| g.noise = 0.6)),
+            effect(Multiply, 1.0, r.grunge("Grunges/Grunge Edge Damage", 2.0)),
+        ]))),
+        fill_layer("Dirt", paint_over([0.05, 0.04, 0.03], 0.9, 0.0), Some(smart_mask("Ambient dirt"))),
+    ]);
+    sm("Military paint worn", &|r| vec![
+        fill_layer("Steel", r.mat("Pitted Steel"), None),
+        fill_layer("Olive paint", paint_over([0.09, 0.1, 0.04], 0.65, 0.0), Some(mask(1.0, vec![
+            effect(Subtract, 1.0, gen(Generator::EdgeWear, |g| {
+                g.level = 0.2;
+                g.noise = 0.7;
+            })),
+            effect(Multiply, 1.0, r.grunge("Grunges/Grunge Paint Peel", 4.0)),
+        ]))),
+        fill_layer("Mud", r.mat("Brown Soil"), Some(mask(0.0, vec![effect(Normal, 1.0, low_band(0.3))]))),
+        fill_layer("Dust", paint_over([0.45, 0.4, 0.33], 0.95, 0.0), Some(smart_mask("Dust from above"))),
+    ]);
+    sm("Rusty steel", &|r| vec![
+        fill_layer("Steel", r.mat("Brushed Steel"), None),
+        fill_layer("Rust", r.mat("Rust Coarse 01"), Some(mask(0.0, vec![
+            effect(Normal, 1.0, r.grunge("Grunges/Grunge Rust", 2.0)),
+            effect(Add, 0.6, gen(Generator::Dirt, |_| {})),
+            effect(Add, 0.5, gen(Generator::Cavity, |_| {})),
+        ]))),
+    ]);
+    sm("Cast iron rusty", &|r| vec![
+        fill_layer("Iron", r.mat("Pitted Cast Iron"), None),
+        fill_layer("Rust", r.mat("Rusted Iron"), Some(mask(0.0, vec![
+            effect(Normal, 1.0, gen(Generator::Cavity, |_| {})),
+            effect(Add, 0.7, gen(Generator::Dirt, |_| {})),
+            effect(Multiply, 0.7, r.grunge("Grunges/Grunge Rust", 1.5)),
+        ]))),
+    ]);
+    sm("Galvanized steel stained", &|r| vec![
+        fill_layer("Galvanized", r.mat("Galvanized Steel"), None),
+        fill_layer("Rust stains", r.mat("Rusty Metal 02"), Some(mask(0.0, vec![
+            effect(Normal, 1.0, r.grunge("Grunges/Grunge Water Stains", 1.5)),
+            effect(Add, 0.5, gen(Generator::Cavity, |_| {})),
+        ]))),
+        fill_layer("Grime", paint_over([0.04, 0.035, 0.03], 0.9, 0.0), Some(smart_mask("Ambient dirt"))),
+    ]);
+    sm("Copper patina", &|r| vec![
+        fill_layer("Copper", r.mat("Polished Copper"), None),
+        fill_layer("Patina", r.mat("Copper Patina"), Some(mask(0.0, vec![
+            effect(Normal, 1.0, r.grunge("Grunges/Clouds", 1.5)),
+            effect(Normal, 1.0, levels(0.45, 0.65)),
+            effect(Add, 0.8, gen(Generator::Cavity, |_| {})),
+            effect(Add, 0.6, gen(Generator::Dirt, |g| g.noise = 0.5)),
+        ]))),
+    ]);
+    sm("Gold worn", &|r| vec![
+        fill_layer("Gold", r.mat("Polished Gold"), None),
+        fill_layer("Scratches", r.mat("Scratched Gold"), Some(mask(0.0, vec![effect(Normal, 1.0, r.grunge("Grunges/Grunge Scratches", 2.0))]))),
+        fill_layer("Grime", paint_over([0.06, 0.045, 0.02], 0.8, 0.0), Some(smart_mask("Cavity dirt"))),
+    ]);
+    sm("Silver tarnished", &|r| vec![
+        fill_layer("Silver", r.mat("Polished Silver"), None),
+        fill_layer("Tarnish", paint_over([0.12, 0.1, 0.08], 0.6, 0.7), Some(mask(0.0, vec![
+            effect(Normal, 1.0, r.grunge("Grunges/Clouds", 2.0)),
+            effect(Normal, 1.0, levels(0.5, 0.75)),
+            effect(Add, 1.0, gen(Generator::Cavity, |_| {})),
+            effect(Add, 0.7, gen(Generator::Dirt, |_| {})),
+        ]))),
+    ]);
+    sm("Cobalt oxidized", &|r| vec![
+        fill_layer("Oxide", r.mat("Oxidized Cobalt"), None),
+        fill_layer("Bare edges", r.mat("Polished Cobalt"), Some(mask(0.0, vec![effect(Normal, 1.0, gen(Generator::EdgeWear, |g| g.level = 0.25))]))),
+    ]);
+    // Wood, leather, fabric, plastic.
+    sm("Wood painted chipped", &|r| vec![
+        fill_layer("Planks", r.mat("Weathered Brown Planks"), None),
+        fill_layer("Paint", paint_over([0.42, 0.55, 0.6], 0.55, 0.0), Some(mask(1.0, vec![
+            effect(Subtract, 1.0, gen(Generator::EdgeWear, |g| g.noise = 0.7)),
+            effect(Multiply, 1.0, r.grunge("Grunges/Grunge Paint Peel", 4.0)),
+        ]))),
+        fill_layer("Dirt", paint_over([0.06, 0.05, 0.035], 0.9, 0.0), Some(smart_mask("Cavity dirt"))),
+    ]);
+    sm("Wood varnished dusty", &|r| vec![
+        fill_layer("Oak", r.mat("Honey Oak Wood"), None),
+        fill_layer("Worn varnish", paint_over([0.42, 0.3, 0.18], 0.7, 0.0), Some(smart_mask("Edge wear"))),
+        fill_layer("Dust", paint_over([0.5, 0.46, 0.4], 1.0, 0.0), Some(smart_mask("Dust from above"))),
+    ]);
+    sm("Leather worn", &|r| vec![
+        fill_layer("Leather", r.mat("Dark Brown Leather"), None),
+        fill_layer("Rubbed", paint_over([0.36, 0.22, 0.12], 0.5, 0.0), Some(smart_mask("Edge wear"))),
+        fill_layer("Creases", paint_over([0.04, 0.025, 0.015], 0.85, 0.0), Some(smart_mask("Cavity dirt"))),
+    ]);
+    sm("Denim faded", &|r| vec![
+        fill_layer("Denim", r.mat("Blue Denim"), None),
+        fill_layer("Faded", paint_over([0.5, 0.6, 0.72], 0.95, 0.0), Some(mask(0.0, vec![effect(Normal, 0.5, gen(Generator::EdgeWear, |g| {
+            g.level = 0.15;
+            g.noise = 0.8;
+        }))]))),
+        fill_layer("Dirt", paint_over([0.12, 0.1, 0.07], 0.95, 0.0), Some(mask(0.0, vec![effect(Normal, 1.0, low_band(0.25))]))),
+    ]);
+    sm("Plastic scuffed", &|r| vec![
+        fill_layer("Plastic", tinted(r.mat("Green Plastic"), [0.3, 0.4, 0.34]), None),
+        fill_layer("Scuffs", paint_over([0.2, 0.3, 0.18], 0.7, 0.0), Some(mask(0.0, vec![
+            effect(Normal, 1.0, r.grunge("Grunges/Grunge Scratches", 2.0)),
+            effect(Add, 0.4, gen(Generator::EdgeWear, |_| {})),
+        ]))),
+        fill_layer("Dust", paint_over([0.45, 0.42, 0.38], 1.0, 0.0), Some(smart_mask("Dust from above"))),
+    ]);
+    // Stone and masonry.
+    sm("Mossy stone", &|r| vec![
+        fill_layer("Rock", r.mat("Gray Rocks"), None),
+        fill_layer("Moss", r.mat("Green Moss"), Some(mask(0.0, vec![
+            effect(Normal, 1.0, up_light(0.55, 3.0)),
+            effect(Multiply, 1.0, r.grunge("Grunges/Clouds", 1.5)),
+            effect(Add, 0.5, gen(Generator::Cavity, |_| {})),
+        ]))),
+    ]);
+    sm("Snowy rock", &|r| vec![
+        fill_layer("Rock", r.mat("Layered Grey Cliff"), None),
+        fill_layer("Snow", r.mat("Snow"), Some(mask(0.0, vec![
+            effect(Normal, 1.0, up_light(0.6, 6.0)),
+            effect(Multiply, 1.0, r.grunge("Grunges/Clouds Soft", 1.0)),
+        ]))),
+    ]);
+    sm("Concrete leaks dusty", &|r| vec![
+        fill_layer("Concrete", r.mat("Smooth Concrete"), None),
+        fill_layer("Leaks", paint_over([0.12, 0.11, 0.1], 0.95, 0.0), Some(mask(0.0, vec![
+            effect(Normal, 0.8, r.grunge("Grunges/Grunge Leaks", 1.5)),
+            effect(Add, 0.5, gen(Generator::Dirt, |_| {})),
+        ]))),
+        fill_layer("Dust", paint_over([0.6, 0.56, 0.5], 1.0, 0.0), Some(smart_mask("Dust from above"))),
+    ]);
+    sm("Brick wall grimy", &|r| vec![
+        fill_layer("Bricks", r.mat("Red Brick Wall"), None),
+        fill_layer("Grime", paint_over([0.06, 0.05, 0.04], 0.95, 0.0), Some(mask(0.0, vec![
+            effect(Normal, 1.0, gen(Generator::AmbientOcclusion, |_| {})),
+            effect(Add, 0.6, r.grunge("Grunges/Grunge Water Stains", 1.0)),
+        ]))),
+        fill_layer("Moss", r.mat("Green Moss"), Some(mask(0.0, vec![
+            effect(Normal, 1.0, low_band(0.25)),
+            effect(Multiply, 1.0, r.grunge("Grunges/Clouds", 1.0)),
+            effect(Normal, 1.0, levels(0.2, 0.5)),
+        ]))),
+    ]);
+    out
+}
+
 // ---------------------------------------------------------------- user library
 
 #[derive(Serialize, Deserialize)]
@@ -463,16 +748,17 @@ pub fn remap_resources(t: &mut LayerTree, map: &std::collections::HashMap<u64, u
     if let LayerKind::Fill(f) = &mut t.desc.kind {
         for c in f.channels.iter_mut() {
             if let Some(id) = c.texture {
-                c.texture = map.get(&id).copied().or(Some(id));
+                c.texture = map.get(&id).copied();
+                if c.texture.is_none() && c.source == SourceKind::Texture {
+                    c.source = SourceKind::Uniform;
+                }
             }
         }
     }
     if let Some(m) = &mut t.desc.mask {
         for e in m.effects.iter_mut() {
-            if let MaskEffectKind::Fill { texture: Some(id), .. } = &mut e.kind {
-                if let Some(n) = map.get(id) {
-                    *id = *n;
-                }
+            if let MaskEffectKind::Fill { texture, .. } = &mut e.kind {
+                *texture = texture.and_then(|id| map.get(&id).copied());
             }
         }
     }
@@ -566,35 +852,75 @@ pub fn files_with(dir: &Path, exts: &[&str]) -> Vec<PathBuf> {
     v
 }
 
-/// Environment maps of an installed Adobe Substance 3D Painter (newest
-/// version found), read in place: nothing is copied into this project.
-pub fn painter_environments() -> Vec<PathBuf> {
-    let base = Path::new(r"C:\Program Files\Adobe");
-    let Ok(rd) = std::fs::read_dir(base) else { return Vec::new() };
-    let mut installs: Vec<PathBuf> = rd
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("Adobe Substance 3D Painter")))
-        .collect();
-    installs.sort();
-    let Some(dir) = installs.last().map(|p| p.join("resources").join("starter_assets").join("environments")) else { return Vec::new() };
-    let mut out = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(&dir) {
-        let mut subs: Vec<PathBuf> = rd.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.is_dir()).collect();
-        subs.sort();
-        for s in subs {
-            out.extend(files_with(&s, ENV_EXTS));
+/// Images of a starter assets folder (`alphas`, `textures`): its own files,
+/// then each sub-folder's, sorted.
+pub fn starter_files(folder: &str) -> Vec<PathBuf> {
+    let Some(root) = starter_dir().map(|d| d.join(folder)) else { return Vec::new() };
+    let mut v = files_with(&root, IMAGE_EXTS);
+    if let Ok(rd) = std::fs::read_dir(&root) {
+        let mut dirs: Vec<PathBuf> = rd.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.is_dir()).collect();
+        dirs.sort();
+        for d in dirs {
+            v.extend(files_with(&d, IMAGE_EXTS));
         }
     }
-    out
+    v
 }
 
-/// The real application's default environment ("Panorama"), if installed.
-pub fn painter_default_environment() -> Option<PathBuf> {
-    painter_environments().into_iter().find(|p| p.file_stem().is_some_and(|s| s.eq_ignore_ascii_case("panorama")))
+/// Shelf folder of a library image: its starter sub-folder, or "Your
+/// assets" for imported files.
+pub fn file_folder(p: &Path) -> String {
+    if p.starts_with(library_dir()) {
+        return "Your assets".into();
+    }
+    p.parent().and_then(|d| d.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
-pub const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "tga", "tif", "tiff", "bmp", "exr", "hdr"];
+/// A file of the starter assets or of the user's library (not one picked
+/// from disk).
+pub fn is_library_file(p: &Path) -> bool {
+    let under = |d: &Path| p.starts_with(d) || std::fs::canonicalize(p).ok().zip(std::fs::canonicalize(d).ok()).is_some_and(|(p, d)| p.starts_with(d));
+    starter_dir().is_some_and(|d| under(&d)) || under(&library_dir())
+}
+
+/// A project resource named like something the tools pull in by themselves
+/// (projects saved before resources kept where they came from): a starter
+/// texture or alpha, a texture material's map, a built-in alpha shape.
+pub fn is_starter_name(name: &str) -> bool {
+    static NAMES: std::sync::OnceLock<std::collections::HashSet<String>> = std::sync::OnceLock::new();
+    let names = NAMES.get_or_init(|| {
+        ["textures", "alphas"]
+            .iter()
+            .flat_map(|f| starter_files(f))
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase()))
+            .collect()
+    });
+    let lower = name.to_lowercase();
+    if names.contains(&lower) {
+        return true;
+    }
+    let stem = lower.rsplit_once('.').map_or(lower.as_str(), |(s, _)| s);
+    TEX_MATERIAL_MAPS.iter().any(|(m, _)| stem.ends_with(&format!(" {m}")))
+        || crate::brush::AlphaKind::ALL.iter().any(|k| k.name().eq_ignore_ascii_case(stem))
+}
+
+/// A starter alpha by its path under `starter_assets/alphas`.
+pub fn starter_alpha(rel: &str) -> Option<PathBuf> {
+    starter_dir().map(|d| d.join("alphas").join(rel)).filter(|p| p.is_file())
+}
+
+/// Environment maps of the starter assets (CC0, Poly Haven; credits in
+/// `starter_assets/environments/CREDITS.txt`).
+pub fn starter_environments() -> Vec<PathBuf> {
+    starter_dir().map(|d| files_with(&d.join("environments"), ENV_EXTS)).unwrap_or_default()
+}
+
+/// The default environment: the first starter one.
+pub fn default_environment() -> Option<PathBuf> {
+    starter_environments().into_iter().next()
+}
+
+pub const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "tga", "tif", "tiff", "bmp", "exr", "hdr", "webp", "avif"];
 pub const ENV_EXTS: &[&str] = &["hdr", "exr"];
 
 /// Copies files into a library folder; returns the new paths.
@@ -609,4 +935,135 @@ pub fn import_files(folder: &str, files: &[PathBuf]) -> Result<Vec<PathBuf>> {
         }
     }
     Ok(out)
+}
+
+/// A scanned texture material: `starter_assets/materials/<Category>/<id>/`
+/// with `color.jpg`, `normal.jpg` (OpenGL), `roughness.jpg`, `height.jpg`,
+/// optional `metallic.jpg` and a `material.json` (name, category, source,
+/// license, downloads, metal).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TexMaterial {
+    pub name: String,
+    pub category: String,
+    pub dir: PathBuf,
+    /// Where it comes from (Poly Haven, ambientCG), shown in its preview.
+    pub source: String,
+    /// Metal without a metallic map: metallic is 1.
+    pub metal: bool,
+    downloads: u64,
+}
+
+/// Texture material maps: file stem, fill channel.
+pub const TEX_MATERIAL_MAPS: [(&str, usize); 5] =
+    [("color", CH_COLOR), ("roughness", CH_ROUGH), ("metallic", CH_METAL), ("height", CH_HEIGHT), ("normal", CH_NORMAL)];
+
+impl TexMaterial {
+    /// The file of one map (`color`, `normal`...), when the material has it.
+    pub fn map(&self, stem: &str) -> Option<PathBuf> {
+        ["jpg", "png"].iter().map(|x| self.dir.join(format!("{stem}.{x}"))).find(|p| p.is_file())
+    }
+
+    /// Its pre-rendered shelf preview (`--matpreviews`: path traced sphere).
+    pub fn preview(&self) -> Option<PathBuf> {
+        Some(self.dir.join("preview.png")).filter(|p| p.is_file())
+    }
+
+    /// A fill reading the maps from resources `ids` (map stem to resource):
+    /// color in sRGB, the others linear, normal in OpenGL convention.
+    pub fn fill(&self, ids: &std::collections::HashMap<&'static str, u64>) -> FillDesc {
+        let mut f = FillDesc::default();
+        for (stem, c) in TEX_MATERIAL_MAPS {
+            let ch = &mut f.channels[c];
+            match ids.get(stem) {
+                Some(&id) => {
+                    *ch = FillChannel { enabled: true, source: SourceKind::Texture, texture: Some(id), ..Default::default() };
+                    if c == CH_COLOR {
+                        ch.value = [1.0; 3];
+                    } else if c == CH_HEIGHT {
+                        // Scanned displacement is far stronger than a
+                        // painted height: a quarter by default.
+                        ch.value = [0.0; 3];
+                        ch.value_b = [0.25; 3];
+                    } else {
+                        ch.value = [0.0; 3];
+                        ch.value_b = [1.0; 3];
+                    }
+                }
+                None if c == CH_METAL => *ch = FillChannel { enabled: true, value: [if self.metal { 1.0 } else { 0.0 }; 3], ..Default::default() },
+                None => {}
+            }
+        }
+        // Tiling 1: the maps fit the UV space exactly.
+        f.projection.scale = 1.0;
+        f.material = Some(self.name.clone());
+        f
+    }
+}
+
+/// `starter_assets` next to the executable (installed) or above it (a
+/// cargo build in the repository). `MF_STARTER_DIR` overrides it.
+pub fn starter_dir() -> Option<PathBuf> {
+    if let Ok(d) = std::env::var("MF_STARTER_DIR") {
+        return Some(PathBuf::from(d)).filter(|d| d.is_dir());
+    }
+    let exe = std::env::current_exe().ok()?;
+    exe.ancestors().skip(1).take(4).map(|d| d.join("starter_assets")).find(|d| d.is_dir())
+}
+
+/// Material categories of the shelf, in display order.
+pub const MATERIAL_CATEGORIES: [&str; 11] = ["Wood", "Metal", "Stone", "Concrete", "Brick", "Tiles", "Plaster", "Ground", "Fabric", "Leather", "Plastic"];
+
+/// The texture materials of the starter assets, by name. Names are unique
+/// (their shelf key).
+pub fn texture_materials() -> Vec<TexMaterial> {
+    #[derive(Deserialize)]
+    struct Meta {
+        name: String,
+        category: Option<String>,
+        source: Option<String>,
+        #[serde(default)]
+        downloads: u64,
+        #[serde(default)]
+        metal: bool,
+    }
+    let Some(root) = starter_dir().map(|d| d.join("materials")) else { return Vec::new() };
+    let mut out: Vec<TexMaterial> = Vec::new();
+    let Ok(cats) = std::fs::read_dir(&root) else { return Vec::new() };
+    for cat in cats.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.is_dir()) {
+        let folder = cat.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let Ok(rd) = std::fs::read_dir(&cat) else { continue };
+        for dir in rd.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.is_dir()) {
+            let Some(meta) = std::fs::read(dir.join("material.json")).ok().and_then(|b| serde_json::from_slice::<Meta>(&b).ok()) else {
+                continue;
+            };
+            // Rock, marble, onyx... are one Stone category.
+            let category = match meta.category.unwrap_or_else(|| folder.clone()).as_str() {
+                "Rock" | "Marble" | "Onyx" | "Granite" | "Terrazzo" => "Stone".to_string(),
+                c => c.to_string(),
+            };
+            let m = TexMaterial {
+                name: meta.name,
+                category,
+                dir,
+                source: meta.source.unwrap_or_default(),
+                metal: meta.metal,
+                downloads: meta.downloads,
+            };
+            if m.map("color").is_some() {
+                out.push(m);
+            }
+        }
+    }
+    // One list by name, like Painter's shelf.
+    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()).then(b.downloads.cmp(&a.downloads)));
+    let mut seen = std::collections::HashSet::new();
+    for m in &mut out {
+        let base = m.name.clone();
+        let mut k = 2;
+        while !seen.insert(m.name.clone()) {
+            m.name = format!("{base} {k}");
+            k += 1;
+        }
+    }
+    out
 }

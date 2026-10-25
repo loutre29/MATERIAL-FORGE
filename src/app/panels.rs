@@ -13,6 +13,8 @@ pub struct LayerDrag(pub Vec<u64>);
 pub(super) enum Cmd {
     Select(u64, Target),
     ToggleVisible(u64),
+    /// Alt + click on an eye: only this layer shows; again: back as before.
+    Solo(u64),
     ToggleExpand(u64),
     ToggleEffect(u64, u64),
     AddLayer(LayerKind),
@@ -45,6 +47,10 @@ pub(super) enum Cmd {
     AssignResource(u64, TexSlot),
     /// Imports an image file into the project, then assigns it.
     AssignFile(PathBuf, TexSlot),
+    /// A built-in alpha shape becomes a project image for a slot.
+    AssignAlphaShape(crate::brush::AlphaKind, TexSlot),
+    /// Fill layer (id) takes the maps of a texture material.
+    FillTexMaterial(u64, Box<crate::library::TexMaterial>),
     /// An asset dropped on the layer stack (on a row, or below the rows).
     DropItem(Option<u64>, Item),
     /// Layer row blend dropdown: (layer, channel, mode).
@@ -113,8 +119,9 @@ pub(super) fn proc_params(ui: &mut Ui, id: impl std::hash::Hash + Copy, p: &mut 
         slider(ui, "Balance", &mut p.balance, 0.0..=1.0);
         Slider::new("Contrast", &mut p.contrast, 0.1..=10.0).log().show(ui);
         let title = format!("{} parameters", p.kind.name());
-        // Painter's shelf procedurals: their own parameters.
-        if p.kind.is_bitmap() {
+        // Painter's shelf procedurals and the normal generators: their own
+        // parameters.
+        if p.kind.is_bitmap() || p.kind.is_normal() {
             if let Some(d) = crate::procedurals::def_of(p.kind) {
                 if !d.params.is_empty() {
                     sub_section(ui, (id, "kind params"), &title, true, |ui| {
@@ -171,11 +178,68 @@ pub(super) fn proc_params(ui: &mut Ui, id: impl std::hash::Hash + Copy, p: &mut 
     });
 }
 
+/// Copied transformations (right click on their section), shared by every
+/// layer, effect and texture set of the session.
+#[derive(Clone, Copy)]
+struct UvTransformClip {
+    scale: f32,
+    stretch: [f32; 2],
+    rotation: f32,
+    offset: [f32; 2],
+    pivot: [f32; 2],
+    sharpness: f32,
+}
+
+#[derive(Clone, Copy)]
+struct PlacementClip {
+    position: [f32; 3],
+    orient: [f32; 4],
+    axes: [f32; 3],
+}
+
+/// Copy / Paste / Reset in a transformation section's right-click menu.
+/// `T` is the clipboard kind kept in egui's memory.
+fn transform_menu<T: Clone + Send + Sync + 'static>(ui: &mut Ui, copy: impl FnOnce() -> T, action: &mut Option<Result<T, ()>>) {
+    let key = egui::Id::new(("transform clip", std::any::type_name::<T>()));
+    if ui.button("Copy").clicked() {
+        let v = copy();
+        ui.data_mut(|d| d.insert_temp(key, v));
+        ui.close_menu();
+    }
+    let have: Option<T> = ui.data(|d| d.get_temp(key));
+    if ui.add_enabled(have.is_some(), egui::Button::new("Paste")).clicked() {
+        *action = have.map(Ok);
+        ui.close_menu();
+    }
+    ui.separator();
+    if ui.button("Reset").clicked() {
+        *action = Some(Err(()));
+        ui.close_menu();
+    }
+}
+
 pub(super) fn projection_ui(ui: &mut Ui, id: impl std::hash::Hash + Copy, p: &mut Projection) {
     super::widgets::combo_row(ui, "Projection", (id, "pm"), &mut p.mode, ProjMode::ALL, ProjMode::name);
-    super::widgets::sub_section(ui, (id, "uvt"), "UV transformations", true, |ui| {
+    if p.mode == ProjMode::Uv {
+        super::widgets::combo_row(ui, "Filtering", (id, "flt"), &mut p.filter, &crate::document::UvFilter::ALL, crate::document::UvFilter::name);
+        super::widgets::combo_row(ui, "UV Wrap", (id, "wrp"), &mut p.wrap, &crate::document::UvWrap::ALL, crate::document::UvWrap::name);
+    }
+    let mut uv_act: Option<Result<UvTransformClip, ()>> = None;
+    let mut place_act: Option<Result<PlacementClip, ()>> = None;
+    let clip = UvTransformClip { scale: p.scale, stretch: p.stretch, rotation: p.rotation, offset: p.offset, pivot: p.pivot, sharpness: p.sharpness };
+    let placement = PlacementClip { position: p.position, orient: p.orient, axes: p.axes };
+    let menu = |ui: &mut Ui| transform_menu(ui, || clip, &mut uv_act);
+    super::widgets::sub_section_menu(ui, (id, "uvt"), "UV transformations", true, menu, |ui| {
         super::widgets::Slider::new("Tiling", &mut p.scale, 0.05..=256.0).log().soft(0.001, 100000.0).show(ui);
         if p.mode == ProjMode::Uv {
+            // The 2D view manipulator's scale per axis.
+            ui.horizontal(|ui| {
+                ui.add_sized([96.0, 20.0], egui::Label::new(egui::RichText::new("Scale U / V").size(12.0).color(super::widgets::LABEL)));
+                let w = ((ui.available_width() - 8.0) / 2.0).max(30.0);
+                for v in p.stretch.iter_mut() {
+                    ui.add_sized([w, 20.0], egui::DragValue::new(v).speed(0.01).range(0.01..=100.0).max_decimals(3));
+                }
+            });
             super::widgets::Slider::new("Rotation", &mut p.rotation, -180.0..=180.0).decimals(0).show(ui);
         }
         slider(ui, "Offset U", &mut p.offset[0], -1.0..=1.0);
@@ -186,7 +250,8 @@ pub(super) fn projection_ui(ui: &mut Ui, id: impl std::hash::Hash + Copy, p: &mu
     });
     if p.mode != ProjMode::Uv {
         // The viewport manipulator's values (W move, E rotate, R scale).
-        super::widgets::sub_section(ui, (id, "p3d"), "3D transformation", true, |ui| {
+        let menu = |ui: &mut Ui| transform_menu(ui, || placement, &mut place_act);
+        super::widgets::sub_section_menu(ui, (id, "p3d"), "3D transformation", true, menu, |ui| {
             let row = |ui: &mut Ui, label: &str, v: &mut [f32; 3], speed: f64| {
                 ui.horizontal(|ui| {
                     ui.add_sized([60.0, 20.0], egui::Label::new(egui::RichText::new(label).size(12.0).color(super::widgets::LABEL)));
@@ -212,21 +277,60 @@ pub(super) fn projection_ui(ui: &mut Ui, id: impl std::hash::Hash + Copy, p: &mu
             }
         });
     }
+    let fresh = Projection { mode: p.mode, ..Default::default() };
+    match uv_act {
+        Some(Ok(c)) => {
+            (p.scale, p.stretch, p.rotation, p.offset, p.pivot, p.sharpness) = (c.scale, c.stretch, c.rotation, c.offset, c.pivot, c.sharpness);
+        }
+        Some(Err(())) => {
+            (p.scale, p.stretch, p.rotation, p.offset, p.pivot, p.sharpness) = (fresh.scale, fresh.stretch, fresh.rotation, fresh.offset, fresh.pivot, fresh.sharpness);
+        }
+        None => {}
+    }
+    match place_act {
+        Some(Ok(c)) => (p.position, p.orient, p.axes) = (c.position, c.orient, c.axes),
+        Some(Err(())) => (p.position, p.orient, p.axes) = (fresh.position, fresh.orient, fresh.axes),
+        None => {}
+    }
 }
 
 impl RetroApp {
-    pub(super) fn menu_bar(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("menu").frame(egui::Frame::none().fill(crate::style::BG).inner_margin(egui::Margin::symmetric(6.0, 3.0))).show(ctx, |ui| {
-            egui::menu::bar(ui, |ui| {
+    /// The app menu (File, Edit, Select, Window, View, Help), opened from
+    /// the project button of the left panel.
+    pub(super) fn app_menu(&mut self, ui: &mut Ui, ctx: &egui::Context) {
+        {
+            {
                 let has = self.doc.is_some();
                 let file = ui.menu_button("File", |ui| {
                     if ui.add(egui::Button::new("New project...").shortcut_text("Ctrl+N")).clicked() {
-                        self.new_dialog = Some(NewProjectDialog { path: String::new(), res: 2048, error: None });
+                        self.new_dialog = Some(NewProjectDialog { path: String::new(), res: 2048, error: None, auto_uv: Default::default() });
                         ui.close_menu();
                     }
                     if ui.add(egui::Button::new("Open...").shortcut_text("Ctrl+O")).clicked() {
                         ui.close_menu();
                         self.open_project();
+                    }
+                    let recent = crate::library::recent_projects();
+                    let mut open_recent = None;
+                    ui.add_enabled_ui(!recent.is_empty(), |ui| {
+                        super::widgets::sub_menu(ui, "Open recent", |ui| {
+                            ui.set_min_width(260.0);
+                            for p in &recent {
+                                let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                                if ui.button(name).on_hover_text(p.display().to_string()).clicked() {
+                                    open_recent = Some(p.clone());
+                                    ui.close_menu();
+                                }
+                            }
+                            ui.separator();
+                            if ui.button("Clear recent").clicked() {
+                                crate::library::clear_recent();
+                                ui.close_menu();
+                            }
+                        });
+                    });
+                    if let Some(p) = open_recent {
+                        self.open_path(&p);
                     }
                     ui.separator();
                     if ui.add_enabled(has, egui::Button::new("Save").shortcut_text("Ctrl+S")).clicked() {
@@ -242,6 +346,10 @@ impl RetroApp {
                         ui.close_menu();
                         self.reimport_mesh();
                     }
+                    if ui.add_enabled(has, egui::Button::new("Export mesh (OBJ)...")).on_hover_text("The mesh with the project's UVs (auto UV included)").clicked() {
+                        ui.close_menu();
+                        self.export_mesh();
+                    }
                     if ui.button("Import resources...").clicked() {
                         ui.close_menu();
                         self.import_resources(super::ImportKind::Texture);
@@ -250,6 +358,10 @@ impl RetroApp {
                     if ui.add_enabled(has, egui::Button::new("Export textures...").shortcut_text("Ctrl+Shift+E")).clicked() {
                         ui.close_menu();
                         self.open_export();
+                    }
+                    if ui.add_enabled(has && self.bake_job.is_none(), egui::Button::new("Bake mesh maps...").shortcut_text("Ctrl+Shift+B")).clicked() {
+                        ui.close_menu();
+                        self.open_bake_dialog();
                     }
                     ui.separator();
                     if ui.button("Quit").clicked() {
@@ -270,41 +382,95 @@ impl RetroApp {
                     ui.menu_button("Add layer", |ui| {
                         ui.add_enabled_ui(has, |ui| self.add_layer_menu(ui));
                     });
+                    ui.separator();
+                    if ui.add(egui::Button::new("Preferences...").shortcut_text("Ctrl+K")).clicked() {
+                        self.show_prefs = true;
+                        ui.close_menu();
+                    }
                 });
-                ui.menu_button("Mode", |ui| {
-                    let busy = self.bake_job.is_some();
-                    if ui.radio(!self.view.path_trace && self.bake_dialog.is_none(), "Painting (F9)").clicked() {
-                        self.view.path_trace = false;
-                        self.bake_dialog = None;
+                ui.menu_button("Select", |ui| {
+                    use super::selection::SelShape;
+                    let sel = self.has_selection();
+                    if ui.add_enabled(has, egui::Button::new("All").shortcut_text("Ctrl+A")).clicked() {
+                        self.select_all();
                         ui.close_menu();
                     }
-                    if ui.add_enabled(has && !busy, egui::RadioButton::new(self.bake_dialog.is_some(), "Baking (F8)")).clicked() {
-                        self.open_bake_dialog();
+                    if ui.add_enabled(sel, egui::Button::new("Deselect").shortcut_text("Ctrl+D")).clicked() {
+                        self.deselect();
                         ui.close_menu();
                     }
-                    if ui.radio(self.view.path_trace, "Rendering (F10)").clicked() {
-                        self.view.path_trace = true;
+                    if ui.add_enabled(has && self.last_selection.is_some(), egui::Button::new("Reselect").shortcut_text("Ctrl+Shift+D")).clicked() {
+                        self.reselect();
                         ui.close_menu();
                     }
+                    if ui.add_enabled(sel, egui::Button::new("Invert").shortcut_text("Ctrl+Shift+I")).clicked() {
+                        self.invert_selection();
+                        ui.close_menu();
+                    }
+                    if ui.add_enabled(has, egui::Button::new("By mesh map...")).on_hover_text("Edges, cavities, occluded areas or thin parts, from the baked maps").clicked() {
+                        let k = super::selection::MapSel::Edges;
+                        self.sel_by_map = Some((k, k.default_threshold()));
+                        ui.close_menu();
+                    }
+                    ui.add_enabled_ui(sel, |ui| {
+                        super::widgets::sub_menu(ui, "Modify", |ui| {
+                            for op in [crate::flood::Modify::Grow, crate::flood::Modify::Shrink, crate::flood::Modify::Feather, crate::flood::Modify::Border] {
+                                if ui.button(format!("{}...", op.name())).clicked() {
+                                    self.sel_modify = Some((op, if op == crate::flood::Modify::Feather { 8.0 } else { 4.0 }));
+                                    ui.close_menu();
+                                }
+                            }
+                        });
+                    });
+                    ui.separator();
+                    if ui.add_enabled(sel, egui::Button::new("Fill selection").shortcut_text("Shift+Backspace")).clicked() {
+                        self.fill_selection(false);
+                        ui.close_menu();
+                    }
+                    if ui.add_enabled(sel, egui::Button::new("Clear selection on the layer").shortcut_text("Del")).clicked() {
+                        self.fill_selection(true);
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.add_enabled(sel, egui::Button::new("Mask the selected layer with the selection")).clicked() {
+                        self.mask_from_selection();
+                        ui.close_menu();
+                    }
+                    if ui.add_enabled(sel, egui::Button::new("New fill layer from the selection")).clicked() {
+                        self.fill_layer_from_selection();
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    for (shape, key) in [(SelShape::Rect, "M"), (SelShape::Ellipse, "Shift+M"), (SelShape::Lasso, "L"), (SelShape::PolyLasso, "Shift+L")] {
+                        if ui.add(egui::Button::new(shape.name()).shortcut_text(key).selected(self.tool == Tool::Select(shape))).clicked() {
+                            if matches!(shape, SelShape::Rect | SelShape::Ellipse) {
+                                self.last_marquee = shape;
+                            } else {
+                                self.last_lasso = shape;
+                            }
+                            self.sel_drag = None;
+                            self.tool = Tool::Select(shape);
+                            ui.close_menu();
+                        }
+                    }
+                    ui.checkbox(&mut self.sel_through, "Select through (3D: hidden and back faces too)");
                 });
                 ui.menu_button("Window", |ui| {
-                    ui.menu_button("Views", |ui| {
+                    ui.menu_button("Panels", |ui| {
                         for tab in super::dock::Tab::PANELS {
                             let mut on = self.tab_open(tab);
                             if ui.checkbox(&mut on, tab.name()).clicked() {
-                                if on {
-                                    self.focus_tab(tab);
-                                } else if let Some(mut d) = self.dock.take() {
-                                    if let Some(found) = d.find_tab(&tab) {
-                                        d.remove_tab(found);
-                                    }
-                                    self.dock = Some(d);
-                                }
+                                self.toggle_tab(tab);
                             }
                         }
                     });
-                    if ui.button("Reset UI").clicked() {
-                        self.dock = None;
+                    let mut locked = self.dock.clone().unwrap_or_default().locked;
+                    if ui.checkbox(&mut locked, "Lock panels").on_hover_text("Panels can neither move nor resize").clicked() {
+                        self.dock.get_or_insert_with(Default::default).locked = locked;
+                    }
+                    if ui.button("Reset panels").on_hover_text("Every panel back to its place and size").clicked() {
+                        let locked = self.dock.clone().unwrap_or_default().locked;
+                        self.dock = Some(super::dock::Panels { locked, ..Default::default() });
                         ui.close_menu();
                     }
                     if ui.add(egui::Button::new("Hide UI").shortcut_text("Tab")).clicked() {
@@ -320,22 +486,13 @@ impl RetroApp {
                         }
                     }
                 });
-                ui.menu_button("Viewport", |ui| {
+                ui.menu_button("View", |ui| {
                     ui.radio_value(&mut self.view.layout, Layout::Both, "3D + 2D (F1)");
                     ui.radio_value(&mut self.view.layout, Layout::Only3D, "3D only (F2)");
                     ui.radio_value(&mut self.view.layout, Layout::Only2D, "2D only (F3)");
                     ui.checkbox(&mut self.view.swap_views, "Swap 2D / 3D (F4)");
                     ui.separator();
-                    ui.menu_button("3D view display", |ui| {
-                        for d in Display::ALL {
-                            ui.radio_value(&mut self.view.display, d, d.name());
-                        }
-                    });
-                    ui.menu_button("2D view display", |ui| {
-                        for d in Display::ALL {
-                            ui.radio_value(&mut self.view.display_2d, d, d.name());
-                        }
-                    });
+                    ui.checkbox(&mut self.view.path_trace, "Render (path traced, F10)");
                     ui.checkbox(&mut self.view.wireframe, "Wireframe");
                     ui.checkbox(&mut self.camera.ortho, "Orthographic (F6, F5 perspective)");
                     ui.menu_button("Camera view", |ui| {
@@ -367,14 +524,8 @@ impl RetroApp {
                         self.flip_flyout(0);
                     }
                 });
-                ui.menu_button("Help", |ui| {
-                    if ui.button("Controls and shortcuts").clicked() {
-                        self.show_help = true;
-                        ui.close_menu();
-                    }
-                });
-            });
-        });
+            }
+        }
     }
 
     fn add_layer_menu(&mut self, ui: &mut Ui) {
@@ -479,6 +630,30 @@ impl RetroApp {
 
     /// Points a slot at project resource `id`.
     pub(super) fn assign_resource(&mut self, id: u64, slot: TexSlot) {
+        // A map dropped on the brush material: it becomes an evaluated
+        // material made of its values and that map.
+        if let TexSlot::FillChannel(super::props::BRUSH_FILL, c) = slot {
+            let mut fd = match self.mat.material.take() {
+                Some((_, f)) => f,
+                None => super::props::brush_fill(&self.mat),
+            };
+            let ch = &mut fd.channels[c];
+            ch.texture = Some(id);
+            ch.source = SourceKind::Texture;
+            ch.enabled = true;
+            if is_color_channel(c) {
+                ch.value = [1.0; 3];
+            } else if c == CH_NORMAL {
+                ch.value_b = [1.0; 3];
+            } else {
+                ch.value = [0.0; 3];
+                ch.value_b = [1.0; 3];
+            }
+            self.mat.channels[c] = true;
+            let name = fd.material.clone().unwrap_or_else(|| "Custom".into());
+            self.mat.material = Some((name, fd));
+            return;
+        }
         let Some(doc) = self.doc.as_mut() else { return };
         let set = doc.active;
         let s = &mut doc.sets[set];
@@ -488,10 +663,14 @@ impl RetroApp {
                     f.channels[c].texture = Some(id);
                     f.channels[c].source = SourceKind::Texture;
                     f.channels[c].enabled = true;
+                    // The map as it is: color untinted, scalars 0 to 1, normal at
+                    // full strength.
                     if is_color_channel(c) {
                         f.channels[c].value = [1.0; 3];
-                    }
-                    if c == CH_NORMAL {
+                    } else if c == CH_NORMAL {
+                        f.channels[c].value_b = [1.0; 3];
+                    } else {
+                        f.channels[c].value = [0.0; 3];
                         f.channels[c].value_b = [1.0; 3];
                     }
                 }
@@ -510,7 +689,6 @@ impl RetroApp {
             }
             TexSlot::Stencil => {
                 self.stencil.resource = Some(id);
-                self.stencil.enabled = true;
             }
             TexSlot::Alpha => self.brush.alpha = AlphaSource::Resource(id),
         }
@@ -580,6 +758,48 @@ impl RetroApp {
                 let s = &mut self.doc.as_mut().unwrap().sets[set];
                 if let Some(l) = find_mut(&mut s.layers, id) {
                     l.desc.visible = !l.desc.visible;
+                }
+                s.dirty = true;
+            }
+            Cmd::Solo(id) => {
+                let restoring = matches!(&self.solo, Some((s, l, _)) if *s == set && *l == id);
+                self.checkpoint(if restoring { "Show all layers" } else { "Solo layer" });
+                let s = &mut self.doc.as_mut().unwrap().sets[set];
+                if restoring {
+                    let (_, _, saved) = self.solo.take().unwrap();
+                    crate::document::visit_mut(&mut s.layers, &mut |l| {
+                        if let Some((_, v)) = saved.iter().find(|(i, _)| *i == l.desc.id) {
+                            l.desc.visible = *v;
+                        }
+                    });
+                } else {
+                    let mut saved = Vec::new();
+                    crate::document::visit(&s.layers, &mut |l| saved.push((l.desc.id, l.desc.visible)));
+                    // The layer and its folders show (so it renders); its own
+                    // children keep their visibility; everything else hides.
+                    fn path(layers: &[crate::document::Layer], id: u64, out: &mut Vec<u64>) -> bool {
+                        for l in layers {
+                            if l.desc.id == id || path(&l.children, id, out) {
+                                out.push(l.desc.id);
+                                return true;
+                            }
+                        }
+                        false
+                    }
+                    let mut shown = Vec::new();
+                    path(&s.layers, id, &mut shown);
+                    let mut inner = Vec::new();
+                    if let Some(l) = find(&s.layers, id) {
+                        crate::document::visit(&l.children, &mut |c| inner.push(c.desc.id));
+                    }
+                    crate::document::visit_mut(&mut s.layers, &mut |l| {
+                        if shown.contains(&l.desc.id) {
+                            l.desc.visible = true;
+                        } else if !inner.contains(&l.desc.id) {
+                            l.desc.visible = false;
+                        }
+                    });
+                    self.solo = Some((set, id, saved));
                 }
                 s.dirty = true;
             }
@@ -670,7 +890,9 @@ impl RetroApp {
                     occlusion_query_set: None,
                 });
                 engine.queue.submit(Some(enc.finish()));
-                let s = &mut self.doc.as_mut().unwrap().sets[set];
+                let doc = self.doc.as_mut().unwrap();
+                doc.modified = true;
+                let s = &mut doc.sets[set];
                 if let Some(l) = s.selected_layer_mut() {
                     l.rev = next_rev();
                 }
@@ -746,6 +968,32 @@ impl RetroApp {
                 }
             }
             Cmd::AssignResource(id, slot) => self.assign_resource(id, slot),
+            Cmd::AssignAlphaShape(k, slot) => {
+                let img = crate::brush::alpha_image(k);
+                let mut bytes = Vec::new();
+                if image::DynamicImage::ImageRgba8(img).write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png).is_ok() {
+                    let doc = self.doc.as_mut().unwrap();
+                    match doc.add_resource(&self.engine, format!("{}.png", k.name()), bytes, slot_kind(slot)) {
+                        Ok(id) => self.assign_resource(id, slot),
+                        Err(e) => self.status = format!("Could not use the alpha: {e:#}"),
+                    }
+                }
+            }
+            Cmd::FillTexMaterial(super::props::BRUSH_FILL, m) => {
+                if let Some(fd) = self.tex_material_fill(&m) {
+                    self.mat.material = Some((m.name.clone(), fd));
+                }
+            }
+            Cmd::FillTexMaterial(id, m) => {
+                let Some(mut fd) = self.tex_material_fill(&m) else { return };
+                let s = &mut self.doc.as_mut().unwrap().sets[set];
+                if let Some(LayerKind::Fill(f)) = find_mut(&mut s.layers, id).map(|l| &mut l.desc.kind) {
+                    // The layer keeps its projection.
+                    fd.projection = f.projection.clone();
+                    **f = fd;
+                }
+                s.dirty = true;
+            }
             Cmd::AssignFile(path, slot) => {
                 let doc = self.doc.as_mut().unwrap();
                 match doc.import_resource(&self.engine, &path, slot_kind(slot)) {
@@ -928,6 +1176,7 @@ impl RetroApp {
                 // On a row: above it (smart masks apply to it); on the empty
                 // area: top of the stack.
                 s.selected = row;
+                s.extra.clear();
                 s.target = Target::Content;
                 self.apply_item(item);
             }
@@ -957,16 +1206,27 @@ pub(super) fn chrono_like_stamp() -> String {
     format!("{}", t % 1_000_000)
 }
 
+/// The "add mask" menu of Painter (mask slot and its button).
 pub(super) fn mask_menu(ui: &mut Ui, cmds: &mut Vec<Cmd>) {
-    if ui.button("Add white mask").clicked() {
-        cmds.push(Cmd::AddMask(true));
-        ui.close_menu();
-    }
-    if ui.button("Add black mask").clicked() {
-        cmds.push(Cmd::AddMask(false));
-        ui.close_menu();
-    }
-    super::widgets::sub_menu(ui, "Add effect", |ui| effect_menu(ui, cmds));
+    let mut add = |ui: &mut Ui, label: &str, c: Vec<Cmd>| {
+        if ui.button(label).clicked() {
+            cmds.extend(c);
+            ui.close_menu();
+        }
+    };
+    add(ui, "Add white mask", vec![Cmd::AddMask(true)]);
+    add(ui, "Add black mask", vec![Cmd::AddMask(false)]);
+    let bitmap = MaskEffectKind::Fill {
+        value: 1.0,
+        source: SourceKind::Texture,
+        texture: None,
+        procedural: ProcParams::default(),
+        projection: Projection::default(),
+        range: [0.0, 1.0],
+    };
+    add(ui, "Add bitmap mask", vec![Cmd::AddMask(false), Cmd::AddEffect(bitmap)]);
+    add(ui, "Add mask with color selection", vec![Cmd::AddMask(false), Cmd::AddEffect(MaskEffectKind::ColorSelect { colors: Vec::new(), tolerance: 0.05 })]);
+    ui.separator();
     super::widgets::sub_menu(ui, "Apply smart mask", |ui| {
         for m in crate::library::smart_masks() {
             if ui.button(m.name).clicked() {
@@ -981,39 +1241,22 @@ pub(super) fn mask_menu(ui: &mut Ui, cmds: &mut Vec<Cmd>) {
             }
         }
     });
-    if ui.button("Remove mask").clicked() {
-        cmds.push(Cmd::RemoveMask);
-        ui.close_menu();
-    }
-    if ui.button("Save mask as smart mask").clicked() {
-        cmds.push(Cmd::SaveSmartMask);
-        ui.close_menu();
-    }
 }
 
+/// The mask "Add ..." items, flat as in Painter: each adds one effect whose
+/// generator, fill source or filter is then chosen in the properties.
 pub(super) fn effect_menu(ui: &mut Ui, cmds: &mut Vec<Cmd>) {
     let mut push = |ui: &mut Ui, k: MaskEffectKind| {
         cmds.push(Cmd::AddEffect(k));
         ui.close_menu();
     };
-    if ui.button("Paint").clicked() {
+    if ui.button("Add generator").clicked() {
+        push(ui, MaskEffectKind::Generator(GeneratorDesc::of(Generator::ALL[0])));
+    }
+    if ui.button("Add paint").clicked() {
         push(ui, MaskEffectKind::Paint);
     }
-    super::widgets::sub_menu(ui, "Generator", |ui| {
-        for g in Generator::ALL {
-            if ui.button(g.name()).clicked() {
-                push(ui, MaskEffectKind::Generator(GeneratorDesc::of(*g)));
-            }
-        }
-    });
-    super::widgets::sub_menu(ui, "Fill (procedural)", |ui| {
-        for p in ProcKind::ALL {
-            if ui.button(p.name()).clicked() {
-                push(ui, MaskEffectKind::fill_procedural(*p));
-            }
-        }
-    });
-    if ui.button("Fill (uniform / texture)").clicked() {
+    if ui.button("Add fill").clicked() {
         push(
             ui,
             MaskEffectKind::Fill {
@@ -1026,19 +1269,13 @@ pub(super) fn effect_menu(ui: &mut Ui, cmds: &mut Vec<Cmd>) {
             },
         );
     }
-    if ui.button("Levels").clicked() {
+    if ui.button("Add levels").clicked() {
         push(ui, MaskEffectKind::levels());
     }
-    if ui.button("Blur").clicked() {
+    if ui.button("Add filter").clicked() {
         push(ui, MaskEffectKind::Blur { radius: 4.0 });
     }
-    if ui.button("Invert").clicked() {
-        push(ui, MaskEffectKind::Invert);
-    }
-    if ui.button("Threshold").clicked() {
-        push(ui, MaskEffectKind::Threshold { value: 0.5 });
-    }
-    if ui.button("Color selection (ID map)").clicked() {
+    if ui.button("Add color selection").clicked() {
         push(ui, MaskEffectKind::ColorSelect { colors: Vec::new(), tolerance: 0.05 });
     }
 }
@@ -1175,10 +1412,20 @@ pub(super) fn filter_ui(ui: &mut Ui, id: u64, f: &mut FilterDesc) {
             });
         }
         FilterKind::Transform => {
-            slider(ui, "Offset U", &mut p[0], -1.0..=1.0);
-            slider(ui, "Offset V", &mut p[1], -1.0..=1.0);
-            slider(ui, "Rotation", &mut p[2], -180.0..=180.0);
-            slider(ui, "Scale", &mut p[3], 0.1..=8.0);
+            let mut act: Option<Result<[f32; 4], ()>> = None;
+            let cur = [p[0], p[1], p[2], p[3]];
+            let menu = |ui: &mut Ui| transform_menu(ui, || cur, &mut act);
+            super::widgets::sub_section_menu(ui, "filter transform", "Transformation", true, menu, |ui| {
+                slider(ui, "Offset U", &mut p[0], -1.0..=1.0);
+                slider(ui, "Offset V", &mut p[1], -1.0..=1.0);
+                slider(ui, "Rotation", &mut p[2], -180.0..=180.0);
+                slider(ui, "Scale", &mut p[3], 0.1..=8.0);
+            });
+            match act {
+                Some(Ok(v)) => p[..4].copy_from_slice(&v),
+                Some(Err(())) => p[..4].copy_from_slice(&[0.0, 0.0, 0.0, 1.0]),
+                None => {}
+            }
         }
         FilterKind::Invert | FilterKind::Desaturate => {}
     }

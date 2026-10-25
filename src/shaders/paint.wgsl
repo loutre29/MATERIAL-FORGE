@@ -4,7 +4,12 @@
 //
 // Brush modes (params.w): 0 camera (screen-space stamps, depth tested),
 // 1 wrap (world-space sphere stamps on the surface), 2 UV (stamps in UV
-// space, used by the 2D view), 3 full (every rasterized texel, polygon fill).
+// space, used by the 2D view), 3 full (every rasterized texel, polygon fill),
+// 4 gradient through the camera, 5 gradient in UV space (stamps[0]: pos =
+// start xy, end xy (px or uv), nrm.w = opacity, ext.x = 0 linear, 1 radial,
+// 2 reflected, ext.y = stop count, ext.z = 1 through (every texel, seen or
+// not), ext.w = 1 the stops' colors replace the material's; stamps[1..]:
+// the stops in order, pos = (position, rgb), nrm.x = opacity).
 
 struct Brush {
     view_proj: mat4x4<f32>,
@@ -49,6 +54,13 @@ struct Stamp {
 @group(0) @binding(3) var alpha_tex: texture_2d<f32>;
 @group(0) @binding(4) var stencil_tex: texture_2d<f32>;
 @group(0) @binding(5) var samp: sampler;
+// The texture set's selection (r8, texel aligned; 1x1 white: no selection).
+@group(0) @binding(6) var selection: texture_2d<f32>;
+
+fn selected(frag: vec4<f32>) -> f32 {
+    let d = vec2<i32>(textureDimensions(selection));
+    return textureLoad(selection, clamp(vec2<i32>(frag.xy), vec2<i32>(0), d - vec2<i32>(1)), 0).r;
+}
 
 // Brush material evaluated over the texture set (texel aligned with the UV raster).
 @group(1) @binding(0) var bm_col: texture_2d<f32>;
@@ -158,12 +170,15 @@ fn shape(local: vec2<f32>) -> f32 {
 struct Weight {
     w: f32,
     stencil: vec4<f32>,
+    // Gradients: the stops' color (rgb) and whether it is used (a).
+    grad: vec4<f32>,
 };
 
 fn brush_weight(world: vec3<f32>, normal: vec3<f32>, uv: vec2<f32>) -> Weight {
     var out: Weight;
     out.w = 0.0;
     out.stencil = vec4<f32>(1.0);
+    out.grad = vec4<f32>(0.0);
     let mode = u32(brush.params.w + 0.5);
     let n = normalize(normal);
     let scr = to_screen(world);
@@ -180,6 +195,49 @@ fn brush_weight(world: vec3<f32>, normal: vec3<f32>, uv: vec2<f32>) -> Weight {
 
     if mode == 3u {
         out.w = 1.0 * out.stencil.a;
+        return out;
+    }
+
+    if mode == 4u || mode == 5u {
+        let g = stamps[0];
+        var p = uv;
+        if mode == 4u {
+            if g.ext.z < 0.5 && (!scr.visible || dot(n, normalize(brush.eye.xyz - world)) <= 0.0) { return out; }
+            p = scr.px;
+        }
+        let a = g.pos.xy;
+        let d = g.pos.zw - a;
+        let l2 = max(dot(d, d), 1e-10);
+        var t = clamp(dot(p - a, d) / l2, 0.0, 1.0);
+        if g.ext.x > 1.5 {
+            t = clamp(abs(dot(p - a, d)) / l2, 0.0, 1.0);
+        } else if g.ext.x > 0.5 {
+            t = clamp(length(p - a) / sqrt(l2), 0.0, 1.0);
+        }
+        let count = u32(g.ext.y + 0.5);
+        if count == 0u {
+            out.w = (1.0 - t) * g.nrm.w * out.stencil.a;
+            return out;
+        }
+        var col = stamps[1].pos.yzw;
+        var op = stamps[1].nrm.x;
+        if t >= stamps[count].pos.x {
+            col = stamps[count].pos.yzw;
+            op = stamps[count].nrm.x;
+        } else if t > stamps[1].pos.x {
+            for (var i = 1u; i < count; i++) {
+                let s0 = stamps[i];
+                let s1 = stamps[i + 1u];
+                if t <= s1.pos.x {
+                    let f = clamp((t - s0.pos.x) / max(s1.pos.x - s0.pos.x, 1e-6), 0.0, 1.0);
+                    col = mix(s0.pos.yzw, s1.pos.yzw, f);
+                    op = mix(s0.nrm.x, s1.nrm.x, f);
+                    break;
+                }
+            }
+        }
+        out.w = op * g.nrm.w * out.stencil.a;
+        out.grad = vec4<f32>(col, g.ext.w);
         return out;
     }
 
@@ -204,9 +262,12 @@ fn brush_weight(world: vec3<f32>, normal: vec3<f32>, uv: vec2<f32>) -> Weight {
             let sn = s.nrm.xyz;
             let facing = dot(n, sn);
             if facing <= 0.05 || abs(dot(d, sn)) > s.pos.w { continue; }
-            // Orient the stamp with the camera right vector; fall back to a
-            // world axis when the surface faces along it.
-            var t = brush.right.xyz - sn * dot(brush.right.xyz, sn);
+            // Orient the stamp with its own tangent (path stamps) or the
+            // camera right vector; fall back to a world axis when the
+            // surface faces along it.
+            var rt = brush.right.xyz;
+            if dot(s.ext.yzw, s.ext.yzw) > 1e-8 { rt = s.ext.yzw; }
+            var t = rt - sn * dot(rt, sn);
             if dot(t, t) < 0.01 {
                 t = cross(select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(sn.y) > 0.9), sn);
             }
@@ -249,12 +310,13 @@ struct OutB {
 @fragment
 fn fs_paint_a(in: VsOut) -> OutA {
     let r = brush_weight(in.world, in.normal, in.uv);
-    let w = r.w;
+    let w = r.w * selected(in.clip);
     let bm = brush_mat(in.clip);
     if w <= 0.0 { discard; }
     var color = bm.col.rgb;
     var height = bm.mrh.z;
     if brush.shape.y > 0.5 && brush.shape.z > 0.5 { color = r.stencil.rgb; }
+    if r.grad.a > 0.5 { color = r.grad.rgb; }
     if brush.shape.y > 0.5 && brush.shape.w > 0.5 {
         height = (dot(r.stencil.rgb, vec3<f32>(0.2126, 0.7152, 0.0722)) - 0.5) * 2.0 * brush.stencil2.y;
     }
@@ -267,7 +329,7 @@ fn fs_paint_a(in: VsOut) -> OutA {
 
 @fragment
 fn fs_paint_b(in: VsOut) -> OutB {
-    let w = brush_weight(in.world, in.normal, in.uv).w;
+    let w = brush_weight(in.world, in.normal, in.uv).w * selected(in.clip);
     let bm = brush_mat(in.clip);
     if w <= 0.0 { discard; }
     var o: OutB;
@@ -279,7 +341,7 @@ fn fs_paint_b(in: VsOut) -> OutB {
 
 @fragment
 fn fs_erase_a(in: VsOut) -> OutA {
-    let w = brush_weight(in.world, in.normal, in.uv).w;
+    let w = brush_weight(in.world, in.normal, in.uv).w * selected(in.clip);
     if w <= 0.0 { discard; }
     var o: OutA;
     o.color = vec4<f32>(0.0, 0.0, 0.0, w);
@@ -290,7 +352,7 @@ fn fs_erase_a(in: VsOut) -> OutA {
 
 @fragment
 fn fs_erase_b(in: VsOut) -> OutB {
-    let w = brush_weight(in.world, in.normal, in.uv).w;
+    let w = brush_weight(in.world, in.normal, in.uv).w * selected(in.clip);
     if w <= 0.0 { discard; }
     var o: OutB;
     o.emissive = vec4<f32>(0.0, 0.0, 0.0, w);
@@ -303,18 +365,28 @@ fn fs_erase_b(in: VsOut) -> OutB {
 @fragment
 fn fs_mask(in: VsOut) -> @location(0) vec4<f32> {
     let r = brush_weight(in.world, in.normal, in.uv);
-    let w = r.w;
+    let w = r.w * selected(in.clip);
     if w <= 0.0 { discard; }
     var v = brush.values.w;
     if brush.shape.y > 0.5 && brush.shape.z > 0.5 {
         v = dot(r.stencil.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
     }
+    if r.grad.a > 0.5 { v = r.grad.r; }
     return vec4<f32>(v * w, w, 0.0, w);
+}
+
+// Selection brush: the selection (r8) itself; add: w + dst * (1 - w),
+// subtract: dst * (1 - w) (blend states in paint.rs).
+@fragment
+fn fs_select(in: VsOut) -> @location(0) vec4<f32> {
+    let w = brush_weight(in.world, in.normal, in.uv).w;
+    if w <= 0.0 { discard; }
+    return vec4<f32>(w);
 }
 
 @fragment
 fn fs_mask_erase(in: VsOut) -> @location(0) vec4<f32> {
-    let w = brush_weight(in.world, in.normal, in.uv).w;
+    let w = brush_weight(in.world, in.normal, in.uv).w * selected(in.clip);
     if w <= 0.0 { discard; }
     return vec4<f32>(0.0, 0.0, 0.0, w);
 }

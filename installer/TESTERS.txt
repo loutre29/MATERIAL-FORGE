@@ -1,24 +1,32 @@
-Material Forge 0.1.0 (test build)
+Material Forge 0.2.0 (test build)
 =================================
 
 A PBR 3D texture painter in the spirit of Substance 3D Painter.
 
 Getting started
-- Start Material Forge, then File > New project (or drop an .fbx / .obj /
-  .gltf / .glb on the window). Each material of the mesh becomes a texture set.
-- Bake mesh maps (left tool strip) for the generators and smart materials.
-- Drag materials and smart materials from Assets onto the layer stack or
-  the mesh. Paint with 1 (brush), 2 (eraser), 4 (polygon fill), 6 (clone,
-  V sets the source).
+- Start Material Forge, then open the menu at the top left > File > New
+  project (or drop an .fbx / .obj / .gltf / .glb on the window). Each
+  material of the mesh becomes a texture set.
+- Top right: Auto UV (new UVs, for meshes without good ones), Bake (mesh
+  maps for the generators and smart materials), Export (the textures,
+  with presets for common engines).
+- Drag materials and smart materials from the Library (right) onto the
+  layer stack (left) or onto the mesh.
+- Tools (Photoshop style keys): B brush, Shift + B projection, E eraser,
+  S clone, R smudge, P path, G paint bucket / gradient, U polygon fill,
+  M / L / W / Q selections, I color picker. [ and ] change the brush
+  size, Ctrl + drag changes size, hardness, flow and angle.
 - Camera: Alt + left drag orbits, Alt + middle drag pans, Alt + right drag
-  or the wheel zooms. F frames the mesh.
-- File > Export textures writes the maps (presets for common engines).
+  or the wheel zooms. F frames the mesh. F1 / F2 / F3: 3D + 2D, 3D only,
+  2D only. In the 2D view, Alt + left drag turns the view.
+- Typed numbers can go past the end of a slider (click the value box).
 
 Requirements
 - Windows 10 / 11, 64-bit, with a DirectX 12 or Vulkan capable GPU.
 
 Where things are kept
-- Your library, layout and autosaves: %APPDATA%\SP_RETRO
+- Your library, layout, shortcuts and autosaves: %APPDATA%\SP_RETRO
 
 Please report: what you did, what you expected, what happened (a screenshot
-helps). Help > Controls and shortcuts lists every key.
+helps). Edit > Preferences (Ctrl + K) lists every shortcut and lets you
+change them.

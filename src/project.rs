@@ -41,6 +41,9 @@ struct SubHeader {
     name: String,
     indices: usize,
     objects: usize,
+    /// Polygon of each triangle (older projects: rebuilt on load).
+    #[serde(default)]
+    polys: Option<usize>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -49,6 +52,9 @@ struct ResHeader {
     name: String,
     kind: ResKind,
     blob: usize,
+    /// Imported by the user (older projects: told by the name).
+    #[serde(default)]
+    imported: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -122,6 +128,7 @@ pub fn save(engine: &Engine, doc: &Document, camera: &OrbitCamera, path: &Path) 
             name: s.name.clone(),
             indices: blobs.push(bytemuck::cast_slice(&s.indices)),
             objects: blobs.push(bytemuck::cast_slice(&s.tri_objects)),
+            polys: Some(blobs.push(bytemuck::cast_slice(&s.tri_polys))),
         })
         .collect();
     let mut sets = Vec::new();
@@ -150,7 +157,7 @@ pub fn save(engine: &Engine, doc: &Document, camera: &OrbitCamera, path: &Path) 
     let mut resources: Vec<ResHeader> = doc
         .resources
         .values()
-        .map(|r| ResHeader { id: r.id, name: r.name.clone(), kind: r.kind, blob: blobs.push_raw(&r.encoded) })
+        .map(|r| ResHeader { id: r.id, name: r.name.clone(), kind: r.kind, blob: blobs.push_raw(&r.encoded), imported: Some(r.imported) })
         .collect();
     resources.sort_by_key(|r| r.id);
     let header = Header {
@@ -257,11 +264,15 @@ pub fn load(engine: &Engine, path: &Path) -> Result<(Document, OrbitCamera)> {
     let header: Header = serde_json::from_slice(data.get(pos..pos + jlen).context("truncated project")?)?;
     pos += jlen;
     let count = take_u64(&mut pos)? as usize;
+    if count > data.len() / 8 {
+        bail!("corrupt project (blob count)");
+    }
     let mut ranges = Vec::with_capacity(count);
     for _ in 0..count {
         let len = take_u64(&mut pos)? as usize;
-        ranges.push(pos..pos + len);
-        pos += len;
+        let end = pos.checked_add(len).filter(|e| *e <= data.len()).context("truncated project")?;
+        ranges.push(pos..end);
+        pos = end;
     }
     if pos > data.len() {
         bail!("truncated project");
@@ -275,10 +286,18 @@ pub fn load(engine: &Engine, path: &Path) -> Result<(Document, OrbitCamera)> {
     };
     let mut submeshes = Vec::new();
     for s in &header.submeshes {
+        let indices: Vec<u32> = bytemuck::pod_collect_to_vec(&rd.blob(s.indices)?);
+        // Polygons of older projects (or a damaged blob) are rebuilt.
+        let stored: Option<Vec<u32>> = s.polys.and_then(|b| rd.blob(b).ok()).map(|b| bytemuck::pod_collect_to_vec(&b));
+        let tri_polys = match stored {
+            Some(p) if p.len() * 3 == indices.len() => p,
+            _ => crate::mesh::quad_polys(&vertices, &indices, &[]),
+        };
         submeshes.push(SubMesh {
             name: s.name.clone(),
-            indices: bytemuck::pod_collect_to_vec(&rd.blob(s.indices)?),
+            indices,
             tri_objects: bytemuck::pod_collect_to_vec(&rd.blob(s.objects)?),
+            tri_polys,
         });
     }
     let mesh = MeshData {
@@ -298,7 +317,15 @@ pub fn load(engine: &Engine, path: &Path) -> Result<(Document, OrbitCamera)> {
         let gpu = crate::engine::texture::rgba8_with_mips(&engine.device, &engine.queue, &r.name, &img);
         resources.insert(
             r.id,
-            Resource { id: r.id, name: r.name.clone(), kind: r.kind, encoded: Arc::new(bytes), gpu: Arc::new(gpu), image: Arc::new(img) },
+            Resource {
+                id: r.id,
+                name: r.name.clone(),
+                kind: r.kind,
+                imported: r.imported.unwrap_or_else(|| !crate::library::is_starter_name(&r.name)),
+                encoded: Arc::new(bytes),
+                gpu: Arc::new(gpu),
+                image: Arc::new(img),
+            },
         );
     }
     let mut sets = Vec::new();

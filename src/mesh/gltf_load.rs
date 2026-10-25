@@ -33,8 +33,8 @@ pub fn load(path: &Path) -> Result<RawMesh> {
             }
         }
     }
-    if !has_normals {
-        raw.normals.clear();
+    if has_normals {
+        raw.normal_missing.clear();
     }
     if !has_uvs {
         raw.uvs.clear();
@@ -85,12 +85,14 @@ fn add_mesh(
             raw.positions.push(world.transform_point3(Vec3::from(*p)).into());
         }
         match reader.read_normals() {
-            Some(ns) => raw
-                .normals
-                .extend(ns.map(|n| (normal_m * Vec3::from(n)).normalize_or(Vec3::Y).to_array())),
+            Some(ns) => {
+                raw.normals.extend(ns.map(|n| (normal_m * Vec3::from(n)).normalize_or(Vec3::Y).to_array()));
+                raw.normal_missing.resize(raw.normals.len(), false);
+            }
             None => {
                 *has_normals = false;
                 raw.normals.extend(std::iter::repeat([0.0, 1.0, 0.0]).take(count));
+                raw.normal_missing.resize(raw.normals.len(), true);
             }
         }
         match reader.read_tex_coords(0) {

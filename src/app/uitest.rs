@@ -78,6 +78,7 @@ pub fn ui_smoke(out: &Path) -> anyhow::Result<()> {
     std::fs::write(&obj, crate::selftest::test_obj())?;
     let mut app = RetroApp::build(engine, Arc::new(egui::mutex::RwLock::new(renderer)), &ctx, Some(obj));
     app.persist_layout = false;
+    app.lock_cursor = false;
     let size = std::env::var("MF_UITEST_SIZE")
         .ok()
         .and_then(|v| v.split_once('x').and_then(|(w, h)| Some(egui::vec2(w.parse().ok()?, h.parse().ok()?))))
@@ -86,6 +87,17 @@ pub fn ui_smoke(out: &Path) -> anyhow::Result<()> {
     d.idle(&mut app, 3);
     anyhow::ensure!(app.doc.is_some(), "project was not created: {}", app.status);
     println!("project created ({} frames, {:.1}s)", d.frames, t0.elapsed().as_secs_f32());
+    // MF_UITEST_ONLY=path / uvgizmo: that check alone (quick iterations).
+    if std::env::var("MF_UITEST_ONLY").is_ok_and(|v| v == "path") {
+        path_check(&mut d, &mut app)?;
+        println!("UITEST OK (path only): {} frames in {:.1}s", d.frames, t0.elapsed().as_secs_f32());
+        return Ok(());
+    }
+    if std::env::var("MF_UITEST_ONLY").is_ok_and(|v| v == "uvgizmo") {
+        uvgizmo_check(&mut d, &mut app)?;
+        println!("UITEST OK (uvgizmo only): {} frames in {:.1}s", d.frames, t0.elapsed().as_secs_f32());
+        return Ok(());
+    }
 
 
     // Every window.
@@ -93,16 +105,19 @@ pub fn ui_smoke(out: &Path) -> anyhow::Result<()> {
     app.show_set_settings = true;
     app.show_history = true;
     app.show_log = true;
-    app.show_help = true;
+    app.show_prefs = true;
     app.open_export();
     let sets = app.doc.as_ref().unwrap().sets.len();
     app.bake_dialog = Some(BakeDialog { settings: Default::default(), high: String::new(), sets: vec![true; sets] });
-    app.new_dialog = Some(NewProjectDialog { path: String::new(), res: 1024, error: None });
+    app.new_dialog = Some(NewProjectDialog { path: String::new(), res: 1024, error: None, auto_uv: Default::default() });
     d.idle(&mut app, 3);
     app.new_dialog = None;
     app.bake_dialog = None;
     app.export_dialog = None;
-    app.show_help = false;
+    app.show_prefs = false;
+    if app.tab_open(dock::Tab::SetSettings) {
+        app.toggle_tab(dock::Tab::SetSettings);
+    }
 
     // Every layer kind and mask effect.
     let mut cmds = vec![
@@ -288,6 +303,21 @@ pub fn ui_smoke(out: &Path) -> anyhow::Result<()> {
     app.run_cmd(Cmd::AddLayer(LayerKind::Fill(Box::default())));
     app.tool = Tool::Picker;
     d.idle(&mut app, 3);
+    // The inspector's Properties panel (in front) scrolls to the slot.
+    app.focus_tab(dock::Tab::Properties);
+    d.idle(&mut app, 2);
+    for _ in 0..40 {
+        if marked(&d.ctx, "slot:Base color").is_some_and(|r| r.min.y > 0.0 && r.max.y < d.size.y - 12.0) {
+            break;
+        }
+        let at = marked(&d.ctx, "slot:Material mode").map(|r| r.center()).unwrap_or(Pos2::new(d.size.x - 150.0, d.size.y * 0.75));
+        let at = Pos2::new(at.x, at.y.clamp(40.0, d.size.y - 40.0));
+        d.frame(&mut app, vec![Event::PointerMoved(at)], Modifiers::NONE);
+        d.frame(&mut app, vec![Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0.0, -120.0), modifiers: Modifiers::NONE }], Modifiers::NONE);
+        d.idle(&mut app, 2);
+    }
+    // The scroll is animated: let it settle before aiming.
+    d.idle(&mut app, 20);
     let target = marked(&d.ctx, "slot:Base color")
         .ok_or_else(|| {
             let doc = app.doc.as_ref().unwrap();
@@ -315,26 +345,35 @@ pub fn ui_smoke(out: &Path) -> anyhow::Result<()> {
         d.frame(app, vec![Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: m }], m);
         d.frame(app, vec![Event::Key { key: k, physical_key: None, pressed: false, repeat: false, modifiers: m }], m);
     };
-    for (k, t, stencil) in [
-        (egui::Key::Num2, Tool::Erase, false),
-        (egui::Key::Num3, Tool::Paint, true),
-        (egui::Key::Num4, Tool::PolygonFill, false),
-        (egui::Key::Num5, Tool::Smudge, false),
-        (egui::Key::Num6, Tool::Clone, false),
-        (egui::Key::Num1, Tool::Paint, false),
+    use super::selection::SelShape;
+    for (k, m, t) in [
+        (egui::Key::E, Modifiers::NONE, Tool::Erase),
+        (egui::Key::U, Modifiers::NONE, Tool::PolygonFill),
+        (egui::Key::R, Modifiers::NONE, Tool::Smudge),
+        (egui::Key::S, Modifiers::NONE, Tool::Clone),
+        (egui::Key::H, Modifiers::NONE, Tool::Hide),
+        (egui::Key::M, Modifiers::NONE, Tool::Select(SelShape::Rect)),
+        (egui::Key::M, Modifiers::SHIFT, Tool::Select(SelShape::Ellipse)),
+        (egui::Key::L, Modifiers::NONE, Tool::Select(SelShape::Lasso)),
+        (egui::Key::L, Modifiers::SHIFT, Tool::Select(SelShape::PolyLasso)),
+        (egui::Key::M, Modifiers::NONE, Tool::Select(SelShape::Ellipse)),
+        (egui::Key::B, Modifiers::NONE, Tool::Paint),
     ] {
-        key(&mut d, &mut app, k, Modifiers::NONE);
-        anyhow::ensure!(app.tool == t && app.stencil.enabled == stencil, "key {k:?} selected {:?}", app.tool);
+        key(&mut d, &mut app, k, m);
+        anyhow::ensure!(app.tool == t, "key {k:?} selected {:?}", app.tool);
     }
-    key(&mut d, &mut app, egui::Key::P, Modifiers::NONE);
-    anyhow::ensure!(app.tool == Tool::Picker && app.prev_tool == Some(Tool::Paint), "P is not a temporary picker");
-    key(&mut d, &mut app, egui::Key::Num1, Modifiers::NONE);
+    key(&mut d, &mut app, egui::Key::I, Modifiers::NONE);
+    anyhow::ensure!(app.tool == Tool::Picker && app.prev_tool == Some(Tool::Paint), "I is not a temporary picker");
+    key(&mut d, &mut app, egui::Key::B, Modifiers::NONE);
     key(&mut d, &mut app, egui::Key::C, Modifiers::NONE);
     anyhow::ensure!(app.view.display == Display::BaseColor, "C did not solo the first channel");
-    key(&mut d, &mut app, egui::Key::B, Modifiers::NONE);
-    anyhow::ensure!(app.view.display == Display::MapAo, "B did not show the first mesh map");
-    key(&mut d, &mut app, egui::Key::M, Modifiers::NONE);
-    anyhow::ensure!(app.view.display == Display::Material, "M did not restore the material view");
+    key(&mut d, &mut app, egui::Key::N, Modifiers::NONE);
+    anyhow::ensure!(app.view.display == Display::MapAo, "N did not show the first mesh map");
+    key(&mut d, &mut app, egui::Key::C, Modifiers::NONE);
+    anyhow::ensure!(app.view.display == Display::Material, "C did not come back to the material view");
+    key(&mut d, &mut app, egui::Key::Num5, Modifiers::NONE);
+    anyhow::ensure!((app.brush.flow - 0.5).abs() < 1e-4, "5 did not set the flow to 50 %");
+    key(&mut d, &mut app, egui::Key::Num0, Modifiers::NONE);
     let lazy = app.brush.lazy;
     key(&mut d, &mut app, egui::Key::D, Modifiers::NONE);
     anyhow::ensure!((app.brush.lazy > 0.0) != (lazy > 0.0), "D did not toggle lazy mouse");
@@ -431,7 +470,10 @@ pub fn ui_smoke(out: &Path) -> anyhow::Result<()> {
             }
             app.focus_tab(dock::Tab::SetSettings);
             d.idle(&mut app, 3);
+            // The settings window floats over the view: closed again.
+            app.toggle_tab(dock::Tab::SetSettings);
             app.focus_tab(dock::Tab::Layers);
+            app.focus_tab(dock::Tab::Properties);
             d.idle(&mut app, 2);
             println!("optional channels: set settings and fill editors drawn");
         }
@@ -516,6 +558,7 @@ pub fn ui_bench(mesh: &Path) -> anyhow::Result<()> {
     let ctx = egui::Context::default();
     let mut app = RetroApp::build(engine, Arc::new(egui::mutex::RwLock::new(renderer)), &ctx, Some(mesh.to_path_buf()));
     app.persist_layout = false;
+    app.lock_cursor = false;
     // SP_BENCH_SIZE=WxH overrides the window size.
     let size = std::env::var("SP_BENCH_SIZE")
         .ok()
@@ -670,7 +713,9 @@ fn slider_check() -> anyhow::Result<()> {
     let press = |p: Pos2, down: bool| Event::PointerButton { pos: p, button: PointerButton::Primary, pressed: down, modifiers: Modifiers::NONE };
     // Drag the first track.
     let r = rects[0];
-    let (a, b) = (Pos2::new(r.min.x + 40.0, r.min.y + 25.0), Pos2::new(r.min.x + 200.0, r.min.y + 25.0));
+    // Label | track | value on one line: the track starts after the label column.
+    let lw = super::widgets::slider_label_width(r.width());
+    let (a, b) = (Pos2::new(r.min.x + lw + 20.0, r.center().y), Pos2::new(r.min.x + lw + 160.0, r.center().y));
     run(vec![Event::PointerMoved(a)], &mut vals, &mut rects);
     run(vec![press(a, true)], &mut vals, &mut rects);
     run(vec![Event::PointerMoved(b)], &mut vals, &mut rects);
@@ -678,7 +723,7 @@ fn slider_check() -> anyhow::Result<()> {
     anyhow::ensure!((vals[0] - 1.0).abs() > 0.5 && vals[1] == 1.0, "dragging the first \"Scale\" slider gave {vals:?}");
     // Click the second number, type 7, Enter.
     let r = rects[1];
-    let v = Pos2::new(r.max.x - 30.0, r.min.y + 8.0);
+    let v = Pos2::new(r.max.x - 26.0, r.center().y);
     run(vec![Event::PointerMoved(v)], &mut vals, &mut rects);
     run(vec![press(v, true)], &mut vals, &mut rects);
     run(vec![press(v, false)], &mut vals, &mut rects);
@@ -728,7 +773,7 @@ fn interaction_checks(d: &mut Driver, app: &mut RetroApp) -> anyhow::Result<()> 
     release(d, app, c);
 
     // The click that closes a menu does not paint.
-    let file = marked(&d.ctx, "menu:File").ok_or_else(|| anyhow::anyhow!("File menu not drawn"))?.center();
+    let file = marked(&d.ctx, "menu:App").ok_or_else(|| anyhow::anyhow!("app menu not drawn"))?.center();
     d.click(app, file, Modifiers::NONE);
     d.idle(app, 1);
     anyhow::ensure!(menu_open(&d.ctx), "the File menu did not open");
@@ -783,12 +828,12 @@ fn interaction_checks(d: &mut Driver, app: &mut RetroApp) -> anyhow::Result<()> 
     anyhow::ensure!(d.ctx.data(|m| m.get_temp::<(u64, String)>(rid)).is_none(), "the rename field stayed open after a click elsewhere");
     anyhow::ensure!(!d.ctx.wants_keyboard_input(), "the rename field kept the keyboard");
 
-    // The right strip icon brings the Texture Set Settings tab to the front,
-    // a second click closes it, a third shows it again.
+    // The gear of the layers panel opens the texture set settings window
+    // (closed by default), a second click closes it, a third shows it again.
     app.dock = None;
     d.idle(app, 2);
-    let icon = marked(&d.ctx, "dockbar:setsettings").ok_or_else(|| anyhow::anyhow!("set settings icon not drawn"))?.center();
-    anyhow::ensure!(app.tab_open(dock::Tab::SetSettings) && !app.tab_visible(dock::Tab::SetSettings), "default layout: settings tab should be behind Layers");
+    let icon = marked(&d.ctx, "setsettings:gear").ok_or_else(|| anyhow::anyhow!("set settings gear not drawn"))?.center();
+    anyhow::ensure!(!app.tab_open(dock::Tab::SetSettings), "default layout: the settings tab opens on demand");
     d.click(app, icon, Modifiers::NONE);
     d.idle(app, 1);
     anyhow::ensure!(app.tab_visible(dock::Tab::SetSettings), "the icon did not bring the hidden tab to the front");
@@ -801,11 +846,304 @@ fn interaction_checks(d: &mut Driver, app: &mut RetroApp) -> anyhow::Result<()> 
     app.dock = None;
     app.view.layout = Layout::Both;
     d.idle(app, 2);
+    // Panels: the edge resizes, the header moves, a double click puts it
+    // back; a hidden left panel comes back from the corner menu.
+    app.dock = None;
+    d.idle(app, 2);
+    let edge = marked(&d.ctx, "panel right:left").ok_or_else(|| anyhow::anyhow!("left panel edge not drawn"))?.center();
+    d.drag(app, &line(edge, edge + egui::vec2(60.0, 0.0), 6), Modifiers::NONE);
+    d.idle(app, 1);
+    let lw = app.dock.clone().unwrap_or_default().left_w;
+    anyhow::ensure!(lw > dock::LEFT_W + 40.0, "dragging the left panel edge did not widen it ({lw})");
+    // The bottom right corner of the library: it floats and grows both ways.
+    let corner = marked(&d.ctx, "panel bottom right:library").ok_or_else(|| anyhow::anyhow!("library corner not drawn"))?.center();
+    d.drag(app, &line(corner, corner + egui::vec2(-30.0, 50.0), 6), Modifiers::NONE);
+    d.idle(app, 1);
+    let r = app.dock.clone().unwrap_or_default().rects[1].ok_or_else(|| anyhow::anyhow!("resizing the library corner did not float it"))?;
+    let lib0 = marked(&d.ctx, "panel header:library").unwrap();
+    anyhow::ensure!(r[3] - r[1] > 100.0 && (r[2] - r[0]) < dock::RIGHT_W, "the corner did not resize the library ({r:?}, header {lib0:?})");
+    let head = marked(&d.ctx, "panel header:library").ok_or_else(|| anyhow::anyhow!("library header not drawn"))?;
+    let h = Pos2::new(head.min.x + 60.0, head.center().y);
+    d.drag(app, &line(h, h + egui::vec2(-80.0, 40.0), 6), Modifiers::NONE);
+    d.idle(app, 1);
+    let r2 = app.dock.clone().unwrap_or_default().rects[1].unwrap();
+    anyhow::ensure!(r2[0] < r[0] - 60.0 && r2[1] > r[1] + 20.0, "dragging the library header did not move it ({r:?} -> {r2:?})");
+    // (Wait first: right after the drag it would count as a triple click.)
+    d.idle(app, 40);
+    let head = marked(&d.ctx, "panel header:library").ok_or_else(|| anyhow::anyhow!("library header not drawn"))?;
+    let h = Pos2::new(head.min.x + 60.0, head.center().y);
+    d.frame(app, vec![Event::PointerMoved(h)], Modifiers::NONE);
+    for _ in 0..2 {
+        d.frame(app, vec![Event::PointerButton { pos: h, button: PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE }], Modifiers::NONE);
+        d.frame(app, vec![Event::PointerButton { pos: h, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE }], Modifiers::NONE);
+    }
+    d.idle(app, 1);
+    anyhow::ensure!(app.dock.clone().unwrap_or_default().rects[1].is_none(), "a double click did not dock the library back");
+    // Locked: the edge no longer resizes.
+    app.dock.get_or_insert_with(Default::default).locked = true;
+    d.idle(app, 2);
+    let lw0 = app.dock.clone().unwrap_or_default().left_w;
+    d.drag(app, &line(edge, edge + egui::vec2(60.0, 0.0), 6), Modifiers::NONE);
+    d.idle(app, 1);
+    anyhow::ensure!(app.dock.clone().unwrap_or_default().left_w == lw0, "a locked panel resized");
+    app.dock = None;
+    d.idle(app, 2);
+    app.toggle_tab(dock::Tab::Layers);
+    d.idle(app, 2);
+    anyhow::ensure!(marked(&d.ctx, "menu:Home").is_some() && !app.tab_open(dock::Tab::Layers), "no menu in the corner while the left panel is hidden");
+    app.focus_tab(dock::Tab::Layers);
+    app.dock = None;
+    d.idle(app, 2);
     println!("interactions: display menu, menu dismiss, Escape order, selection history, rename focus, dock icons OK");
     multi_select_check(d, app)?;
     gizmo_check(d, app)?;
     color_field_check(d, app)?;
     eraser_clone_split_check(d, app)?;
+    path_check(d, app)?;
+    uvgizmo_check(d, app)?;
+    auto_uv_check(d, app)?;
+    selection_check(d, app)?;
+    Ok(())
+}
+
+fn count_layers(app: &RetroApp) -> usize {
+    let mut n = 0;
+    crate::document::visit(&app.doc.as_ref().unwrap().sets[app.doc.as_ref().unwrap().active].layers, &mut |_| n += 1);
+    n
+}
+
+/// Selection tools: a rectangle in the 3D view clips the brush, Ctrl + D
+/// / undo / invert, a polygonal lasso in the 2D view (clicks + Enter),
+/// Escape cancels, Shift + Backspace fills.
+fn selection_check(d: &mut Driver, app: &mut RetroApp) -> anyhow::Result<()> {
+    use super::selection::SelShape;
+    let key = |d: &mut Driver, app: &mut RetroApp, k: egui::Key, m: Modifiers| {
+        d.frame(app, vec![Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: m }], m);
+        d.frame(app, vec![Event::Key { key: k, physical_key: None, pressed: false, repeat: false, modifiers: m }], m);
+    };
+    let label = |app: &RetroApp| app.history.undo.last().map(|e| e.label().to_string()).unwrap_or_default();
+    app.view.layout = Layout::Only3D;
+    app.run_cmd(Cmd::AddLayer(LayerKind::Paint));
+    app.mat.channels = [true, true, true, false, false, false, false];
+    app.tool = Tool::Select(SelShape::Rect);
+    d.idle(app, 2);
+    let c = app.vp_rect.center();
+    let (a, b) = (c + egui::vec2(-160.0, -140.0), c + egui::vec2(0.0, 140.0));
+    d.drag(app, &line(a, b, 8), Modifiers::NONE);
+    d.idle(app, 2);
+    anyhow::ensure!(app.has_selection() && label(app) == "Rectangle select", "the rectangle did not select ({})", label(app));
+    // A stroke across the whole view paints only inside the selection.
+    app.tool = Tool::Paint;
+    d.idle(app, 1);
+    d.drag(app, &line(c - egui::vec2(300.0, 0.0), c + egui::vec2(300.0, 0.0), 30), Modifiers::NONE);
+    d.idle(app, 3);
+    {
+        let doc = app.doc.as_ref().unwrap();
+        let s = &doc.sets[doc.active];
+        let sel = s.selection.as_ref().unwrap().read_bytes(&app.engine.device, &app.engine.queue);
+        let l = s.selected_layer().ok_or_else(|| anyhow::anyhow!("no layer"))?;
+        let col = crate::engine::texture::f16_bytes_to_f32(&l.paint.as_ref().unwrap().color.read_bytes(&app.engine.device, &app.engine.queue));
+        let (mut inside, mut outside) = (0usize, 0usize);
+        for (i, px) in col.chunks_exact(4).enumerate() {
+            if px[3] > 0.02 {
+                if sel[i] > 0 {
+                    inside += 1;
+                } else {
+                    outside += 1;
+                }
+            }
+        }
+        anyhow::ensure!(inside > 100 && outside == 0, "the brush ignored the selection ({inside} texels inside, {outside} outside)");
+        println!("selection: rectangle clips the brush ({inside} texels painted inside, 0 outside)");
+    }
+    // Ctrl + D deselects, undo brings it back, Ctrl + Shift + I inverts.
+    key(d, app, egui::Key::D, Modifiers::COMMAND);
+    anyhow::ensure!(!app.has_selection(), "Ctrl + D did not deselect");
+    key(d, app, egui::Key::Z, Modifiers::COMMAND);
+    anyhow::ensure!(app.has_selection(), "undo did not restore the selection");
+    key(d, app, egui::Key::I, Modifiers::COMMAND | Modifiers::SHIFT);
+    anyhow::ensure!(label(app) == "Invert selection", "Ctrl + Shift + I did not invert ({})", label(app));
+    // Polygonal lasso in the 2D view: three clicks and Enter; Escape cancels.
+    app.view.layout = Layout::Both;
+    // L comes back to the last lasso used; Shift + L switches.
+    key(d, app, egui::Key::L, Modifiers::NONE);
+    if app.tool != Tool::Select(SelShape::PolyLasso) {
+        key(d, app, egui::Key::L, Modifiers::SHIFT);
+    }
+    anyhow::ensure!(app.tool == Tool::Select(SelShape::PolyLasso), "Shift + L did not pick the polygonal lasso ({:?})", app.tool);
+    d.idle(app, 2);
+    let u = app.uv_rect.intersect(app.canvas_mid).center();
+    for p in [u + egui::vec2(-80.0, -60.0), u + egui::vec2(90.0, -40.0), u + egui::vec2(10.0, 90.0)] {
+        d.click(app, p, Modifiers::NONE);
+        d.idle(app, 1);
+    }
+    anyhow::ensure!(app.sel_drag.as_ref().is_some_and(|s| s.uv && s.path.len() == 3), "the polygonal lasso did not record 3 points");
+    key(d, app, egui::Key::Enter, Modifiers::NONE);
+    anyhow::ensure!(app.sel_drag.is_none() && label(app) == "Polygonal lasso", "Enter did not close the polygonal lasso ({})", label(app));
+    d.click(app, u, Modifiers::NONE);
+    d.idle(app, 1);
+    anyhow::ensure!(app.sel_drag.is_some(), "a click did not start a new lasso");
+    key(d, app, egui::Key::Escape, Modifiers::NONE);
+    anyhow::ensure!(app.sel_drag.is_none(), "Escape did not cancel the lasso");
+    // Shift + Backspace fills the selection on the layer.
+    key(d, app, egui::Key::Backspace, Modifiers::SHIFT);
+    anyhow::ensure!(label(app) == "Fill selection", "Shift + Backspace did not fill ({})", label(app));
+    key(d, app, egui::Key::D, Modifiers::COMMAND);
+    // Magic wand (W) and paint bucket (G) in the 3D view.
+    app.view.layout = Layout::Only3D;
+    key(d, app, egui::Key::W, Modifiers::NONE);
+    anyhow::ensure!(app.tool == Tool::Wand, "W did not pick the magic wand");
+    d.idle(app, 2);
+    let on_mesh = {
+        let r = app.vp_rect;
+        let mut found = None;
+        'outer: for fy in [0.5f32, 0.4, 0.6, 0.3, 0.7] {
+            for fx in [0.3f32, 0.35, 0.4, 0.25, 0.45, 0.6, 0.65, 0.7] {
+                let p = Pos2::new(r.min.x + r.width() * fx, r.min.y + r.height() * fy);
+                if app.pick_at(Vec2::new(p.x - r.min.x, p.y - r.min.y)).is_some() {
+                    found = Some(p);
+                    break 'outer;
+                }
+            }
+        }
+        found.ok_or_else(|| anyhow::anyhow!("no mesh under the probe points"))?
+    };
+    d.click(app, on_mesh, Modifiers::NONE);
+    d.idle(app, 2);
+    anyhow::ensure!(app.has_selection() && label(app) == "Magic wand", "the magic wand did not select ({})", label(app));
+    key(d, app, egui::Key::D, Modifiers::COMMAND);
+    app.run_cmd(Cmd::AddLayer(LayerKind::Paint));
+    key(d, app, egui::Key::G, Modifiers::NONE);
+    anyhow::ensure!(app.tool == Tool::Bucket, "G did not pick the paint bucket");
+    d.click(app, on_mesh, Modifiers::NONE);
+    d.idle(app, 2);
+    anyhow::ensure!(label(app) == "Paint bucket", "the paint bucket did not fill ({})", label(app));
+    {
+        let doc = app.doc.as_ref().unwrap();
+        let s = &doc.sets[doc.active];
+        let l = s.selected_layer().ok_or_else(|| anyhow::anyhow!("no layer"))?;
+        let col = crate::engine::texture::f16_bytes_to_f32(&l.paint.as_ref().unwrap().color.read_bytes(&app.engine.device, &app.engine.queue));
+        let painted = col.chunks_exact(4).filter(|p| p[3] > 0.5).count();
+        anyhow::ensure!(painted > 1000, "the paint bucket painted {painted} texels");
+        println!("selection: magic wand selects, paint bucket filled {painted} texels");
+    }
+    // Selection brush (Q): a stroke selects, X then a stroke subtracts.
+    key(d, app, egui::Key::D, Modifiers::COMMAND);
+    key(d, app, egui::Key::Q, Modifiers::NONE);
+    anyhow::ensure!(app.tool == Tool::SelBrush, "Q did not pick the selection brush");
+    let c = app.vp_rect.center();
+    let sel_count = |app: &RetroApp| {
+        let doc = app.doc.as_ref().unwrap();
+        doc.sets[doc.active].selection.as_ref().map_or(0, |t| t.read_bytes(&app.engine.device, &app.engine.queue).iter().filter(|b| **b > 128).count())
+    };
+    d.drag(app, &line(c - egui::vec2(200.0, 0.0), c + egui::vec2(200.0, 0.0), 20), Modifiers::NONE);
+    d.idle(app, 3);
+    let painted = sel_count(app);
+    anyhow::ensure!(painted > 100 && label(app) == "Selection brush", "the selection brush selected {painted} texels ({})", label(app));
+    key(d, app, egui::Key::X, Modifiers::NONE);
+    d.drag(app, &line(c - egui::vec2(60.0, 0.0), c + egui::vec2(60.0, 0.0), 8), Modifiers::NONE);
+    d.idle(app, 3);
+    let left = sel_count(app);
+    anyhow::ensure!(left < painted && label(app) == "Selection brush (subtract)", "subtracting with the selection brush left {left} of {painted}");
+    key(d, app, egui::Key::X, Modifiers::NONE);
+    println!("selection: selection brush paints {painted} texels, subtracts down to {left}");
+    // Select > By mesh map: a synthetic curvature map (left half convex).
+    {
+        let doc = app.doc.as_mut().unwrap();
+        let a = doc.active;
+        let s = &mut doc.sets[a];
+        s.gpu.alloc_baked(&app.engine.device, Some(&app.engine.queue));
+        let res = s.resolution();
+        let v: Vec<f32> = (0..res * res).map(|i| if i % res < res / 2 { 0.9 } else { 0.5 }).collect();
+        s.gpu.baked_curvature.write_bytes(&app.engine.queue, &crate::engine::texture::f32_to_f16_bytes(&v));
+        s.baked = true;
+    }
+    key(d, app, egui::Key::D, Modifiers::COMMAND);
+    app.select_by_map(super::selection::MapSel::Edges, 0.58);
+    {
+        let doc = app.doc.as_ref().unwrap();
+        let s = &doc.sets[doc.active];
+        let res = s.resolution();
+        let b = s.selection.as_ref().ok_or_else(|| anyhow::anyhow!("by mesh map selected nothing"))?.read_bytes(&app.engine.device, &app.engine.queue);
+        let wrong = b.iter().enumerate().filter(|(i, v)| s.raster.tri[*i] >= 0 && ((*i as u32 % res) < res / 2) != (**v > 128)).count();
+        anyhow::ensure!(wrong == 0, "select by mesh map took {wrong} wrong texels");
+        println!("selection: by mesh map (edges) selects the convex half");
+    }
+    // Polygon fill in Select mode: a rectangle makes a selection of faces;
+    // Select > Modify grows it.
+    key(d, app, egui::Key::D, Modifiers::COMMAND);
+    app.tool = Tool::PolygonFill;
+    app.poly_to_selection = true;
+    app.poly_select = super::view3d::PolySelect::Marquee;
+    d.idle(app, 1);
+    let c = app.vp_rect.center();
+    d.drag(app, &line(c - egui::vec2(200.0, 150.0), c + egui::vec2(50.0, 150.0), 8), Modifiers::NONE);
+    d.idle(app, 2);
+    anyhow::ensure!(app.has_selection() && label(app) == "Select faces", "polygon fill did not select faces ({})", label(app));
+    app.poly_to_selection = false;
+    app.modify_selection(crate::flood::Modify::Grow, 4.0);
+    anyhow::ensure!(label(app) == "Grow selection (4 px)", "grow did not apply ({})", label(app));
+    // A fill layer masked by the selection.
+    let n_before = count_layers(app);
+    app.fill_layer_from_selection();
+    d.idle(app, 2);
+    {
+        let doc = app.doc.as_ref().unwrap();
+        let s = &doc.sets[doc.active];
+        let l = s.selected_layer().ok_or_else(|| anyhow::anyhow!("no layer"))?;
+        anyhow::ensure!(count_layers(app) == n_before + 1 && matches!(l.desc.kind, LayerKind::Fill(_)), "no fill layer was added");
+        let eff = l.desc.mask.as_ref().and_then(|m| m.effects.last()).ok_or_else(|| anyhow::anyhow!("the fill layer has no mask effect"))?;
+        let tex = l.mask_paint.get(&eff.id).ok_or_else(|| anyhow::anyhow!("no mask paint texture"))?;
+        let v = crate::engine::texture::f16_bytes_to_f32(&tex.read_bytes(&app.engine.device, &app.engine.queue));
+        let on = v.chunks_exact(2).filter(|p| p[0] > 0.9).count();
+        let off = v.chunks_exact(2).filter(|p| p[0] < 0.1).count();
+        anyhow::ensure!(on > 100 && off > 100, "the mask does not hold the selection ({on} white, {off} black)");
+        println!("selection: fill layer from the selection ({on} texels in the mask)");
+    }
+    key(d, app, egui::Key::D, Modifiers::COMMAND);
+    // Shift + G: the gradient, a drag across the view.
+    app.run_cmd(Cmd::AddLayer(LayerKind::Paint));
+    key(d, app, egui::Key::G, Modifiers::NONE);
+    if app.tool != Tool::Gradient {
+        key(d, app, egui::Key::G, Modifiers::SHIFT);
+    }
+    anyhow::ensure!(app.tool == Tool::Gradient, "Shift + G did not switch to the gradient ({:?})", app.tool);
+    app.brush.flow = 1.0;
+    let c = app.vp_rect.center();
+    d.drag(app, &line(c - egui::vec2(250.0, 0.0), c + egui::vec2(250.0, 0.0), 10), Modifiers::NONE);
+    d.idle(app, 2);
+    anyhow::ensure!(label(app) == "Gradient", "the gradient was not applied ({})", label(app));
+    {
+        let doc = app.doc.as_ref().unwrap();
+        let s = &doc.sets[doc.active];
+        let l = s.selected_layer().ok_or_else(|| anyhow::anyhow!("no layer"))?;
+        let col = crate::engine::texture::f16_bytes_to_f32(&l.paint.as_ref().unwrap().color.read_bytes(&app.engine.device, &app.engine.queue));
+        let full = col.chunks_exact(4).filter(|p| p[3] > 0.9).count();
+        let partial = col.chunks_exact(4).filter(|p| p[3] > 0.1 && p[3] < 0.9).count();
+        anyhow::ensure!(full > 100 && partial > 100, "the gradient has no ramp ({full} opaque, {partial} partial texels)");
+        println!("selection: gradient ramps ({full} opaque, {partial} partial texels)");
+    }
+    app.tool = Tool::Paint;
+    app.view.layout = Layout::Only3D;
+    d.idle(app, 2);
+    println!("selection: deselect / undo / invert, polygonal lasso in 2D, Escape, fill OK");
+    // Solo (Alt + click on an eye): only that layer shows, again restores.
+    {
+        let vis = |app: &RetroApp| {
+            let mut v = Vec::new();
+            crate::document::visit(&app.doc.as_ref().unwrap().sets[app.doc.as_ref().unwrap().active].layers, &mut |l| v.push((l.desc.id, l.desc.visible)));
+            v
+        };
+        let before = vis(app);
+        let id = app.doc.as_ref().unwrap().sets[app.doc.as_ref().unwrap().active].layers[0].desc.id;
+        app.run_cmd(Cmd::Solo(id));
+        let solo = vis(app);
+        anyhow::ensure!(solo.iter().filter(|(_, v)| *v).count() >= 1 && solo.iter().any(|(i, v)| *i == id && *v), "solo did not keep the layer");
+        anyhow::ensure!(solo.iter().filter(|(i, v)| *i != id && *v).count() < before.iter().filter(|(_, v)| *v).count(), "solo hid nothing");
+        app.run_cmd(Cmd::Solo(id));
+        anyhow::ensure!(vis(app) == before, "a second solo did not restore the visibility");
+        println!("layers: solo and restore OK");
+    }
     Ok(())
 }
 
@@ -850,25 +1188,355 @@ fn eraser_clone_split_check(d: &mut Driver, app: &mut RetroApp) -> anyhow::Resul
     Ok(())
 }
 
+/// Path tool: P, clicks make a path on a new path layer that paints itself;
+/// a dragged point repaints (one undo step), the brush edits the selected
+/// path, Backspace removes a point, Escape ends the path, the pen pulls out
+/// handles, the layer refuses hand painting; the same in the 2D view.
+/// 2D manipulator: a move takes the image, its frame and the pivot along
+/// (the pivot stays the frame's middle), so a rotation turns the image
+/// around its own middle, wherever it was moved.
+fn uvgizmo_check(d: &mut Driver, app: &mut RetroApp) -> anyhow::Result<()> {
+    use super::uvgizmo::{tex_of_uv, uv_of_frame};
+    let layout = app.view.layout;
+    app.view.layout = Layout::Only2D;
+    app.tool = Tool::Paint;
+    app.run_cmd(Cmd::AddLayer(LayerKind::Fill(Box::default())));
+    d.idle(app, 3);
+    let (_, p0) = app.uv_gizmo_target().ok_or_else(|| anyhow::anyhow!("no UV-projected fill selected"))?;
+    // Alt + left drag turns the view (a quarter turn here); the rest of the
+    // test then runs on the turned view.
+    // It turns around the middle of the part the panels leave visible.
+    let r = app.uv_rect;
+    let c = app.visible_part(r).center();
+    let fixed = app.uv_of(Vec2::new(c.x - r.min.x, c.y - r.min.y));
+    let arc: Vec<Pos2> = (0..=8).map(|i| c + egui::Vec2::angled(i as f32 / 8.0 * std::f32::consts::FRAC_PI_2) * 120.0).collect();
+    d.drag(app, &arc, Modifiers::ALT);
+    d.idle(app, 2);
+    let view_deg = app.view.uv_rot.to_degrees();
+    anyhow::ensure!((view_deg - 90.0).abs() < 3.0, "Alt + drag did not turn the 2D view a quarter turn ({view_deg:.1} degrees)");
+    let drift = app.uv_of(Vec2::new(c.x - r.min.x, c.y - r.min.y)).distance(fixed) * app.view.uv_zoom;
+    anyhow::ensure!(drift < 1.0, "the 2D view did not turn around the middle of its visible part (drift {drift:.1} px)");
+    let probe = Vec2::new(0.3, 0.6);
+    let back = app.uv_of(app.uv_point(probe));
+    anyhow::ensure!(back.distance(probe) < 1e-4, "UV to view and back is off on a turned view ({back:?})");
+    let mid = |p: &crate::document::Projection| uv_of_frame(p, Vec2::splat(0.5));
+    let start = app.uv_screen(mid(&p0)) + egui::vec2(10.0, 10.0);
+    d.drag(app, &line(start, start + egui::vec2(80.0, 50.0), 6), Modifiers::NONE);
+    d.idle(app, 2);
+    let (_, p1) = app.uv_gizmo_target().unwrap();
+    let moved = mid(&p1) - mid(&p0);
+    anyhow::ensure!(moved.length() > 0.01, "dragging inside the frame did not move it");
+    anyhow::ensure!(mid(&p1).distance(Vec2::from(p1.pivot)) < 1e-3, "the pivot stayed behind the moved frame ({:?} vs {:?})", p1.pivot, mid(&p1));
+    let probe = Vec2::new(0.3, 0.6);
+    anyhow::ensure!(tex_of_uv(&p1, probe + moved).distance(tex_of_uv(&p0, probe)) < 1e-3, "the image did not move with the frame");
+    // Rotate: grab outside the frame (zoomed out, so outside is in view),
+    // turn around the pivot.
+    let keep = app.uv_px(Vec2::from(p1.pivot));
+    app.view.uv_zoom *= 0.5;
+    let now = app.uv_px(Vec2::from(p1.pivot));
+    for k in 0..2 {
+        app.view.uv_pan[k] += keep[k] - now[k];
+    }
+    d.idle(app, 2);
+    let piv = app.uv_screen(Vec2::from(p1.pivot));
+    // Outside the frame, away from the handles.
+    let out = app.uv_screen(uv_of_frame(&p1, Vec2::new(1.12, 0.3)));
+    let turned = piv + egui::vec2(-(out - piv).y, (out - piv).x);
+    d.drag(app, &[out, piv + ((out - piv) + (turned - piv)) * 0.5, turned], Modifiers::NONE);
+    d.idle(app, 2);
+    let (_, p2) = app.uv_gizmo_target().unwrap();
+    anyhow::ensure!((p2.rotation - p1.rotation).abs() > 10.0, "dragging outside did not rotate ({} -> {}; from {out:?} around {piv:?} in {:?})", p1.rotation, p2.rotation, app.uv_rect);
+    anyhow::ensure!(mid(&p2).distance(mid(&p1)) < 1e-3, "rotating moved the frame's middle: it does not turn around the moved image");
+    // A fill in the layer's mask gets the same manipulator.
+    app.run_cmd(Cmd::AddMask(false));
+    app.run_cmd(Cmd::AddEffect(MaskEffectKind::Fill {
+        value: 1.0,
+        source: crate::document::SourceKind::Uniform,
+        texture: None,
+        procedural: Default::default(),
+        projection: Default::default(),
+        range: [0.0, 1.0],
+    }));
+    d.idle(app, 3);
+    let (_, m0) = app.uv_gizmo_target().ok_or_else(|| anyhow::anyhow!("a mask fill gets no 2D manipulator"))?;
+    let at = app.uv_screen(mid(&m0)) + egui::vec2(10.0, 10.0);
+    d.drag(app, &line(at, at + egui::vec2(-60.0, 40.0), 6), Modifiers::NONE);
+    d.idle(app, 2);
+    let mask_proj = || {
+        let doc = app.doc.as_ref()?;
+        let s = &doc.sets[doc.active];
+        let l = s.selected_layer()?;
+        l.desc.mask.as_ref()?.effects.iter().find_map(|e| match &e.kind {
+            MaskEffectKind::Fill { projection, .. } => Some(projection.clone()),
+            _ => None,
+        })
+    };
+    let m1 = mask_proj().ok_or_else(|| anyhow::anyhow!("the mask fill is gone"))?;
+    anyhow::ensure!(mid(&m1).distance(mid(&m0)) > 0.01, "dragging the mask fill's frame in the 2D view did not move it");
+    let (_, content) = {
+        let doc = app.doc.as_ref().unwrap();
+        let s = &doc.sets[doc.active];
+        match &s.selected_layer().unwrap().desc.kind {
+            LayerKind::Fill(f) => ((), f.projection.clone()),
+            _ => anyhow::bail!("the fill layer lost its kind"),
+        }
+    };
+    anyhow::ensure!(mid(&content).distance(mid(&p2)) < 1e-4, "moving the mask fill moved the layer's own fill");
+    app.view.layout = layout;
+    app.view.uv_rot = 0.0;
+    app.view.uv_zoom = 0.0;
+    d.idle(app, 2);
+    println!("2D view turned {view_deg:.0} degrees with Alt + drag; 2D manipulator: the pivot follows a move ({:.3}), rotation turns around it, a mask fill moves too", moved.length());
+    Ok(())
+}
+
+fn path_check(d: &mut Driver, app: &mut RetroApp) -> anyhow::Result<()> {
+    let key = |d: &mut Driver, app: &mut RetroApp, k: egui::Key| {
+        d.frame(app, vec![Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE }], Modifiers::NONE);
+        d.frame(app, vec![Event::Key { key: k, physical_key: None, pressed: false, repeat: false, modifiers: Modifiers::NONE }], Modifiers::NONE);
+    };
+    let painted = |app: &RetroApp| -> usize {
+        let doc = app.doc.as_ref().unwrap();
+        let s = &doc.sets[doc.active];
+        let Some(p) = s.selected_layer().and_then(|l| l.paint.as_ref()) else { return 0 };
+        let col = crate::engine::texture::f16_bytes_to_f32(&p.color.read_bytes(&app.engine.device, &app.engine.queue));
+        col.chunks_exact(4).filter(|p| p[3] > 0.5).count()
+    };
+    app.view.layout = Layout::Only3D;
+    app.run_cmd(Cmd::AddLayer(LayerKind::Paint));
+    d.idle(app, 2);
+    key(d, app, egui::Key::P);
+    anyhow::ensure!(app.tool == Tool::Path, "P did not pick the path tool ({:?})", app.tool);
+    if let Some(stitch) = crate::brush::builtin_brushes().into_iter().find(|b| b.name == "Stitch") {
+        app.apply_brush_preset(&stitch);
+        if crate::library::starter_dir().is_some() {
+            anyhow::ensure!(matches!(app.brush.alpha, AlphaSource::Resource(_)), "the stitch preset did not load its tip");
+        }
+    }
+    app.brush.size = 6.0;
+    // A spot of the mesh with room around it (the test scene has two objects).
+    let r = app.vp_rect;
+    let hit = |app: &RetroApp, p: Pos2| app.pick_at(Vec2::new(p.x - r.min.x, p.y - r.min.y)).is_some();
+    let mut c = None;
+    'outer: for fy in [0.5f32, 0.4, 0.6] {
+        for fx in [0.3f32, 0.35, 0.4, 0.25, 0.6, 0.65, 0.7] {
+            let p = Pos2::new(r.min.x + r.width() * fx, r.min.y + r.height() * fy);
+            if [-40.0f32, 0.0, 40.0].iter().all(|dx| [-25.0f32, 25.0].iter().all(|dy| hit(app, p + egui::vec2(*dx, *dy)))) {
+                c = Some(p);
+                break 'outer;
+            }
+        }
+    }
+    let c = c.ok_or_else(|| anyhow::anyhow!("no room on the mesh for the path test"))?;
+    let paths = |app: &RetroApp| app.active_paths().cloned().unwrap_or_default();
+    for p in [c + egui::vec2(-35.0, 10.0), c + egui::vec2(0.0, -20.0), c + egui::vec2(35.0, 10.0)] {
+        d.click(app, p, Modifiers::NONE);
+        d.idle(app, 1);
+        anyhow::ensure!(app.pick_at(Vec2::new(p.x - app.vp_rect.min.x, p.y - app.vp_rect.min.y)).is_some(), "no mesh under the path test point ({})", app.status);
+    }
+    d.idle(app, 2);
+    let v = paths(app);
+    anyhow::ensure!(v.len() == 1 && v[0].points.len() == 3, "expected one path of 3 points: {} paths ({})", v.len(), app.status);
+    let n = painted(app);
+    anyhow::ensure!(n > 50, "the path painted {n} texels");
+    // MF_PATH_SHOT=<png>: the layer's color (UV space), to look at the stitches.
+    if let Ok(f) = std::env::var("MF_PATH_SHOT") {
+        let doc = app.doc.as_ref().unwrap();
+        let s = &doc.sets[doc.active];
+        if let Some(p) = s.selected_layer().and_then(|l| l.paint.as_ref()) {
+            let col = crate::engine::texture::f16_bytes_to_f32(&p.color.read_bytes(&app.engine.device, &app.engine.queue));
+            let (w, h) = (p.color.width, p.color.height);
+            let img = image::RgbaImage::from_fn(w, h, |x, y| {
+                let a = col[((y * w + x) * 4 + 3) as usize].clamp(0.0, 1.0);
+                let g = (a * 255.0) as u8;
+                image::Rgba([g, g, g, 255])
+            });
+            img.save(f)?;
+        }
+    }
+    // Non-destructive: a dragged point repaints, one undo step brings it back.
+    let before = v[0].points[1].pos;
+    d.drag(app, &line(c + egui::vec2(0.0, -20.0), c + egui::vec2(0.0, 10.0), 4), Modifiers::NONE);
+    d.idle(app, 2);
+    let v = paths(app);
+    anyhow::ensure!(v[0].points.len() == 3 && v[0].points[1].pos != before, "dragging a point did not move it");
+    app.undo();
+    d.idle(app, 2);
+    anyhow::ensure!(paths(app).first().is_some_and(|p| p.points[1].pos == before), "one undo did not bring the dragged point back");
+    app.redo();
+    d.idle(app, 2);
+    // The brush edits the path layer: its spacing repaints the stitches.
+    let n1 = painted(app);
+    app.brush.spacing = (app.brush.spacing * 3.0).min(4.0);
+    d.idle(app, 3);
+    anyhow::ensure!(app.active_style().is_some_and(|s| s.brush.spacing == app.brush.spacing), "the brush did not edit the path layer");
+    let n2 = painted(app);
+    anyhow::ensure!(n2 != n1, "changing the spacing did not repaint the path ({n1} texels)");
+    key(d, app, egui::Key::Backspace);
+    anyhow::ensure!(paths(app)[0].points.len() == 2, "Backspace did not remove a point");
+    // Escape ends the path; the next click starts another.
+    key(d, app, egui::Key::Escape);
+    anyhow::ensure!(app.path.path.is_none(), "Escape did not end the path");
+    d.click(app, c + egui::vec2(0.0, 22.0), Modifiers::NONE);
+    d.idle(app, 1);
+    anyhow::ensure!(paths(app).len() == 2, "a click after Escape did not start a second path ({} paths)", paths(app).len());
+    key(d, app, egui::Key::Escape);
+    // Pen: click and drag pulls out handles, a click is a corner.
+    app.path.pen = true;
+    d.drag(app, &line(c + egui::vec2(-30.0, -22.0), c + egui::vec2(-12.0, -24.0), 4), Modifiers::NONE);
+    d.click(app, c + egui::vec2(30.0, -22.0), Modifiers::NONE);
+    d.idle(app, 2);
+    let v = paths(app);
+    let pen = v.last().unwrap();
+    anyhow::ensure!(v.len() == 3 && pen.points.len() == 2, "the pen path has {} points ({} paths)", pen.points.len(), v.len());
+    use crate::document::PointKind;
+    anyhow::ensure!(
+        pen.points[0].kind == PointKind::Smooth && pen.points[1].kind == PointKind::Broken && pen.points[1].h_out == [0.0; 3],
+        "pen points: drag {:?}, click {:?}",
+        pen.points[0].kind,
+        pen.points[1].kind
+    );
+    key(d, app, egui::Key::Escape);
+    app.path.pen = false;
+    // A path layer is not painted by hand.
+    app.tool = Tool::Paint;
+    d.idle(app, 1);
+    let undo = app.history.undo.len();
+    d.drag(app, &line(c + egui::vec2(-20.0, 0.0), c + egui::vec2(20.0, 0.0), 6), Modifiers::NONE);
+    d.idle(app, 2);
+    anyhow::ensure!(app.history.undo.len() == undo, "a brush stroke painted the path layer");
+    app.tool = Tool::Path;
+    // 2D view.
+    app.view.layout = Layout::Only2D;
+    d.idle(app, 2);
+    let before = painted(app);
+    let u = app.uv_rect.intersect(app.canvas_mid).center();
+    for p in [u + egui::vec2(-100.0, 0.0), u + egui::vec2(0.0, 60.0), u + egui::vec2(100.0, 0.0)] {
+        d.click(app, p, Modifiers::NONE);
+        d.idle(app, 1);
+    }
+    d.idle(app, 2);
+    let v = paths(app);
+    anyhow::ensure!(v.last().is_some_and(|p| p.uv && p.points.len() == 3), "the 2D path was not made ({} paths)", v.len());
+    anyhow::ensure!(painted(app) > before + 50, "the 2D path painted nothing");
+    key(d, app, egui::Key::Escape);
+    // Other settings mean another path layer: the first keeps its own.
+    let (first, spacing) = ({ let d = app.doc.as_ref().unwrap(); d.sets[d.active].selected }, app.brush.spacing);
+    anyhow::ensure!(app.new_path_layer(), "New path layer did nothing");
+    d.idle(app, 2);
+    anyhow::ensure!({ let d = app.doc.as_ref().unwrap(); d.sets[d.active].selected } != first && paths(app).is_empty(), "New path layer did not select an empty path layer");
+    app.brush.spacing = spacing * 0.5;
+    d.idle(app, 2);
+    { let d = app.doc.as_mut().unwrap(); let s = d.active; d.sets[s].selected = first; }
+    d.idle(app, 2);
+    anyhow::ensure!(app.brush.spacing == spacing, "the first path layer's brush changed with the new layer's ({})", app.brush.spacing);
+    app.view.layout = Layout::Only3D;
+    // Projection tool (Shift + B): paints the stencil without the brush's
+    // stencil option.
+    let tex = app.doc.as_ref().unwrap().resources.values().find(|r| r.kind == crate::document::ResKind::Texture).map(|r| r.id);
+    if let Some(id) = tex {
+        app.stencil.enabled = false;
+        app.stencil.resource = Some(id);
+        app.run_cmd(Cmd::AddLayer(LayerKind::Paint));
+        app.brush = crate::brush::BrushSettings::default();
+        d.frame(app, vec![Event::Key { key: egui::Key::B, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::SHIFT }], Modifiers::SHIFT);
+        d.frame(app, vec![Event::Key { key: egui::Key::B, physical_key: None, pressed: false, repeat: false, modifiers: Modifiers::SHIFT }], Modifiers::SHIFT);
+        d.idle(app, 2);
+        anyhow::ensure!(app.tool == Tool::Projection && app.props_tab == 2, "Shift + B did not open the projection ({:?}, tab {})", app.tool, app.props_tab);
+        anyhow::ensure!(app.stencil_active(), "the projection tool does not use the stencil");
+        d.drag(app, &line(c - egui::vec2(30.0, 0.0), c + egui::vec2(30.0, 0.0), 8), Modifiers::NONE);
+        d.idle(app, 2);
+        let n = painted(app);
+        anyhow::ensure!(n > 50, "the projection painted {n} texels");
+        app.stencil.resource = None;
+        println!("projection: Shift + B, stencil tab, {n} texels painted");
+    }
+    app.tool = Tool::Paint;
+    d.idle(app, 2);
+    println!("path: path layer painted ({n} texels), point drag + undo, brush edits the path, Backspace, Escape, pen handles, no hand painting, 2D");
+    Ok(())
+}
+
+/// Auto UV on the open project: a painted spot is still painted at the
+/// same place on the mesh after the UVs change; the history is cleared and
+/// the bake window asks for new mesh maps.
+fn auto_uv_check(d: &mut Driver, app: &mut RetroApp) -> anyhow::Result<()> {
+    app.view.layout = Layout::Only3D;
+    app.tool = Tool::Paint;
+    app.brush = crate::brush::BrushSettings::default();
+    app.brush.size = 20.0;
+    app.run_cmd(Cmd::AddLayer(LayerKind::Paint));
+    d.idle(app, 2);
+    let r = app.vp_rect;
+    let mut spot = None;
+    'find: for fy in [0.5f32, 0.4, 0.6] {
+        for fx in [0.3f32, 0.35, 0.4, 0.6, 0.65] {
+            let p = Pos2::new(r.min.x + r.width() * fx, r.min.y + r.height() * fy);
+            if app.pick_at(Vec2::new(p.x - r.min.x, p.y - r.min.y)).is_some() {
+                spot = Some(p);
+                break 'find;
+            }
+        }
+    }
+    let spot = spot.ok_or_else(|| anyhow::anyhow!("no mesh for the auto UV check"))?;
+    d.drag(app, &line(spot - egui::vec2(4.0, 0.0), spot + egui::vec2(4.0, 0.0), 3), Modifiers::NONE);
+    d.idle(app, 2);
+    let local = Vec2::new(spot.x - r.min.x, spot.y - r.min.y);
+    let alpha_at = |app: &RetroApp| -> anyhow::Result<(f32, [f32; 2])> {
+        let hit = app.pick_at(local).ok_or_else(|| anyhow::anyhow!("the spot left the mesh"))?;
+        let doc = app.doc.as_ref().unwrap();
+        let s = &doc.sets[hit.set];
+        let l = s.selected_layer().ok_or_else(|| anyhow::anyhow!("no layer"))?;
+        let p = l.paint.as_ref().ok_or_else(|| anyhow::anyhow!("no paint"))?;
+        let res = p.color.width;
+        let (x, y) = (((hit.uv[0] * res as f32) as u32).min(res - 1), ((hit.uv[1] * res as f32) as u32).min(res - 1));
+        Ok((p.color.read_texel_f16(&app.engine.device, &app.engine.queue, x, y)[3], hit.uv))
+    };
+    let (before, uv0) = alpha_at(app)?;
+    anyhow::ensure!(before > 0.5, "the stroke did not paint the spot ({before})");
+    // The window: open, unwrap on its thread, apply.
+    app.open_uv_dialog();
+    d.idle(app, 2);
+    anyhow::ensure!(app.uv_dialog.is_some(), "the Auto UV window did not open");
+    let mesh = app.doc.as_ref().unwrap().mesh.clone();
+    let (m, reports) = crate::mesh::unwrap_mesh(&mesh, &crate::mesh::UvSettings::default())?;
+    anyhow::ensure!(!reports.is_empty() && reports.iter().all(|r| r.charts > 0), "auto UV made no islands");
+    app.uv_dialog = None;
+    app.apply_auto_uv(m);
+    d.idle(app, 3);
+    let (after, uv1) = alpha_at(app)?;
+    anyhow::ensure!(uv1 != uv0, "the UVs did not change ({uv0:?})");
+    anyhow::ensure!(after > 0.5, "the paint did not follow the new UVs (alpha {after} at {uv1:?}, was {before} at {uv0:?})");
+    anyhow::ensure!(app.history.undo.is_empty() && app.bake_dialog.is_some(), "auto UV did not clear the history / ask for a bake");
+    app.bake_dialog = None;
+    println!("auto UV: paint followed the new UVs ({uv0:?} -> {uv1:?}), history cleared, bake asked");
+    Ok(())
+}
+
 /// Color fields: the picker opens on a click and closes on a click
 /// outside; the eyedropper picks the mesh color without painting.
 fn color_field_check(d: &mut Driver, app: &mut RetroApp) -> anyhow::Result<()> {
     // The selected fill (from the manipulator check) shows its base color bar.
     app.view.layout = Layout::Only3D;
     app.tool = Tool::Paint;
+    app.focus_tab(dock::Tab::Properties);
     d.idle(app, 3);
     // On short windows the bar is further down the Properties panel: scroll.
     for _ in 0..30 {
         let r = marked(&d.ctx, "colorbar:Color").unwrap_or(Rect::NOTHING);
         let e = marked(&d.ctx, "eyedrop:Color").unwrap_or(Rect::NOTHING);
-        if r.height() >= 18.0 && e.height() >= 17.0 {
+        // Fully inside the window (the panel clips what is below its edge).
+        if r.height() >= 18.0 && e.height() >= 17.0 && r.min.y > 60.0 && r.max.y < d.size.y - 24.0 {
             break;
         }
-        let at = Pos2::new(if r.is_positive() { r.center().x } else { 400.0 }, d.size.y * 0.6);
+        // Low in the Properties panel (its header and tabs are above).
+        let at = Pos2::new(d.size.x - 150.0, d.size.y - 80.0);
         d.frame(app, vec![Event::PointerMoved(at)], Modifiers::NONE);
         d.frame(app, vec![Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0.0, -120.0), modifiers: Modifiers::NONE }], Modifiers::NONE);
         d.idle(app, 2);
     }
+    // The scroll is animated: let it settle before aiming.
+    d.idle(app, 20);
     let bar = marked(&d.ctx, "colorbar:Color").ok_or_else(|| anyhow::anyhow!("no color bar drawn"))?;
     d.click(app, bar.center(), Modifiers::NONE);
     d.idle(app, 2);

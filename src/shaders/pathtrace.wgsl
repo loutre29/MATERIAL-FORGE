@@ -12,6 +12,12 @@ struct PT {
     // emissive intensities of sets 0-3 and 4-7
     emi_a: vec4<f32>,
     emi_b: vec4<f32>,
+    // alpha mode of sets 0-3 and 4-7 (0 opaque, 1 cutout, 2 blend)
+    amode_a: vec4<f32>,
+    amode_b: vec4<f32>,
+    // alpha cutoff of sets 0-3 and 4-7
+    cut_a: vec4<f32>,
+    cut_b: vec4<f32>,
 };
 
 struct Node {
@@ -70,6 +76,15 @@ struct Tri {
 @group(0) @binding(36) var e5: texture_2d<f32>;
 @group(0) @binding(37) var e6: texture_2d<f32>;
 @group(0) @binding(38) var e7: texture_2d<f32>;
+// Denoiser guides of the first visible surface, averaged like the color:
+// (albedo, depth), (normal, coverage); two entries per pixel.
+@group(0) @binding(39) var<storage, read_write> aux: array<vec4<f32>>;
+
+fn slot_vec(a: vec4<f32>, b: vec4<f32>, s: u32) -> f32 {
+    if s < 4u { return a[s]; }
+    if s < 8u { return b[s - 4u]; }
+    return 0.0;
+}
 
 const PI: f32 = 3.14159265359;
 
@@ -278,11 +293,20 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {
     var radiance = vec3<f32>(0.0);
     var throughput = vec3<f32>(1.0);
     let eps = U.eye.w * 1e-4;
+    // Denoiser guides of the first surface shaded.
+    var g_alb = vec3<f32>(1.0);
+    var g_nrm = vec3<f32>(0.0);
+    var g_depth = 1e9;
+    var guided = false;
+    var passes = 0u;
     for (var bounce = 0u; bounce <= U.size.w; bounce++) {
         let hit = trace(o, d, false);
         if !hit.hit {
             if bounce == 0u {
-                if U.env.z > 0.5 {
+                if U.env.z > 1.5 {
+                    // Black (material previews take their alpha from the
+                    // coverage guide).
+                } else if U.env.z > 0.5 {
                     let gr = mix(vec3<f32>(0.018), vec3<f32>(0.06), ndc.y * 0.5 + 0.5);
                     radiance += gr;
                 } else {
@@ -302,9 +326,32 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {
         if dot(ng, d) > 0.0 { ng = -ng; }
         if dot(ns, ng) < 0.0 { ns = -ns; }
         let slot = tr.info.x;
-        let base = tex_base(slot, uv).rgb;
+        let base4 = tex_base(slot, uv);
+        let base = base4.rgb;
+        // Cutout and alpha blend: the ray passes through where the surface
+        // is (partly) transparent.
+        // Guides from the first surface met (also when the ray passes
+        // through it): stable from sample to sample.
+        if !guided {
+            guided = true;
+            g_alb = max(base, vec3<f32>(0.02));
+            g_nrm = ns;
+            g_depth = length(p - a4.xyz / a4.w);
+        }
+        let amode = slot_vec(U.amode_a, U.amode_b, slot);
+        if passes < 16u && ((amode > 1.5 && rnd() > base4.a) || (amode > 0.5 && amode < 1.5 && base4.a < slot_vec(U.cut_a, U.cut_b, slot))) {
+            o = p + d * eps * 4.0;
+            passes += 1u;
+            bounce -= 1u;
+            continue;
+        }
         let orm = tex_orm(slot, uv);
-        let nts = tex_nrm(slot, uv).xyz;
+        let n4 = tex_nrm(slot, uv);
+        let nts = n4.xyz;
+        let transmission = clamp(n4.w, 0.0, 1.0);
+        // Hit from inside (geometric normal facing the ray): leaving glass.
+        let ng_raw = normalize(cross(tr.p1.xyz - tr.p0.xyz, tr.p2.xyz - tr.p0.xyz));
+        let inside = dot(ng_raw, d) > 0.0;
         radiance += throughput * tex_emi(slot, uv);
         var t = tr.tng.xyz - ns * dot(ns, tr.tng.xyz);
         if dot(t, t) < 1e-10 { t = ortho(ns)[0]; }
@@ -339,6 +386,32 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {
             let vdh = max(dot(v, hv), 1e-4);
             let gg = g1(ndv, a2) * g1(ndl, a2);
             throughput *= fresnel(f0, vdh) * gg * vdh / (ndh * ndv) / p_spec;
+        } else if rnd() < transmission * (1.0 - metal) {
+            // Transmission: refraction through a rough interface (GGX
+            // microfacet), tinted by the base color; IOR 1.45.
+            let u1 = rnd();
+            let u2 = rnd();
+            let cos_t = sqrt((1.0 - u1) / (1.0 + (a2 - 1.0) * u1));
+            let sin_t = sqrt(max(1.0 - cos_t * cos_t, 0.0));
+            let phi = 2.0 * PI * u2;
+            var hv = basis * vec3<f32>(sin_t * cos(phi), sin_t * sin(phi), cos_t);
+            let eta = select(1.0 / 1.45, 1.45, inside);
+            var rd = refract(d, hv, eta);
+            if dot(rd, rd) < 1e-8 {
+                // Total internal reflection.
+                rd = reflect(d, hv);
+                o = p + ng * eps;
+            } else {
+                o = p - ng * eps;
+                throughput *= select(base, vec3<f32>(1.0), inside) * (1.0 - fv) / (1.0 - p_spec);
+            }
+            d = normalize(rd);
+            if bounce >= 2u {
+                let q = clamp(max(throughput.r, max(throughput.g, throughput.b)), 0.05, 0.95);
+                if rnd() > q { break; }
+                throughput /= q;
+            }
+            continue;
         } else {
             let u1 = rnd();
             let u2 = rnd();
@@ -364,4 +437,13 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {
     }
     accum[idx] = vec4<f32>(acc, 1.0);
     textureStore(out_tex, vec2<i32>(g.xy), vec4<f32>(acc, 1.0));
+    // Guides, averaged over the samples (the pixel jitters).
+    var ga = vec4<f32>(g_alb, g_depth);
+    var gn = vec4<f32>(g_nrm, select(0.0, 1.0, guided));
+    if U.size.z > 0u {
+        ga = (aux[idx * 2u] * f + ga) / (f + 1.0);
+        gn = (aux[idx * 2u + 1u] * f + gn) / (f + 1.0);
+    }
+    aux[idx * 2u] = ga;
+    aux[idx * 2u + 1u] = gn;
 }

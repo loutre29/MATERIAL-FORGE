@@ -258,14 +258,38 @@ fn proc_raw(kind: u32, p: vec3<f32>, pp: ProcParams) -> f32 {
         }
         // 3D Worley noise: distance to the nearest feature point
         case 26u: { return clamp(voronoi3(p * 2.0, 1.0).x * 1.3, 0.0, 1.0); }
+        // Flakes: a gray per flake (a sparkle mask), see flake_normal.
+        case 27u: { return flake(p, pp).w; }
         default: { return 0.5; }
     }
+}
+
+// Metallic flakes: each cell of a jittered grid is a small mirror tilted at
+// random. pp.b = (scale in cells per unit / 8, tilt 0..1, coverage 0..1).
+// Returns the tangent normal (xyz) and a gray per flake (w, 0 off a flake).
+fn flake(pin: vec3<f32>, pp: ProcParams) -> vec4<f32> {
+    let seed = pp.a.x;
+    let p = pin * max(pp.b.x, 1.0) * 8.0 + vec3<f32>(seed * 13.17, seed * 7.31, seed * 3.77);
+    let v = voronoi3(p, 1.0);
+    let r = hash33(vec3<f32>(v.z * 91.7, v.z * 13.3 + 4.1, v.z * 5.9 + 1.7));
+    if r.z > clamp(pp.b.z, 0.0, 1.0) {
+        return vec4<f32>(0.0, 0.0, 1.0, 0.0);
+    }
+    // Random direction, tilt up to about 60 degrees.
+    let a = r.x * 6.2831853;
+    let t = sqrt(r.y) * clamp(pp.b.y, 0.0, 1.5) * 1.7;
+    let n = normalize(vec3<f32>(cos(a) * t, sin(a) * t, 1.0));
+    return vec4<f32>(n, 0.25 + 0.75 * fract(v.z * 17.31));
 }
 
 // Full evaluation: seed offset, domain warp, then balance and contrast.
 fn proc_eval(kind: u32, pin: vec3<f32>, pp: ProcParams) -> f32 {
     let seed = pp.a.x;
     var p = pin * vec3<f32>(max(pp.b.y, 0.01), 1.0, 1.0);
+    // Flakes read pp.b as their own parameters (no expansion, own seed).
+    if kind == 27u {
+        return clamp((flake(pin, pp).w - pp.a.z) * pp.a.y + 0.5, 0.0, 1.0);
+    }
     if kind != 12u {
         p += vec3<f32>(seed * 13.17, seed * 7.31, seed * 3.77);
     }

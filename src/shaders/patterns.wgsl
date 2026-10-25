@@ -188,7 +188,7 @@ fn strokes(uv: vec2<f32>, n: vec2<f32>, k: i32, len: f32, dir: f32, spread: f32,
     let i = floor(p);
     let f = fract(p);
     var s = 0.0;
-    let reach = i32(ceil(len)) + 1;
+    let reach = min(i32(ceil(len)), 6) + 1; // typed lengths can be huge
     for (var y = -reach; y <= reach; y++) {
         for (var x = -reach; x <= reach; x++) {
             let o = vec2<f32>(f32(x), f32(y));

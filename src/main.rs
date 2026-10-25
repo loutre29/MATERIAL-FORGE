@@ -10,7 +10,9 @@ mod camera;
 mod document;
 mod engine;
 mod export;
+mod flood;
 mod history;
+mod imageio;
 mod library;
 mod logo;
 mod mesh;
@@ -64,6 +66,162 @@ fn main() -> eframe::Result<()> {
         let mesh = args.get(2).map(std::path::PathBuf::from).unwrap_or_else(|| "mesh.fbx".into());
         if let Err(e) = app::ui_bench(&mesh) {
             eprintln!("UIBENCH FAILED: {e:#}");
+            std::process::exit(1);
+        }
+        std::process::exit(0);
+    }
+    // `--envpng <hdr|exr> <png>`: a tonemapped preview of an environment.
+    if args.get(1).map(String::as_str) == Some("--envpng") {
+        let (Some(src), Some(dst)) = (args.get(2), args.get(3)) else { std::process::exit(2) };
+        let ok = engine::env::load_hdr(std::path::Path::new(src)).and_then(|(w, h, px)| {
+            let img = image::RgbImage::from_fn(w, h, |x, y| {
+                let p = px[(y * w + x) as usize];
+                let t = |v: f32| ((v / (1.0 + v)).powf(1.0 / 2.2) * 255.0) as u8;
+                image::Rgb([t(p[0]), t(p[1]), t(p[2])])
+            });
+            let img = image::imageops::resize(&img, 1024, 512, image::imageops::FilterType::Triangle);
+            img.save(dst)?;
+            let mean: f32 = px.iter().map(|p| (p[0] + p[1] + p[2]) / 3.0).sum::<f32>() / px.len() as f32;
+            let max = px.iter().map(|p| p[0].max(p[1]).max(p[2])).fold(0.0f32, f32::max);
+            println!("{w}x{h} mean {mean:.3} max {max:.1}");
+            Ok(())
+        });
+        std::process::exit(if ok.is_ok() { 0 } else { 1 });
+    }
+    if args.get(1).map(String::as_str) == Some("--floodbench") {
+        #[cfg(windows)]
+        {
+            extern "system" {
+                fn AttachConsole(pid: u32) -> i32;
+            }
+            // SAFETY: plain Win32 call; failure just means no console output.
+            unsafe { AttachConsole(u32::MAX) };
+        }
+        let Some(mesh) = args.get(2) else { std::process::exit(2) };
+        let res = args.get(3).and_then(|r| r.parse().ok()).unwrap_or(4096);
+        if let Err(e) = selftest::flood_bench(std::path::Path::new(mesh), res) {
+            eprintln!("floodbench: {e:#}");
+            std::process::exit(1);
+        }
+        std::process::exit(0);
+    }
+    if args.get(1).map(String::as_str) == Some("--bakeshot") {
+        #[cfg(windows)]
+        {
+            extern "system" {
+                fn AttachConsole(pid: u32) -> i32;
+            }
+            // SAFETY: plain Win32 call; failure just means no console output.
+            unsafe { AttachConsole(u32::MAX) };
+        }
+        let (Some(mesh), Some(out)) = (args.get(2), args.get(3)) else { std::process::exit(2) };
+        let res = args.get(4).and_then(|r| r.parse().ok()).unwrap_or(1024);
+        if let Err(e) = selftest::bake_shot(std::path::Path::new(mesh), std::path::Path::new(out), res) {
+            eprintln!("bakeshot: {e:#}");
+            std::process::exit(1);
+        }
+        std::process::exit(0);
+    }
+    if args.get(1).map(String::as_str) == Some("--autouv") {
+        #[cfg(windows)]
+        {
+            extern "system" {
+                fn AttachConsole(pid: u32) -> i32;
+            }
+            // SAFETY: plain Win32 call; failure just means no console output.
+            unsafe { AttachConsole(u32::MAX) };
+        }
+        // --autouv <mesh> <dir> [smart|free|fast]: unwraps, reports, renders a checker.
+        let (Some(src), Some(dst)) = (args.get(2), args.get(3)) else {
+            eprintln!("usage: --autouv <mesh> <dir> [smart|free|fast]");
+            std::process::exit(2);
+        };
+        let method = args.get(4).map(String::as_str).unwrap_or("smart");
+        if let Err(e) = selftest::uv_check(std::path::Path::new(src), std::path::Path::new(dst), method) {
+            eprintln!("autouv: {e:#}");
+            std::process::exit(1);
+        }
+        std::process::exit(0);
+    }
+    if args.get(1).map(String::as_str) == Some("--alphashot") {
+        #[cfg(windows)]
+        {
+            extern "system" {
+                fn AttachConsole(pid: u32) -> i32;
+            }
+            // SAFETY: plain Win32 call; failure just means no console output.
+            unsafe { AttachConsole(u32::MAX) };
+        }
+        let out = args.get(2).map(std::path::PathBuf::from).unwrap_or_else(|| "alphashot".into());
+        if let Err(e) = selftest::alpha_shot(&out, args.get(3).map(std::path::Path::new)) {
+            eprintln!("alphashot: {e:#}");
+            std::process::exit(1);
+        }
+        std::process::exit(0);
+    }
+    if args.get(1).map(String::as_str) == Some("--matpreviews") {
+        #[cfg(windows)]
+        {
+            extern "system" {
+                fn AttachConsole(pid: u32) -> i32;
+            }
+            // SAFETY: plain Win32 call; failure just means no console output.
+            unsafe { AttachConsole(u32::MAX) };
+        }
+        if let Err(e) = selftest::material_previews(args.get(2).map(String::as_str).unwrap_or("")) {
+            eprintln!("matpreviews: {e:#}");
+            std::process::exit(1);
+        }
+        std::process::exit(0);
+    }
+    if args.get(1).map(String::as_str) == Some("--matshot") {
+        #[cfg(windows)]
+        {
+            extern "system" {
+                fn AttachConsole(pid: u32) -> i32;
+            }
+            // SAFETY: plain Win32 call; failure just means no console output.
+            unsafe { AttachConsole(u32::MAX) };
+        }
+        let out = args.get(2).map(std::path::PathBuf::from).unwrap_or_else(|| "matshot".into());
+        if let Err(e) = selftest::mat_shot(&out, args.get(3).map(String::as_str).unwrap_or("")) {
+            eprintln!("matshot: {e:#}");
+            std::process::exit(1);
+        }
+        std::process::exit(0);
+    }
+    if args.get(1).map(String::as_str) == Some("--layershot") {
+        #[cfg(windows)]
+        {
+            extern "system" {
+                fn AttachConsole(pid: u32) -> i32;
+            }
+            // SAFETY: plain Win32 call; failure just means no console output.
+            unsafe { AttachConsole(u32::MAX) };
+        }
+        // --layershot <project> <dir>: layer thumbnails next to the solo layer.
+        let (Some(src), Some(dst)) = (args.get(2), args.get(3)) else {
+            eprintln!("usage: --layershot <project> <dir>");
+            std::process::exit(2);
+        };
+        if let Err(e) = selftest::layer_shot(std::path::Path::new(src), std::path::Path::new(dst)) {
+            eprintln!("layershot: {e:#}");
+            std::process::exit(1);
+        }
+        std::process::exit(0);
+    }
+    if args.get(1).map(String::as_str) == Some("--matsheet") {
+        #[cfg(windows)]
+        {
+            extern "system" {
+                fn AttachConsole(pid: u32) -> i32;
+            }
+            // SAFETY: plain Win32 call; failure just means no console output.
+            unsafe { AttachConsole(u32::MAX) };
+        }
+        let out = args.get(2).map(std::path::PathBuf::from).unwrap_or_else(|| "matsheet".into());
+        if let Err(e) = selftest::mat_sheet(&out) {
+            eprintln!("matsheet: {e:#}");
             std::process::exit(1);
         }
         std::process::exit(0);
@@ -150,8 +308,11 @@ fn main() -> eframe::Result<()> {
         renderer: eframe::Renderer::Wgpu,
         wgpu_options: egui_wgpu::WgpuConfiguration {
             power_preference: wgpu::PowerPreference::HighPerformance,
-            // One queued frame: the brush cursor and strokes follow the pen
-            // a frame sooner than the default queue of two.
+            // Mailbox and one queued frame: the newest frame shows at the
+            // next refresh, without waiting behind older ones (no tearing).
+            // Camera and brush follow the mouse with the least delay.
+            // MF_VSYNC=1 falls back to classic vsync.
+            present_mode: if std::env::var("MF_VSYNC").is_ok() { wgpu::PresentMode::AutoVsync } else { wgpu::PresentMode::Mailbox },
             desired_maximum_frame_latency: Some(1),
             device_descriptor: Arc::new(|adapter| wgpu::DeviceDescriptor {
                 label: Some("sp_retro device"),

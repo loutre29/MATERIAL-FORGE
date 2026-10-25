@@ -1,0 +1,17 @@
+# Vendored uvunwrap 0.2.0 (MIT, https://github.com/archonic/uvunwrap) with
+# one addition: Options::keep_orientation, so auto UV islands stay upright.
+[package]
+name = "uvunwrap"
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+
+[features]
+default = ["parallel", "direct-solver"]
+parallel = ["dep:rayon"]
+direct-solver = ["dep:faer"]
+
+[dependencies]
+rayon = { version = "1.10", optional = true }
+faer = { version = "0.22", optional = true, default-features = false, features = ["std"] }
