@@ -1,4 +1,4 @@
-Material Forge 0.2.0 (test build)
+Material Forge 0.3.0 (test build)
 =================================
 
 A PBR 3D texture painter in the spirit of Substance 3D Painter.

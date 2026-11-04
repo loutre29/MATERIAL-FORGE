@@ -3,7 +3,7 @@
 ; Output: dist\MaterialForge-Setup-<version>.exe
 
 #define AppName "Material Forge"
-#define AppVersion "0.2.0"
+#define AppVersion "0.3.0"
 #define AppExe "material_forge.exe"
 
 [Setup]
