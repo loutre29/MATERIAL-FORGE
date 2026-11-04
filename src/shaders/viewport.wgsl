@@ -240,6 +240,11 @@ fn shade(in: VsOut, front: bool) -> vec4<f32> {
         }
         case 11u: { return as_data(vec3<f32>(spec_level)); }
         case 12u: { return as_data(vec3<f32>(transmission)); }
+        // The display texture's color, shaded (Muse's pieces on the model).
+        case 13u: {
+            let facing = max(dot(ng, normalize(cam.eye.xyz - in.world)), 0.0);
+            return as_data(disp.rgb * (0.45 + 0.55 * facing));
+        }
         case 10u: {
             let kind = u32(S.k.w + 0.5);
             if kind == 1u { return as_data(disp.rgb); }

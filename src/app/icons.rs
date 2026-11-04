@@ -13,6 +13,8 @@ pub enum Icon {
     Picker,
     Hide,
     Render,
+    /// Packshot studio: a softbox on its stand.
+    Studio,
     Eye,
     EyeOff,
     Folder,
@@ -69,6 +71,9 @@ pub enum Icon {
     Path,
     /// Swap the split views: two opposed arrows.
     Swap,
+    /// Panels locked / free: a padlock, closed or open.
+    Lock,
+    Unlock,
 }
 
 fn s(c: Color32) -> Stroke {
@@ -99,6 +104,21 @@ pub fn paint(p: &egui::Painter, r: Rect, icon: Icon, c: Color32) {
             line((7.0, 3.0), (-7.0, 3.0));
             line((-7.0, 3.0), (-4.0, 0.0));
             line((-7.0, 3.0), (-4.0, 6.0));
+        }
+        Icon::Lock | Icon::Unlock => {
+            p.rect_stroke(Rect::from_min_max(at(-6.0, -1.0), at(6.0, 7.0)), 2.0 * k, s(c));
+            p.circle_filled(at(0.0, 3.0), 1.3 * k, c);
+            // The shackle: raised and out of the body on the right when open.
+            let lift = if icon == Icon::Unlock { 3.0 } else { 0.0 };
+            let pts: Vec<Pos2> = (0..=12)
+                .map(|i| {
+                    let a = std::f32::consts::PI * (1.0 + i as f32 / 12.0);
+                    at(4.0 * a.cos(), -5.0 - lift + 4.0 * a.sin())
+                })
+                .collect();
+            p.add(egui::Shape::line(pts, s(c)));
+            line((-4.0, -5.0 - lift), (-4.0, -1.0));
+            line((4.0, -5.0 - lift), (4.0, -1.0 - lift * 1.4));
         }
         Icon::Path => {
             let pts: Vec<Pos2> = (0..=16)
@@ -333,6 +353,14 @@ pub fn paint(p: &egui::Painter, r: Rect, icon: Icon, c: Color32) {
             poly(&[(-7.0, -3.0), (4.0, -3.0), (4.0, 5.0), (-7.0, 5.0)], true);
             poly(&[(4.0, -1.0), (8.0, -4.0), (8.0, 6.0), (4.0, 3.0)], false);
             circle(-2.0, 1.0, 2.0);
+        }
+        Icon::Studio => {
+            poly(&[(-7.0, -7.0), (3.0, -7.0), (3.0, 1.0), (-7.0, 1.0)], true);
+            line((-2.0, 1.0), (-2.0, 7.0));
+            line((-5.0, 7.0), (1.0, 7.0));
+            line((5.0, -5.0), (8.0, -6.0));
+            line((5.0, -3.0), (8.0, -3.0));
+            line((5.0, -1.0), (8.0, 0.0));
         }
         Icon::Eye | Icon::EyeOff => {
             poly(&[(-8.0, 0.0), (-4.0, -4.0), (0.0, -5.0), (4.0, -4.0), (8.0, 0.0), (4.0, 4.0), (0.0, 5.0), (-4.0, 4.0)], true);

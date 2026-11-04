@@ -3,6 +3,7 @@
 // No console window for release builds; --selftest re-attaches to the parent one.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod ambientcg;
 mod app;
 mod bake;
 mod brush;
@@ -20,6 +21,7 @@ mod preview;
 mod procedurals;
 mod project;
 mod selftest;
+mod studio;
 mod style;
 
 use eframe::{egui, egui_wgpu};
@@ -30,6 +32,20 @@ fn main() -> eframe::Result<()> {
         env_logger::Env::default().default_filter_or("warn,wgpu_hal=error,wgpu_core=error,sp_retro=info"),
     )
     .init();
+    // A crash leaves its reason next to the library (crash.log): the window
+    // app has no console to show it.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let path = library::library_dir().join("..").join("crash.log");
+        let when = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let thread = std::thread::current().name().unwrap_or("worker").to_string();
+        let text = format!("[{when}] {} panicked on thread {thread}: {info}
+{}
+
+", env!("CARGO_PKG_VERSION"), std::backtrace::Backtrace::force_capture());
+        let _ = std::fs::OpenOptions::new().create(true).append(true).open(&path).and_then(|mut f| std::io::Write::write_all(&mut f, text.as_bytes()));
+        default_hook(info);
+    }));
 
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some("--bench") {
@@ -122,6 +138,39 @@ fn main() -> eframe::Result<()> {
         }
         std::process::exit(0);
     }
+    if args.get(1).map(String::as_str) == Some("--musetest") {
+        #[cfg(windows)]
+        {
+            extern "system" {
+                fn AttachConsole(pid: u32) -> i32;
+            }
+            // SAFETY: plain Win32 call; failure just means no console output.
+            unsafe { AttachConsole(u32::MAX) };
+        }
+        let (Some(p), Some(out), Some(prompt)) = (args.get(2), args.get(3), args.get(4)) else { std::process::exit(2) };
+        let sets: Vec<String> = args.get(5).map(|s| s.split(',').map(|n| n.trim().to_string()).collect()).unwrap_or_default();
+        if let Err(e) = app::muse_test(std::path::Path::new(p), std::path::Path::new(out), prompt, &sets) {
+            eprintln!("musetest: {e:#}");
+            std::process::exit(1);
+        }
+        std::process::exit(0);
+    }
+    if args.get(1).map(String::as_str) == Some("--museview") {
+        #[cfg(windows)]
+        {
+            extern "system" {
+                fn AttachConsole(pid: u32) -> i32;
+            }
+            // SAFETY: plain Win32 call; failure just means no console output.
+            unsafe { AttachConsole(u32::MAX) };
+        }
+        let (Some(p), Some(out)) = (args.get(2), args.get(3)) else { std::process::exit(2) };
+        if let Err(e) = app::muse_view_shot(std::path::Path::new(p), std::path::Path::new(out)) {
+            eprintln!("museview: {e:#}");
+            std::process::exit(1);
+        }
+        std::process::exit(0);
+    }
     if args.get(1).map(String::as_str) == Some("--autouv") {
         #[cfg(windows)]
         {
@@ -155,6 +204,43 @@ fn main() -> eframe::Result<()> {
         let out = args.get(2).map(std::path::PathBuf::from).unwrap_or_else(|| "alphashot".into());
         if let Err(e) = selftest::alpha_shot(&out, args.get(3).map(std::path::Path::new)) {
             eprintln!("alphashot: {e:#}");
+            std::process::exit(1);
+        }
+        std::process::exit(0);
+    }
+    // `--lightmeasure <image>`: what Muse is told of a photo's light.
+    if args.get(1).map(String::as_str) == Some("--lightmeasure") {
+        #[cfg(windows)]
+        {
+            extern "system" {
+                fn AttachConsole(pid: u32) -> i32;
+            }
+            // SAFETY: plain Win32 call; failure just means no console output.
+            unsafe { AttachConsole(u32::MAX) };
+        }
+        for p in &args[2..] {
+            match image::open(p) {
+                Ok(i) => println!("{p}: {}", studio::photo_light(&i).unwrap_or_default()),
+                Err(e) => println!("{p}: {e}"),
+            }
+        }
+        std::process::exit(0);
+    }
+    if args.get(1).map(String::as_str) == Some("--studioshot") {
+        #[cfg(windows)]
+        {
+            extern "system" {
+                fn AttachConsole(pid: u32) -> i32;
+            }
+            // SAFETY: plain Win32 call; failure just means no console output.
+            unsafe { AttachConsole(u32::MAX) };
+        }
+        let (Some(input), Some(out)) = (args.get(2), args.get(3)) else {
+            eprintln!("usage: --studioshot <project.sprp | mesh> <out.png>");
+            std::process::exit(2);
+        };
+        if let Err(e) = selftest::studio_shot(std::path::Path::new(input), std::path::Path::new(out)) {
+            eprintln!("studioshot: {e:#}");
             std::process::exit(1);
         }
         std::process::exit(0);

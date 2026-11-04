@@ -244,7 +244,15 @@ impl RetroApp {
         }
         // Leave the panels' resize grips (a few points on each side) to them.
         let resp = ui.allocate_rect(rect.shrink2(egui::vec2(6.0, 0.0)), Sense::click_and_drag());
-        ui.painter().image(self.vp_tex.unwrap(), rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+        // While Muse checks its first pass, the view as it was before: the
+        // user sees one result, the final one.
+        let held = self.muse_hold_tex();
+        ui.painter().image(held.unwrap_or(self.vp_tex.unwrap()), rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+        if held.is_some() {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+        }
+        self.muse_piece_labels(ui.painter(), rect);
+        self.studio_overlay(ui.painter(), rect);
 
         // Assets dropped on the mesh go to the texture set under the cursor.
         if super::drop_hover::<super::shelf::Item>(ui, rect).is_some() {

@@ -53,6 +53,8 @@ pub struct FilterU {
     pub p1: [f32; 4],
     pub color: [f32; 4],
     pub color2: [f32; 4],
+    /// Curves: 4 curves of 8 (x, y) points (`document::curve_uniform`).
+    pub curve: [[f32; 4]; 16],
 }
 
 #[repr(C)]
@@ -116,6 +118,9 @@ pub struct MaskU {
     pub xf: [[f32; 4]; 3],
     pub nr: [[f32; 4]; 3],
     pub colors: [[f32; 4]; 8],
+    /// UV projection: per-axis scale (the 2D manipulator), pivot.
+    pub uvx: [f32; 4],
+    pub uvp: [f32; 4],
 }
 
 /// Paint layer textures (see `document::PaintTex`).

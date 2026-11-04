@@ -32,6 +32,9 @@ struct Header {
     active: usize,
     bake_settings: BakeSettings,
     camera: OrbitCamera,
+    /// The packshot studio (older projects: the default kit).
+    #[serde(default)]
+    studio: crate::studio::Studio,
     sets: Vec<SetHeader>,
     resources: Vec<ResHeader>,
 }
@@ -64,6 +67,9 @@ struct SetHeader {
     res: u32,
     settings: SetSettings,
     baked: bool,
+    /// Mesh maps the user removed (bits in `MESH_MAPS` order).
+    #[serde(default)]
+    removed_maps: u8,
     /// ao, curvature, normal, world normal, thickness, id
     maps: [usize; 6],
     selected: Option<u64>,
@@ -149,6 +155,7 @@ pub fn save(engine: &Engine, doc: &Document, camera: &OrbitCamera, path: &Path) 
             res: s.resolution(),
             settings: s.settings.clone(),
             baked: s.baked,
+            removed_maps: s.removed_maps,
             maps,
             selected: s.selected,
             layers,
@@ -173,6 +180,7 @@ pub fn save(engine: &Engine, doc: &Document, camera: &OrbitCamera, path: &Path) 
         active: doc.active,
         bake_settings: doc.bake_settings.clone(),
         camera: *camera,
+        studio: doc.studio.clone(),
         sets,
         resources,
     };
@@ -337,6 +345,7 @@ pub fn load(engine: &Engine, path: &Path) -> Result<(Document, OrbitCamera)> {
             set.settings.alpha_mode = crate::document::AlphaMode::Auto;
         }
         set.baked = sh.baked;
+        set.removed_maps = sh.removed_maps;
         if set.baked {
             set.gpu.alloc_baked(&engine.device, None);
         }
@@ -378,6 +387,7 @@ pub fn load(engine: &Engine, path: &Path) -> Result<(Document, OrbitCamera)> {
         bvh,
         pick_map,
         hidden: Vec::new(),
+        studio: header.studio,
     };
     let mut doc = doc;
     doc.reset_hidden();

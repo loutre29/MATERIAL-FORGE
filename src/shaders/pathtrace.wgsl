@@ -1,6 +1,7 @@
 // Progressive path tracer (render mode). One sample per pixel per frame,
 // accumulated in a storage buffer. Materials come from the texture sets'
-// final maps; lighting from the environment map.
+// final maps; lighting from the environment map, or the packshot studio's
+// lights (src/studio.rs) over a seamless background.
 
 struct PT {
     inv_view_proj: mat4x4<f32>,
@@ -80,6 +81,38 @@ struct Tri {
 // (albedo, depth), (normal, coverage); two entries per pixel.
 @group(0) @binding(39) var<storage, read_write> aux: array<vec4<f32>>;
 
+// The packshot studio (src/studio.rs StudioGpu).
+struct Light {
+    // xyz the face's center, w kind (0 off, 1 rectangle, 2 disc, 4 black flag)
+    pos: vec4<f32>,
+    // emission axis, w width
+    fwd: vec4<f32>,
+    // w height
+    right: vec4<f32>,
+    // w cosine of the grid's half angle (0: no grid)
+    up: vec4<f32>,
+    // radiance at the face's center, w area
+    color: vec4<f32>,
+    // soft edges, top to bottom gradient
+    prof: vec4<f32>,
+};
+
+struct Studio {
+    // on, light count, ground height, shadow opacity
+    a: vec4<f32>,
+    // background (linear, as shown), room light
+    bg: vec4<f32>,
+    // environment light, object size, floor reflection, its fade height
+    b: vec4<f32>,
+    // toward the background's lit pool, w its angular radius
+    pool: vec4<f32>,
+    // background falloff, ground on
+    c: vec4<f32>,
+    lights: array<Light, 8>,
+};
+
+@group(0) @binding(40) var<uniform> S: Studio;
+
 fn slot_vec(a: vec4<f32>, b: vec4<f32>, s: u32) -> f32 {
     if s < 4u { return a[s]; }
     if s < 8u { return b[s - 4u]; }
@@ -130,17 +163,18 @@ fn tex_nrm(s: u32, uv: vec2<f32>) -> vec4<f32> {
     }
 }
 
-fn tex_emi(s: u32, uv: vec2<f32>) -> vec3<f32> {
-    var e = vec3<f32>(0.0);
+// Emission, w the specular level (the finals' spare alpha, as in the viewport).
+fn tex_emi(s: u32, uv: vec2<f32>) -> vec4<f32> {
+    var e = vec4<f32>(0.0, 0.0, 0.0, 0.5);
     switch s {
-        case 0u: { e = textureSampleLevel(e0, samp, uv, 0.0).rgb * U.emi_a.x; }
-        case 1u: { e = textureSampleLevel(e1, samp, uv, 0.0).rgb * U.emi_a.y; }
-        case 2u: { e = textureSampleLevel(e2, samp, uv, 0.0).rgb * U.emi_a.z; }
-        case 3u: { e = textureSampleLevel(e3, samp, uv, 0.0).rgb * U.emi_a.w; }
-        case 4u: { e = textureSampleLevel(e4, samp, uv, 0.0).rgb * U.emi_b.x; }
-        case 5u: { e = textureSampleLevel(e5, samp, uv, 0.0).rgb * U.emi_b.y; }
-        case 6u: { e = textureSampleLevel(e6, samp, uv, 0.0).rgb * U.emi_b.z; }
-        case 7u: { e = textureSampleLevel(e7, samp, uv, 0.0).rgb * U.emi_b.w; }
+        case 0u: { e = textureSampleLevel(e0, samp, uv, 0.0); e = vec4<f32>(e.rgb * U.emi_a.x, e.a); }
+        case 1u: { e = textureSampleLevel(e1, samp, uv, 0.0); e = vec4<f32>(e.rgb * U.emi_a.y, e.a); }
+        case 2u: { e = textureSampleLevel(e2, samp, uv, 0.0); e = vec4<f32>(e.rgb * U.emi_a.z, e.a); }
+        case 3u: { e = textureSampleLevel(e3, samp, uv, 0.0); e = vec4<f32>(e.rgb * U.emi_a.w, e.a); }
+        case 4u: { e = textureSampleLevel(e4, samp, uv, 0.0); e = vec4<f32>(e.rgb * U.emi_b.x, e.a); }
+        case 5u: { e = textureSampleLevel(e5, samp, uv, 0.0); e = vec4<f32>(e.rgb * U.emi_b.y, e.a); }
+        case 6u: { e = textureSampleLevel(e6, samp, uv, 0.0); e = vec4<f32>(e.rgb * U.emi_b.z, e.a); }
+        case 7u: { e = textureSampleLevel(e7, samp, uv, 0.0); e = vec4<f32>(e.rgb * U.emi_b.w, e.a); }
         default: {}
     }
     return e;
@@ -194,10 +228,10 @@ fn safe_inv(v: f32) -> f32 {
     return 1.0 / v;
 }
 
-fn trace(o: vec3<f32>, d: vec3<f32>, any_hit: bool) -> Isect {
+fn trace(o: vec3<f32>, d: vec3<f32>, any_hit: bool, tmax: f32) -> Isect {
     var best: Isect;
     best.hit = false;
-    best.t = 1e30;
+    best.t = tmax;
     let inv = vec3<f32>(safe_inv(d.x), safe_inv(d.y), safe_inv(d.z));
     var stack: array<u32, 48>;
     var sp = 1u;
@@ -276,6 +310,183 @@ fn g1(ndx: f32, a2: f32) -> f32 {
     return 2.0 * ndx / (ndx + sqrt(a2 + (1.0 - a2) * ndx * ndx));
 }
 
+fn ggx_d(ndh: f32, a2: f32) -> f32 {
+    let k = ndh * ndh * (a2 - 1.0) + 1.0;
+    return a2 / (PI * k * k);
+}
+
+// ---------------------------------------------------------------- studio
+
+struct LightS {
+    // toward the light, its distance
+    wi: vec3<f32>,
+    dist: f32,
+    // radiance times geometry over the sample's density (times the
+    // receiver's cosine: the light received)
+    e: vec3<f32>,
+    // solid angle density
+    pdf: f32,
+    ok: bool,
+};
+
+fn grid_falloff(l: Light, cos_l: f32) -> f32 {
+    if l.up.w <= 0.0 { return 1.0; }
+    return smoothstep(l.up.w, mix(l.up.w, 1.0, 0.5), cos_l);
+}
+
+// How bright the face is at (nx, ny), -1 to 1 across its width and
+// height: soft edges, then the top to bottom gradient (studio.rs `profile`).
+fn profile(l: Light, disc: bool, nx: f32, ny: f32) -> f32 {
+    let f = l.prof.x;
+    var edge: f32;
+    if disc {
+        edge = max(1.0 - f * (nx * nx + ny * ny), 0.0);
+    } else {
+        let ny2 = ny * ny;
+        edge = max(1.0 - f * nx * nx, 0.0) * (1.0 - 0.5 * f * ny2 * ny2);
+    }
+    return edge * max(1.0 + l.prof.y * ny, 0.0);
+}
+
+// The seamless background seen along `d`: its color, darker away from the
+// lit pool behind the product.
+fn bg_seen(d: vec3<f32>) -> vec3<f32> {
+    if S.c.x <= 0.0 { return S.bg.rgb; }
+    let a = acos(clamp(dot(d, S.pool.xyz), -1.0, 1.0)) / max(S.pool.w, 1e-4);
+    return S.bg.rgb * (1.0 - S.c.x * (1.0 - exp(-a * a)));
+}
+
+// One sample of light `l` seen from `p`.
+fn sample_light(l: Light, p: vec3<f32>) -> LightS {
+    var s: LightS;
+    s.ok = false;
+    s.pdf = 0.0;
+    let kind = u32(l.pos.w + 0.5);
+    if kind != 1u && kind != 2u { return s; }
+    let u1 = rnd();
+    let u2 = rnd();
+    var y: vec3<f32>;
+    var nx: f32;
+    var ny: f32;
+    let area = l.color.w;
+    if kind == 1u {
+        nx = u1 * 2.0 - 1.0;
+        ny = u2 * 2.0 - 1.0;
+    } else {
+        let r = sqrt(u1);
+        let phi = 2.0 * PI * u2;
+        nx = r * cos(phi);
+        ny = r * sin(phi);
+    }
+    y = l.pos.xyz + l.right.xyz * (nx * l.fwd.w * 0.5) + l.up.xyz * (ny * l.right.w * 0.5);
+    let wl = y - p;
+    let dist = length(wl);
+    if dist < 1e-6 { return s; }
+    let wi = wl / dist;
+    let cos_l = dot(-wi, l.fwd.xyz);
+    if cos_l <= 1e-4 { return s; }
+    let e = l.color.rgb * profile(l, kind == 2u, nx, ny) * grid_falloff(l, cos_l) * cos_l * area / (dist * dist);
+    s.wi = wi;
+    s.dist = dist;
+    s.e = e;
+    s.pdf = dist * dist / (area * cos_l);
+    s.ok = true;
+    return s;
+}
+
+struct LightHit {
+    e: vec3<f32>,
+    // a black flag ends the ray
+    stop: bool,
+};
+
+// What a ray from o along d meets of the lights before `tmax` (their
+// fronts emit; rays pass through them), weighted against light sampling
+// by the density the ray was drawn with (`bsdf_pdf`, 0: no weighting).
+// A black flag (either side) stops the ray: nothing past it counts.
+fn hit_lights(o: vec3<f32>, d: vec3<f32>, tmax: f32, bsdf_pdf: f32) -> LightHit {
+    var out: LightHit;
+    out.e = vec3<f32>(0.0);
+    out.stop = false;
+    let n = u32(S.a.y + 0.5);
+    var far = tmax;
+    for (var i = 0u; i < n; i++) {
+        let l = S.lights[i];
+        if u32(l.pos.w + 0.5) != 4u { continue; }
+        let den = dot(d, l.fwd.xyz);
+        if abs(den) < 1e-6 { continue; }
+        let t = dot(l.pos.xyz - o, l.fwd.xyz) / den;
+        if t <= 0.0 || t >= far { continue; }
+        let lp = o + d * t - l.pos.xyz;
+        if abs(dot(lp, l.right.xyz)) <= l.fwd.w * 0.5 && abs(dot(lp, l.up.xyz)) <= l.right.w * 0.5 {
+            far = t;
+            out.stop = true;
+        }
+    }
+    var sum = vec3<f32>(0.0);
+    for (var i = 0u; i < n; i++) {
+        let l = S.lights[i];
+        let kind = u32(l.pos.w + 0.5);
+        if kind != 1u && kind != 2u { continue; }
+        let den = dot(d, l.fwd.xyz);
+        if den >= -1e-6 { continue; }
+        let t = dot(l.pos.xyz - o, l.fwd.xyz) / den;
+        if t <= 0.0 || t >= far { continue; }
+        let lp = o + d * t - l.pos.xyz;
+        let nx = dot(lp, l.right.xyz) / (l.fwd.w * 0.5);
+        let ny = dot(lp, l.up.xyz) / (l.right.w * 0.5);
+        var inside = false;
+        if kind == 1u {
+            inside = abs(nx) <= 1.0 && abs(ny) <= 1.0;
+        } else {
+            inside = nx * nx + ny * ny <= 1.0;
+        }
+        if !inside { continue; }
+        let cos_l = -den;
+        let pdf_l = t * t / (l.color.w * cos_l);
+        var w = 1.0;
+        if bsdf_pdf > 0.0 {
+            w = bsdf_pdf * bsdf_pdf / (bsdf_pdf * bsdf_pdf + pdf_l * pdf_l);
+        }
+        sum += l.color.rgb * profile(l, kind == 2u, nx, ny) * grid_falloff(l, cos_l) * w;
+    }
+    out.e = sum;
+    return out;
+}
+
+// The ground under the subject seen by the camera along `d`: the
+// background there, darker where the subject keeps the lights from it.
+fn ground_shade(p: vec3<f32>, eps: f32, d: vec3<f32>) -> vec3<f32> {
+    let seen = bg_seen(d);
+    if S.a.w <= 0.0 { return seen; }
+    let up = vec3<f32>(0.0, 1.0, 0.0);
+    var lit = vec3<f32>(0.0);
+    var open = vec3<f32>(0.0);
+    let n = u32(S.a.y + 0.5);
+    let o = p + up * eps;
+    for (var i = 0u; i < n; i++) {
+        let s = sample_light(S.lights[i], p);
+        if !s.ok { continue; }
+        let c = max(s.wi.y, 0.0);
+        if c <= 0.0 { continue; }
+        open += s.e * c;
+        if !trace(o, s.wi, true, s.dist).hit {
+            lit += s.e * c;
+        }
+    }
+    // The studio's bounce light, blocked near the subject.
+    let amb = PI * 0.6 * (S.bg.w + S.b.x);
+    let u1 = rnd();
+    let u2 = rnd();
+    let r = sqrt(u1);
+    let phi = 2.0 * PI * u2;
+    let dir = vec3<f32>(r * cos(phi), sqrt(max(1.0 - u1, 0.0)), r * sin(phi));
+    let occ = trace(o, dir, true, S.b.y * 4.0).hit;
+    let lit_amb = select(amb, 0.0, occ);
+    let ratio = (lit + vec3<f32>(lit_amb)) / max(open + vec3<f32>(amb), vec3<f32>(1e-6));
+    return seen * mix(vec3<f32>(1.0), min(ratio, vec3<f32>(1.0)), S.a.w);
+}
+
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) g: vec3<u32>) {
     let w = U.size.x;
@@ -299,10 +510,67 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {
     var g_depth = 1e9;
     var guided = false;
     var passes = 0u;
+    // The packshot studio: its lights, background and ground.
+    let studio = S.a.x > 0.5;
+    // The density the last bounce drew its direction with (weighting
+    // against light sampling; 0 after a refraction or from the camera).
+    var last_pdf = 0.0;
+    // Only refractions since the camera: the background shows through.
+    var clear = true;
+    // The ray comes off the glossy floor: its image fades with height.
+    var floor_fade = false;
     for (var bounce = 0u; bounce <= U.size.w; bounce++) {
-        let hit = trace(o, d, false);
+        let hit = trace(o, d, false, 1e30);
+        let off_floor = floor_fade;
+        if floor_fade {
+            floor_fade = false;
+            if hit.hit && S.b.w > 0.0 {
+                let f = exp(-hit.t / S.b.w);
+                radiance += throughput * (1.0 - f) * bg_seen(d);
+                throughput *= f;
+            }
+        }
+        if studio && bounce > 0u && !off_floor {
+            let lh = hit_lights(o, d, select(1e30, hit.t, hit.hit), last_pdf);
+            radiance += throughput * lh.e;
+            if lh.stop { break; }
+        }
+        if studio && bounce == 0u && S.c.y > 0.5 && d.y < -1e-6 && o.y > S.a.z {
+            let tg = (S.a.z - o.y) / d.y;
+            if !hit.hit || tg < hit.t {
+                let gp = o + d * tg;
+                let k = S.b.z;
+                radiance += ground_shade(gp, eps, d) * (1.0 - k);
+                if k <= 0.0 {
+                    if !guided {
+                        guided = true;
+                        g_alb = max(S.bg.rgb, vec3<f32>(0.02));
+                        g_nrm = vec3<f32>(0.0, 1.0, 0.0);
+                        g_depth = length(gp - a4.xyz / a4.w);
+                    }
+                    break;
+                }
+                // A glossy floor: the rest is its mirror image (the
+                // background where it shows nothing; the denoiser's guides
+                // from what it shows).
+                throughput *= k;
+                o = gp + vec3<f32>(0.0, eps, 0.0);
+                d = reflect(d, vec3<f32>(0.0, 1.0, 0.0));
+                floor_fade = true;
+                continue;
+            }
+        }
         if !hit.hit {
-            if bounce == 0u {
+            if studio {
+                if bounce == 0u || clear {
+                    radiance += throughput * bg_seen(d);
+                } else {
+                    radiance += throughput * (S.bg.rgb * S.bg.w + env(d, 0.0) * S.b.x);
+                }
+                if !guided {
+                    g_alb = max(S.bg.rgb, vec3<f32>(0.02));
+                }
+            } else if bounce == 0u {
                 if U.env.z > 1.5 {
                     // Black (material previews take their alpha from the
                     // coverage guide).
@@ -352,7 +620,8 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {
         // Hit from inside (geometric normal facing the ray): leaving glass.
         let ng_raw = normalize(cross(tr.p1.xyz - tr.p0.xyz, tr.p2.xyz - tr.p0.xyz));
         let inside = dot(ng_raw, d) > 0.0;
-        radiance += throughput * tex_emi(slot, uv);
+        let emi4 = tex_emi(slot, uv);
+        radiance += throughput * emi4.rgb;
         var t = tr.tng.xyz - ns * dot(ns, tr.tng.xyz);
         if dot(t, t) < 1e-10 { t = ortho(ns)[0]; }
         t = normalize(t);
@@ -366,9 +635,39 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {
         let a2 = a * a;
         let v = -d;
         let ndv = max(dot(n, v), 1e-4);
-        let f0 = mix(vec3<f32>(0.04), base, metal);
+        // Specular level 0.5: F0 0.04 (0 none, 1 0.08), as in the viewport.
+        let f0 = mix(vec3<f32>(0.08 * clamp(emi4.a, 0.0, 1.0)), base, metal);
         let fv = fresnel(f0, ndv);
         let p_spec = clamp(max(fv.r, max(fv.g, fv.b)) * (1.0 - 0.5 * rough) + metal * 0.5, 0.1, 0.95);
+        let tr_w = transmission * (1.0 - metal);
+        // The studio's lights, each sampled (shadow ray), weighted per
+        // lobe against the lobe meeting the box itself.
+        if studio {
+            let nl = u32(S.a.y + 0.5);
+            for (var li = 0u; li < nl; li++) {
+                let s = sample_light(S.lights[li], p);
+                if !s.ok { continue; }
+                let ndl = dot(n, s.wi);
+                if ndl <= 0.0 || dot(ng, s.wi) <= 0.0 { continue; }
+                if trace(p + ng * eps, s.wi, true, s.dist * 0.999).hit { continue; }
+                let hv = normalize(v + s.wi);
+                let ndh = max(dot(n, hv), 1e-4);
+                let vdh = max(dot(v, hv), 1e-4);
+                let dd = ggx_d(ndh, a2);
+                let spec = fresnel(f0, vdh) * dd * g1(ndv, a2) * g1(ndl, a2) / (4.0 * ndv);
+                let diff = base * (1.0 - metal) * (1.0 - fv) * (1.0 - tr_w) / PI * ndl;
+                var ws = 1.0;
+                var wd = 1.0;
+                if s.pdf > 0.0 {
+                    let ps = p_spec * dd * ndh / (4.0 * vdh);
+                    let pd = (1.0 - p_spec) * (1.0 - tr_w) * ndl / PI;
+                    let l2 = s.pdf * s.pdf;
+                    ws = l2 / (l2 + ps * ps);
+                    wd = l2 / (l2 + pd * pd);
+                }
+                radiance += throughput * s.e * (spec * ws + diff * wd);
+            }
+        }
         let basis = ortho(n);
         var nd: vec3<f32>;
         if rnd() < p_spec {
@@ -386,7 +685,9 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {
             let vdh = max(dot(v, hv), 1e-4);
             let gg = g1(ndv, a2) * g1(ndl, a2);
             throughput *= fresnel(f0, vdh) * gg * vdh / (ndh * ndv) / p_spec;
-        } else if rnd() < transmission * (1.0 - metal) {
+            last_pdf = p_spec * ggx_d(ndh, a2) * ndh / (4.0 * vdh);
+            clear = false;
+        } else if rnd() < tr_w {
             // Transmission: refraction through a rough interface (GGX
             // microfacet), tinted by the base color; IOR 1.45.
             let u1 = rnd();
@@ -406,6 +707,7 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {
                 throughput *= select(base, vec3<f32>(1.0), inside) * (1.0 - fv) / (1.0 - p_spec);
             }
             d = normalize(rd);
+            last_pdf = 0.0;
             if bounce >= 2u {
                 let q = clamp(max(throughput.r, max(throughput.g, throughput.b)), 0.05, 0.95);
                 if rnd() > q { break; }
@@ -419,6 +721,8 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {
             let phi = 2.0 * PI * u2;
             nd = basis * vec3<f32>(r * cos(phi), r * sin(phi), sqrt(max(1.0 - u1, 0.0)));
             throughput *= base * (1.0 - metal) * (1.0 - fv) / (1.0 - p_spec);
+            last_pdf = (1.0 - p_spec) * (1.0 - tr_w) * max(dot(n, nd), 0.0) / PI;
+            clear = false;
         }
         if dot(nd, ng) <= 0.0 { break; }
         o = p + ng * eps;

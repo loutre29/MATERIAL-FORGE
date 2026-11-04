@@ -544,6 +544,467 @@ fn up_light(level: f32, contrast: f32) -> MaskEffectKind {
     })
 }
 
+/// An sRGB color picked by eye, as the linear value fills take.
+fn lin(c: [f32; 3]) -> [f32; 3] {
+    c.map(|v| v.powf(2.2))
+}
+
+/// A fill that only changes the color (hand-painted shading layers).
+fn tint(rgb: [f32; 3]) -> FillDesc {
+    let mut f = paint_over(rgb, 0.5, 0.0);
+    f.channels[CH_ROUGH].enabled = false;
+    f.channels[CH_METAL].enabled = false;
+    f
+}
+
+/// A fill that only changes the height (relief).
+fn relief(h: FillChannel) -> FillDesc {
+    let mut f = with_height(tint([0.0; 3]), h);
+    f.channels[CH_COLOR].enabled = false;
+    f
+}
+
+/// Glowing paint: the color, emissive too.
+fn glowing(rgb: [f32; 3]) -> FillDesc {
+    let mut f = tint(rgb);
+    f.channels[CH_EMISSIVE] = uni(rgb);
+    f
+}
+
+/// A layer at `opacity`.
+fn faded(mut l: LayerTree, opacity: f32) -> LayerTree {
+    l.desc.opacity = [opacity; NCH];
+    l
+}
+
+/// A procedural pattern as a mask, tri-planar (planar patterns take each
+/// face's plane), `scale` across the object.
+fn pat(kind: ProcKind, scale: f32, seed: f32, f: impl Fn(&mut ProcParams)) -> MaskEffectKind {
+    let mut k = procm(kind, scale, |p| {
+        p.seed = seed;
+        f(p);
+    });
+    if let MaskEffectKind::Fill { projection, .. } = &mut k {
+        projection.mode = ProjMode::Triplanar;
+    }
+    k
+}
+
+/// Brush strokes as a mask.
+fn strokes(scale: f32, seed: f32) -> MaskEffectKind {
+    pat(ProcKind::BrushStrokes, scale, seed, |p| {
+        p.density = 0.5;
+        p.roughness = 0.6;
+    })
+}
+
+/// A pattern as a fill channel ramping `a` to `b` (linear colors).
+fn pat_ch(kind: ProcKind, scale: f32, a: [f32; 3], b: [f32; 3], f: impl Fn(&mut ProcParams)) -> (FillChannel, Projection) {
+    let mut c = procc(kind, a, b);
+    f(&mut c.procedural);
+    (c, Projection { mode: ProjMode::Triplanar, scale, ..Default::default() })
+}
+
+/// Levels flipped (white below `lo`, black above `hi`).
+fn inv_levels(lo: f32, hi: f32) -> MaskEffectKind {
+    MaskEffectKind::Levels { in_lo: lo, in_hi: hi, gamma: 1.0, out_lo: 1.0, out_hi: 0.0 }
+}
+
+/// A base painted in visible brush strokes mixing two colors (sRGB).
+fn painted_base(name: &str, a: [f32; 3], b: [f32; 3], rough: f32, metal: f32, scale: f32) -> LayerTree {
+    let (c, proj) = pat_ch(ProcKind::BrushStrokes, scale, lin(a), lin(b), |p| {
+        p.density = 0.5;
+        p.roughness = 0.6;
+    });
+    let mut f = fill(c, gray(rough), gray(metal));
+    f.projection = proj;
+    fill_layer(name, f, None)
+}
+
+/// Light and shade painted into the color: a soft cool shadow on the sides
+/// turned away from the light and warm light on top, following the form,
+/// their border nudged by strokes.
+fn painted_light(shadow: [f32; 3], light: [f32; 3]) -> Vec<LayerTree> {
+    use MaskBlend::*;
+    let lit = |invert: bool| {
+        gen(Generator::Light, move |g| {
+            g.dir = [0.25, 1.0, 0.35];
+            g.invert = invert;
+            g.level = 0.5;
+            g.contrast = 1.6;
+        })
+    };
+    vec![
+        faded(fill_layer("Cool shadow", tint(lin(shadow)), Some(mask(0.0, vec![
+            effect(Normal, 1.0, lit(true)),
+            effect(Overlay, 0.25, strokes(5.0, 3.0)),
+            effect(Normal, 1.0, levels(0.4, 0.85)),
+        ]))), 0.7),
+        faded(fill_layer("Warm light", tint(lin(light)), Some(mask(0.0, vec![
+            effect(Normal, 1.0, lit(false)),
+            effect(Overlay, 0.25, strokes(5.0, 5.0)),
+            effect(Normal, 1.0, levels(0.55, 0.95)),
+        ]))), 0.5),
+    ]
+}
+
+/// Dark color in the crevices.
+fn crevices(rgb: [f32; 3], opacity: f32) -> LayerTree {
+    use MaskBlend::*;
+    faded(fill_layer("Crevices", tint(lin(rgb)), Some(mask(0.0, vec![
+        effect(Normal, 1.0, gen(Generator::Cavity, |g| {
+            g.level = 0.15;
+            g.contrast = 6.0;
+        })),
+        effect(Add, 0.4, gen(Generator::AmbientOcclusion, |g| g.contrast = 5.0)),
+    ]))), opacity)
+}
+
+/// Light caught by the edges in broken strokes.
+fn edge_light(rgb: [f32; 3], opacity: f32) -> LayerTree {
+    use MaskBlend::*;
+    faded(fill_layer("Edge light", tint(lin(rgb)), Some(mask(0.0, vec![
+        effect(Normal, 1.0, gen(Generator::Edges, |g| {
+            g.level = 0.62;
+            g.contrast = 10.0;
+        })),
+        effect(Multiply, 1.0, strokes(10.0, 7.0)),
+        effect(Normal, 1.0, levels(0.12, 0.3)),
+    ]))), opacity)
+}
+
+/// The "Hand-painted ..." smart materials (no files): the look of painted
+/// animated films set in a brass city and its undercity. Each has its own
+/// build (engraving, chipped paint over rust, graffiti, facets...), over a
+/// base in brush strokes with light and shade painted in.
+fn hand_painted_smart_materials(sm: &mut dyn FnMut(&str, Vec<LayerTree>)) {
+    use MaskBlend::*;
+    use ProcKind as K;
+    let mut out = |name: &str, mut layers: Vec<LayerTree>, shadow: [f32; 3], light: [f32; 3]| {
+        // Light and shade go under the crevices and edges (the last two).
+        let n = layers.len().saturating_sub(2);
+        let tail = layers.split_off(n);
+        layers.extend(painted_light(shadow, light));
+        layers.extend(tail);
+        sm(name, layers);
+    };
+
+    // Polished brass with engraved hexagon ornaments, tarnish in the
+    // recesses and painted glints.
+    out(
+        "Hand-painted gilded brass",
+        vec![
+            painted_base("Brass", [0.6, 0.4, 0.13], [0.86, 0.64, 0.26], 0.4, 0.6, 5.0),
+            fill_layer("Engraving", with_height(tint(lin([0.3, 0.15, 0.04])), gray(-0.08)), Some(mask(0.0, vec![
+                effect(Normal, 1.0, pat(K::Hexagons, 2.5, 0.0, |p| p.density = 0.25)),
+                effect(Normal, 1.0, inv_levels(0.3, 0.6)),
+            ]))),
+            faded(fill_layer("Tarnish", tint(lin([0.22, 0.16, 0.05])), Some(mask(0.0, vec![
+                effect(Normal, 1.0, gen(Generator::Dirt, |g| g.noise = 0.4)),
+                effect(Multiply, 1.0, pat(K::Grunge, 3.0, 2.0, |_| {})),
+            ]))), 0.8),
+            fill_layer("Glints", tint(lin([1.0, 0.95, 0.72])), Some(mask(0.0, vec![
+                effect(Normal, 1.0, gen(Generator::Light, |g| {
+                    g.dir = [0.5, 0.8, 0.6];
+                    g.level = 0.85;
+                    g.contrast = 5.0;
+                })),
+                effect(Multiply, 1.0, strokes(8.0, 11.0)),
+                effect(Normal, 1.0, levels(0.25, 0.45)),
+            ]))),
+            crevices([0.2, 0.08, 0.03], 0.85),
+            edge_light([1.0, 0.94, 0.7], 0.9),
+        ],
+        [0.32, 0.2, 0.26],
+        [1.0, 0.85, 0.5],
+    );
+
+    // Undercity iron: teal paint chipped off, rust blooming through it and
+    // running down in streaks.
+    let mut rust = paint_over(lin([0.55, 0.24, 0.08]), 0.95, 0.0);
+    rust.channels[CH_HEIGHT] = gray(0.03);
+    out(
+        "Hand-painted rusted plate",
+        vec![
+            painted_base("Iron", [0.17, 0.18, 0.2], [0.3, 0.3, 0.32], 0.7, 0.4, 5.0),
+            fill_layer("Teal paint", paint_over(lin([0.12, 0.42, 0.42]), 0.6, 0.0), Some(mask(1.0, vec![
+                effect(Subtract, 1.0, gen(Generator::EdgeWear, |g| {
+                    g.level = 0.25;
+                    g.noise = 0.7;
+                })),
+                effect(Subtract, 0.9, pat(K::Rust, 2.5, 1.0, |_| {})),
+            ]))),
+            fill_layer("Rust", rust, Some(mask(0.0, vec![
+                effect(Normal, 1.0, pat(K::Rust, 3.5, 4.0, |_| {})),
+                effect(Add, 0.6, gen(Generator::Dirt, |_| {})),
+                effect(Normal, 1.0, levels(0.45, 0.55)),
+            ]))),
+            faded(fill_layer("Rust streaks", tint(lin([0.42, 0.18, 0.06])), Some(mask(0.0, vec![
+                effect(Normal, 1.0, pat(K::Streaks, 2.0, 2.0, |p| p.density = 0.6)),
+            ]))), 0.8),
+            crevices([0.06, 0.04, 0.03], 0.9),
+            edge_light([0.78, 0.8, 0.78], 0.7),
+        ],
+        [0.1, 0.12, 0.2],
+        [0.7, 0.62, 0.5],
+    );
+
+    // A chem pipe: copper, verdigris running down, glowing green pockets.
+    out(
+        "Hand-painted chem copper",
+        vec![
+            painted_base("Copper", [0.52, 0.23, 0.11], [0.8, 0.42, 0.22], 0.45, 0.5, 5.0),
+            fill_layer("Verdigris", paint_over(lin([0.3, 0.66, 0.55]), 0.9, 0.0), Some(mask(0.0, vec![
+                effect(Normal, 1.0, gen(Generator::Dirt, |g| g.noise = 0.5)),
+                effect(Add, 0.8, pat(K::Streaks, 2.5, 6.0, |p| p.density = 0.8)),
+                effect(Overlay, 0.5, strokes(6.0, 13.0)),
+                effect(Normal, 1.0, levels(0.45, 0.55)),
+            ]))),
+            fill_layer("Chem glow", glowing(lin([0.5, 1.0, 0.2])), Some(mask(0.0, vec![
+                effect(Normal, 1.0, pat(K::Rust, 3.0, 9.0, |_| {})),
+                effect(Multiply, 1.0, gen(Generator::Dirt, |g| g.level = 0.2)),
+                effect(Normal, 1.0, levels(0.35, 0.45)),
+            ]))),
+            crevices([0.12, 0.05, 0.02], 0.85),
+            edge_light([1.0, 0.75, 0.5], 0.85),
+        ],
+        [0.2, 0.1, 0.2],
+        [1.0, 0.7, 0.45],
+    );
+
+    // An undercity wall: bricks in deep mortar, neon spray paint splashed
+    // over them, grime rising from the ground.
+    let mut mortar = paint_over(lin([0.3, 0.28, 0.28]), 0.95, 0.0);
+    mortar.channels[CH_HEIGHT] = gray(-0.1);
+    out(
+        "Hand-painted graffiti bricks",
+        vec![
+            painted_base("Brick", [0.42, 0.18, 0.12], [0.62, 0.3, 0.2], 0.85, 0.0, 6.0),
+            faded(fill_layer("Brick tones", tint(lin([0.72, 0.42, 0.28])), Some(mask(0.0, vec![
+                effect(Normal, 1.0, pat(K::Cells, 3.0, 1.0, |_| {})),
+                effect(Normal, 1.0, levels(0.6, 0.62)),
+            ]))), 0.6),
+            fill_layer("Mortar", mortar, Some(mask(0.0, vec![
+                effect(Normal, 1.0, pat(K::Bricks, 3.0, 0.0, |p| p.density = 0.3)),
+                effect(Normal, 1.0, inv_levels(0.3, 0.6)),
+            ]))),
+            fill_layer("Pink spray", paint_over(lin([1.0, 0.18, 0.62]), 0.5, 0.0), Some(mask(0.0, vec![effect(Normal, 1.0, pat(K::Splatter, 2.0, 1.0, |p| p.density = 0.35))]))),
+            fill_layer("Cyan spray", paint_over(lin([0.1, 0.85, 0.95]), 0.5, 0.0), Some(mask(0.0, vec![effect(Normal, 1.0, pat(K::Splatter, 2.6, 7.0, |p| p.density = 0.3))]))),
+            faded(fill_layer("Grime", tint(lin([0.1, 0.08, 0.08])), Some(mask(0.0, vec![
+                effect(Normal, 1.0, low_band(0.3)),
+                effect(Overlay, 0.6, strokes(6.0, 17.0)),
+            ]))), 0.8),
+            crevices([0.08, 0.04, 0.05], 0.85),
+            edge_light([0.95, 0.75, 0.6], 0.7),
+        ],
+        [0.22, 0.1, 0.22],
+        [0.98, 0.66, 0.46],
+    );
+
+    // A magic crystal: flat facets in blues, glowing veins and rims.
+    let (c, proj) = pat_ch(K::Cells, 4.0, lin([0.04, 0.12, 0.36]), lin([0.24, 0.6, 0.95]), |_| {});
+    let mut facets = fill(c, gray(0.2), gray(0.0));
+    facets.projection = proj;
+    out(
+        "Hand-painted hextech crystal",
+        vec![
+            fill_layer("Facets", facets, None),
+            faded(fill_layer("Brushwork", tint(lin([0.5, 0.85, 1.0])), Some(mask(0.0, vec![
+                effect(Normal, 1.0, strokes(6.0, 2.0)),
+                effect(Normal, 1.0, levels(0.75, 0.8)),
+            ]))), 0.4),
+            fill_layer("Energy veins", glowing(lin([0.4, 0.95, 1.0])), Some(mask(0.0, vec![
+                effect(Normal, 1.0, pat(K::Cracks, 4.0, 0.0, |p| p.density = 0.1)),
+                effect(Normal, 1.0, levels(0.5, 0.7)),
+            ]))),
+            fill_layer("Glowing rims", glowing(lin([0.7, 1.0, 1.0])), Some(mask(0.0, vec![effect(Normal, 0.9, gen(Generator::Edges, |g| {
+                g.level = 0.4;
+                g.contrast = 6.0;
+            }))]))),
+            crevices([0.02, 0.02, 0.15], 0.9),
+            edge_light([0.85, 1.0, 1.0], 0.6),
+        ],
+        [0.05, 0.03, 0.28],
+        [0.6, 0.9, 1.0],
+    );
+
+    // A vial of glowing purple: swirls, rising bubbles.
+    let (c, proj) = pat_ch(K::Marble, 2.0, lin([0.16, 0.03, 0.28]), lin([0.55, 0.12, 0.62]), |_| {});
+    let mut glass = fill(c, gray(0.25), gray(0.0));
+    glass.projection = proj;
+    out(
+        "Hand-painted shimmer glass",
+        vec![
+            fill_layer("Glass", glass, None),
+            fill_layer("Swirl glow", glowing(lin([1.0, 0.3, 0.88])), Some(mask(0.0, vec![
+                effect(Normal, 1.0, pat(K::Marble, 2.0, 4.0, |_| {})),
+                effect(Normal, 1.0, levels(0.85, 0.92)),
+            ]))),
+            fill_layer("Bubbles", glowing(lin([1.0, 0.78, 1.0])), Some(mask(0.0, vec![effect(Normal, 1.0, pat(K::Dots, 7.0, 3.0, |p| p.density = 0.1))]))),
+            crevices([0.06, 0.0, 0.12], 0.8),
+            edge_light([1.0, 0.82, 1.0], 0.85),
+        ],
+        [0.1, 0.03, 0.25],
+        [0.95, 0.6, 1.0],
+    );
+
+    // Blue enforcer armor: hammered steel, scratches, bright worn edges.
+    let (h, proj) = pat_ch(K::Cells, 6.0, [-0.03; 3], [0.03; 3], |_| {});
+    let mut dents = relief(h);
+    dents.projection = proj;
+    out(
+        "Hand-painted enforcer steel",
+        vec![
+            painted_base("Steel", [0.28, 0.34, 0.45], [0.45, 0.52, 0.63], 0.5, 0.5, 5.0),
+            fill_layer("Hammered dents", dents, None),
+            faded(fill_layer("Scratches", tint(lin([0.85, 0.88, 0.93])), Some(mask(0.0, vec![effect(Normal, 1.0, pat(K::Scratches, 3.0, 5.0, |p| p.density = 0.3))]))), 0.8),
+            faded(fill_layer("Grime", tint(lin([0.1, 0.1, 0.12])), Some(mask(0.0, vec![
+                effect(Normal, 1.0, gen(Generator::Dirt, |_| {})),
+                effect(Multiply, 1.0, pat(K::Grunge, 3.0, 8.0, |_| {})),
+            ]))), 0.7),
+            crevices([0.04, 0.05, 0.12], 0.9),
+            edge_light([0.95, 0.98, 1.0], 1.0),
+        ],
+        [0.12, 0.13, 0.3],
+        [0.85, 0.86, 0.82],
+    );
+
+    // A worn leather: pores, creases, scuffs, edges rubbed lighter.
+    let (h, proj) = pat_ch(K::Leather, 14.0, [-0.025; 3], [0.02; 3], |_| {});
+    let mut grain = relief(h);
+    grain.projection = proj;
+    let mut crease = tint(lin([0.14, 0.06, 0.03]));
+    crease.channels[CH_HEIGHT] = gray(-0.04);
+    out(
+        "Hand-painted worn leather",
+        vec![
+            painted_base("Leather", [0.3, 0.15, 0.07], [0.46, 0.25, 0.12], 0.65, 0.0, 5.0),
+            fill_layer("Grain", grain, None),
+            faded(fill_layer("Creases", crease, Some(mask(0.0, vec![
+                effect(Normal, 1.0, pat(K::Ridged, 2.5, 3.0, |p| p.contrast = 1.5)),
+                effect(Normal, 1.0, levels(0.72, 0.82)),
+            ]))), 0.75),
+            fill_layer("Rubbed edges", tint(lin([0.72, 0.5, 0.3])), Some(mask(0.0, vec![effect(Normal, 0.85, gen(Generator::EdgeWear, |g| g.noise = 0.6))]))),
+            faded(fill_layer("Scuffs", tint(lin([0.12, 0.05, 0.03])), Some(mask(0.0, vec![effect(Normal, 1.0, pat(K::Scratches, 2.0, 9.0, |p| p.density = 0.5))]))), 0.6),
+            crevices([0.08, 0.03, 0.02], 0.85),
+            edge_light([0.92, 0.7, 0.48], 0.5),
+        ],
+        [0.16, 0.07, 0.14],
+        [0.8, 0.52, 0.3],
+    );
+
+    // A wine coat cloth: weave, faded folds, dust.
+    let (h, proj) = pat_ch(K::Fabric, 40.0, [-0.02; 3], [0.02; 3], |_| {});
+    let mut weave = relief(h);
+    weave.projection = proj;
+    out(
+        "Hand-painted coat cloth",
+        vec![
+            painted_base("Cloth", [0.3, 0.05, 0.1], [0.46, 0.09, 0.15], 0.95, 0.0, 4.0),
+            fill_layer("Weave", weave, None),
+            faded(fill_layer("Weave shade", tint(lin([0.18, 0.02, 0.06])), Some(mask(0.0, vec![
+                effect(Normal, 1.0, pat(K::Fabric, 40.0, 0.0, |_| {})),
+                effect(Normal, 1.0, inv_levels(0.3, 0.5)),
+            ]))), 0.5),
+            faded(fill_layer("Faded", tint(lin([0.62, 0.3, 0.34])), Some(mask(0.0, vec![
+                effect(Normal, 1.0, gen(Generator::Edges, |g| g.level = 0.3)),
+                effect(Multiply, 1.0, strokes(7.0, 4.0)),
+                effect(Normal, 1.0, levels(0.2, 0.4)),
+            ]))), 0.7),
+            faded(fill_layer("Dust", tint(lin([0.55, 0.48, 0.42])), Some(mask(0.0, vec![
+                effect(Normal, 1.0, up_light(0.75, 4.0)),
+                effect(Multiply, 1.0, pat(K::Grunge, 4.0, 3.0, |_| {})),
+            ]))), 0.45),
+            crevices([0.1, 0.0, 0.04], 0.85),
+            edge_light([1.0, 0.62, 0.55], 0.4),
+        ],
+        [0.14, 0.02, 0.16],
+        [0.95, 0.5, 0.36],
+    );
+
+    // Undercity cobblestones: stones of mixed tones in dark gaps, moss.
+    let mut gaps = tint(lin([0.07, 0.06, 0.07]));
+    gaps.channels[CH_HEIGHT] = gray(-0.12);
+    out(
+        "Hand-painted cobblestone",
+        vec![
+            painted_base("Stone", [0.3, 0.3, 0.33], [0.48, 0.47, 0.46], 0.85, 0.0, 5.0),
+            faded(fill_layer("Warm stones", tint(lin([0.52, 0.44, 0.34])), Some(mask(0.0, vec![
+                effect(Normal, 1.0, pat(K::Cells, 3.0, 0.0, |_| {})),
+                effect(Normal, 1.0, levels(0.62, 0.64)),
+            ]))), 0.8),
+            faded(fill_layer("Cool stones", tint(lin([0.26, 0.31, 0.36])), Some(mask(0.0, vec![
+                effect(Normal, 1.0, pat(K::Cells, 3.0, 0.0, |_| {})),
+                effect(Normal, 1.0, inv_levels(0.3, 0.32)),
+            ]))), 0.8),
+            fill_layer("Gaps", gaps, Some(mask(0.0, vec![
+                effect(Normal, 1.0, pat(K::Cracks, 3.0, 0.0, |p| p.density = 0.3)),
+                effect(Normal, 1.0, levels(0.4, 0.6)),
+            ]))),
+            fill_layer("Moss", paint_over(lin([0.3, 0.48, 0.13]), 0.95, 0.0), Some(mask(0.0, vec![
+                effect(Normal, 1.0, up_light(0.7, 3.0)),
+                effect(Multiply, 1.0, pat(K::Grunge, 3.0, 5.0, |_| {})),
+                effect(Add, 0.5, pat(K::Cracks, 3.0, 0.0, |p| p.density = 0.5)),
+                effect(Multiply, 1.0, pat(K::Clouds, 1.5, 6.0, |p| p.contrast = 2.0)),
+                effect(Normal, 1.0, levels(0.35, 0.45)),
+            ]))),
+            crevices([0.05, 0.05, 0.08], 0.85),
+            edge_light([0.88, 0.86, 0.78], 0.7),
+        ],
+        [0.15, 0.16, 0.3],
+        [0.85, 0.8, 0.66],
+    );
+
+    // Weathered planks: long boards in dark seams, grain, old blue-gray
+    // paint left in patches.
+    let mut seams = tint(lin([0.07, 0.035, 0.02]));
+    seams.channels[CH_HEIGHT] = gray(-0.1);
+    out(
+        "Hand-painted weathered planks",
+        vec![
+            painted_base("Wood", [0.36, 0.2, 0.1], [0.55, 0.34, 0.17], 0.8, 0.0, 5.0),
+            faded(fill_layer("Grain", tint(lin([0.22, 0.1, 0.05])), Some(mask(0.0, vec![
+                effect(Normal, 1.0, pat(K::Fibers, 3.0, 0.0, |p| p.contrast = 2.0)),
+                effect(Normal, 1.0, levels(0.58, 0.64)),
+            ]))), 0.85),
+            fill_layer("Old paint", paint_over(lin([0.36, 0.47, 0.52]), 0.7, 0.0), Some(mask(0.0, vec![
+                effect(Normal, 1.0, pat(K::Grunge, 2.0, 4.0, |_| {})),
+                effect(Subtract, 1.0, gen(Generator::EdgeWear, |g| g.noise = 0.6)),
+                effect(Normal, 1.0, levels(0.45, 0.5)),
+            ]))),
+            fill_layer("Seams", seams, Some(mask(0.0, vec![
+                effect(Normal, 1.0, pat(K::Bricks, 3.0, 0.0, |p| {
+                    p.density = 0.15;
+                    p.aspect = 0.25;
+                })),
+                effect(Normal, 1.0, inv_levels(0.3, 0.6)),
+            ]))),
+            crevices([0.08, 0.03, 0.02], 0.85),
+            edge_light([0.95, 0.78, 0.55], 0.8),
+        ],
+        [0.2, 0.1, 0.16],
+        [0.95, 0.7, 0.42],
+    );
+
+    // Painted skin: blush, red in the creases, freckles, cool shade.
+    out(
+        "Hand-painted skin",
+        vec![
+            painted_base("Skin", [0.78, 0.52, 0.42], [0.92, 0.68, 0.56], 0.6, 0.0, 4.0),
+            faded(fill_layer("Blush", tint(lin([0.9, 0.42, 0.4])), Some(mask(0.0, vec![
+                effect(Normal, 1.0, pat(K::Clouds, 1.2, 2.0, |p| p.contrast = 1.5)),
+                effect(Normal, 1.0, levels(0.5, 0.8)),
+                effect(Add, 0.6, gen(Generator::Cavity, |g| g.level = 0.1)),
+            ]))), 0.55),
+            faded(fill_layer("Freckles", tint(lin([0.6, 0.32, 0.2])), Some(mask(0.0, vec![effect(Normal, 1.0, pat(K::Dots, 22.0, 1.0, |p| p.density = 0.05))]))), 0.7),
+            crevices([0.5, 0.15, 0.16], 0.7),
+            edge_light([1.0, 0.92, 0.84], 0.5),
+        ],
+        [0.52, 0.32, 0.46],
+        [1.0, 0.88, 0.74],
+    );
+}
+
 /// The starter smart materials, built on the starter texture materials
 /// (a recipe whose material is missing is left out).
 pub fn smart_materials() -> Vec<SmartMaterialPreset> {
@@ -700,6 +1161,7 @@ pub fn smart_materials() -> Vec<SmartMaterialPreset> {
             effect(Normal, 1.0, levels(0.2, 0.5)),
         ]))),
     ]);
+    hand_painted_smart_materials(&mut |name, layers| out.push(SmartMaterialPreset { name: name.into(), tree: folder(name, layers), textures: Vec::new() }));
     out
 }
 
@@ -1013,9 +1475,9 @@ pub fn starter_dir() -> Option<PathBuf> {
 /// Material categories of the shelf, in display order.
 pub const MATERIAL_CATEGORIES: [&str; 11] = ["Wood", "Metal", "Stone", "Concrete", "Brick", "Tiles", "Plaster", "Ground", "Fabric", "Leather", "Plastic"];
 
-/// The texture materials of the starter assets, by name. Names are unique
-/// (their shelf key).
-pub fn texture_materials() -> Vec<TexMaterial> {
+/// The texture material in `dir` (its `material.json` and maps; the
+/// category defaults to the parent folder's name).
+pub fn tex_material_at(dir: &Path) -> Option<TexMaterial> {
     #[derive(Deserialize)]
     struct Meta {
         name: String,
@@ -1026,33 +1488,91 @@ pub fn texture_materials() -> Vec<TexMaterial> {
         #[serde(default)]
         metal: bool,
     }
-    let Some(root) = starter_dir().map(|d| d.join("materials")) else { return Vec::new() };
-    let mut out: Vec<TexMaterial> = Vec::new();
-    let Ok(cats) = std::fs::read_dir(&root) else { return Vec::new() };
-    for cat in cats.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.is_dir()) {
-        let folder = cat.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let Ok(rd) = std::fs::read_dir(&cat) else { continue };
-        for dir in rd.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.is_dir()) {
-            let Some(meta) = std::fs::read(dir.join("material.json")).ok().and_then(|b| serde_json::from_slice::<Meta>(&b).ok()) else {
-                continue;
-            };
-            // Rock, marble, onyx... are one Stone category.
-            let category = match meta.category.unwrap_or_else(|| folder.clone()).as_str() {
-                "Rock" | "Marble" | "Onyx" | "Granite" | "Terrazzo" => "Stone".to_string(),
-                c => c.to_string(),
-            };
-            let m = TexMaterial {
-                name: meta.name,
-                category,
-                dir,
-                source: meta.source.unwrap_or_default(),
-                metal: meta.metal,
-                downloads: meta.downloads,
-            };
-            if m.map("color").is_some() {
-                out.push(m);
+    let meta: Meta = serde_json::from_slice(&std::fs::read(dir.join("material.json")).ok()?).ok()?;
+    let folder = dir.parent().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    // Rock, marble, onyx... are one Stone category.
+    let category = match meta.category.unwrap_or(folder).as_str() {
+        "Rock" | "Marble" | "Onyx" | "Granite" | "Terrazzo" => "Stone".to_string(),
+        c => c.to_string(),
+    };
+    let m = TexMaterial { name: meta.name, category, dir: dir.to_path_buf(), source: meta.source.unwrap_or_default(), metal: meta.metal, downloads: meta.downloads };
+    m.map("color").is_some().then_some(m)
+}
+
+/// The texture materials of the starter assets and the library, by name.
+/// Names are unique (their shelf key).
+/// Each texture material's average color (sRGB hex) and average roughness
+/// (None without a roughness map), read from its maps the first time and
+/// kept in `material_stats.json` (Muse picks the scan whose real look is
+/// closest to what is asked).
+pub fn material_stats(mats: &[TexMaterial]) -> Vec<(Option<String>, Option<f32>)> {
+    use rayon::prelude::*;
+    let file = library_dir().join("..").join("material_stats.json");
+    let mut cache: std::collections::HashMap<String, (Option<String>, Option<f32>)> =
+        std::fs::read(&file).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    let stamp = |p: &Path| p.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
+    let key = |m: &TexMaterial| {
+        let c = m.map("color");
+        format!("{}|{}", m.dir.display(), c.as_deref().map_or(0, stamp))
+    };
+    // The average of a map, on a grid of about 64k samples.
+    let average = |p: Option<PathBuf>| -> Option<[f32; 3]> {
+        let img = image::open(p?).ok()?.to_rgb8();
+        let step = ((img.width() as u64 * img.height() as u64 / 65536) as f32).sqrt().max(1.0) as u32;
+        let (mut sum, mut n) = ([0f64; 3], 0f64);
+        for y in (0..img.height()).step_by(step as usize) {
+            for x in (0..img.width()).step_by(step as usize) {
+                let px = img.get_pixel(x, y).0;
+                for c in 0..3 {
+                    sum[c] += px[c] as f64;
+                }
+                n += 1.0;
             }
         }
+        (n > 0.0).then(|| sum.map(|s| (s / n) as f32))
+    };
+    let missing: Vec<&TexMaterial> = mats.iter().filter(|m| !cache.contains_key(&key(m))).collect();
+    if !missing.is_empty() {
+        let found: Vec<(String, (Option<String>, Option<f32>))> = missing
+            .par_iter()
+            .map(|m| {
+                let color = average(m.map("color")).map(|c| format!("#{:02x}{:02x}{:02x}", c[0] as u8, c[1] as u8, c[2] as u8));
+                let rough = average(m.map("roughness")).map(|c| (c[0] / 255.0 * 100.0).round() / 100.0);
+                (key(m), (color, rough))
+            })
+            .collect();
+        cache.extend(found);
+        if let Ok(b) = serde_json::to_vec(&cache) {
+            let _ = std::fs::write(&file, b);
+        }
+    }
+    mats.iter().map(|m| cache.get(&key(m)).cloned().unwrap_or((None, None))).collect()
+}
+
+/// The texture materials under `root` (`<category>/<material>`).
+fn tex_materials_in(root: &Path, out: &mut Vec<TexMaterial>) {
+    let Ok(cats) = std::fs::read_dir(root) else { return };
+    for cat in cats.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.is_dir()) {
+        let Ok(rd) = std::fs::read_dir(&cat) else { continue };
+        out.extend(rd.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.is_dir()).filter_map(|d| tex_material_at(&d)));
+    }
+}
+
+/// The scans Muse downloaded (ambientCG): project assets, shown only with
+/// the projects that use them.
+pub fn scan_materials() -> Vec<TexMaterial> {
+    let mut out = Vec::new();
+    tex_materials_in(&crate::ambientcg::scans_dir(), &mut out);
+    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    out
+}
+
+pub fn texture_materials() -> Vec<TexMaterial> {
+    // The starter assets, then the user's own in the library.
+    let roots = [starter_dir().map(|d| d.join("materials")), Some(library_dir().join("materials"))];
+    let mut out: Vec<TexMaterial> = Vec::new();
+    for root in roots.into_iter().flatten() {
+        tex_materials_in(&root, &mut out);
     }
     // One list by name, like Painter's shelf.
     out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()).then(b.downloads.cmp(&a.downloads)));

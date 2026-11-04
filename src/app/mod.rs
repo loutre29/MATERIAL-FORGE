@@ -1,6 +1,7 @@
 //! The application: state, frame loop and GPU orchestration. UI pieces live
 //! in the submodules (panels, viewport input, shelf, dialogs).
 
+mod autosave;
 mod autouv;
 mod dialogs;
 mod dock;
@@ -13,19 +14,25 @@ mod polysel;
 mod uvgizmo;
 mod layers;
 mod layout;
+mod muse;
+mod muse_light;
+mod photo;
+mod pieces;
 mod panels;
 mod path;
 mod props;
 mod region;
 mod selection;
 mod shelf;
+mod studio_panel;
 mod crawl;
 mod uitest;
 mod view3d;
 mod widgets;
 
 pub use crawl::ui_crawl;
-pub use uitest::{ui_bench, ui_smoke};
+pub use muse::view_shot as muse_view_shot;
+pub use uitest::{muse_test, ui_bench, ui_smoke};
 
 /// Set by the headless UI tests: native file dialogs would block them.
 pub static HEADLESS: AtomicBool = AtomicBool::new(false);
@@ -290,6 +297,8 @@ pub struct ViewSettings {
     pub show_properties: bool,
     /// Path-traced render mode.
     pub path_trace: bool,
+    /// The packshot studio: its lights, background, lens and frame.
+    pub studio: bool,
 }
 
 impl Default for ViewSettings {
@@ -303,7 +312,8 @@ impl Default for ViewSettings {
             bg_blur: 4.0,
             bg_intensity: 1.0,
             flat_bg: true,
-            // The real application's defaults: linear tone mapping, no post effects.
+            // Linear (clamp) tone mapping (the user's choice), no post
+            // effects.
             tonemap: 3,
             bloom: 0.0,
             bloom_threshold: 1.5,
@@ -327,6 +337,7 @@ impl Default for ViewSettings {
             split: 0.5,
             show_properties: true,
             path_trace: false,
+            studio: false,
         }
     }
 }
@@ -596,6 +607,16 @@ pub struct RetroApp {
     import_dialog: Option<ImportDialog>,
     bake_job: Option<BakeJob>,
     show_view_settings: bool,
+    /// The lights the last setup replaced ("Back to my lights").
+    studio_prev: Option<crate::studio::Studio>,
+    /// "Render every angle": the shots still to render after the current one.
+    studio_queue: Vec<(crate::camera::OrbitCamera, crate::studio::Studio, PathBuf)>,
+    /// The packshot being rendered.
+    studio_job: Option<studio_panel::StudioJob>,
+    /// The view's field of view while the studio's lens replaces it.
+    studio_fov: Option<f32>,
+    /// Frames left to center the model in the studio's frame (entering it).
+    studio_recenter: u8,
     show_set_settings: bool,
     show_prefs: bool,
     /// Single-key shortcuts (editable in the Shortcuts window) and the
@@ -635,9 +656,10 @@ pub struct RetroApp {
     /// and the triangle centers per submesh (mesh pointer, generation).
     sort_key: u64,
     tri_centers: Option<((usize, u64), Arc<Vec<Vec<Vec3>>>)>,
+    /// When the project was last autosaved (or last unmodified).
     last_autosave: Instant,
-    /// Minutes between autosaves (0 = off).
-    autosave_minutes: f32,
+    /// Autosave settings (Preferences, saved in autosave.json).
+    autosave: autosave::Autosave,
     /// Which floating panels show (None: the default arrangement).
     dock: Option<dock::Panels>,
     /// Read and write the user's panel arrangement (off in tests and benches).
@@ -650,6 +672,8 @@ pub struct RetroApp {
     gesture: Option<BrushGesture>,
     /// The canvas between the floating panels (bars and overlays center on it).
     canvas_mid: Rect,
+    /// Split view: the mouse is (or last was) over the 2D view (F frames it alone).
+    last_view_2d: bool,
     /// Tool dock: the entry each group shows (its last used tool).
     dock_last: Vec<dock::DockItem>,
     /// Where the display settings (0) and history (1) flyouts hang from.
@@ -665,6 +689,8 @@ pub struct RetroApp {
     layout_saved: (Instant, String),
     /// The Texture Set Settings tab was drawn this frame (mesh map thumbnails).
     set_settings_visible: bool,
+    /// The Muse panel: texturing by prompt (Meta Model API).
+    muse: muse::Muse,
     /// Logo texture for the start screen.
     logo_tex: Option<egui::TextureHandle>,
     /// Warning over the viewport (message, when).
@@ -690,6 +716,9 @@ pub struct RetroApp {
     /// History version when edits were last tracked: undo / redo / pushes
     /// since then (even outside a frame) are not edits of their own.
     tracked_history: u64,
+    /// The studio settings at the end of the last frame (their edits are
+    /// undo steps too).
+    pub(crate) tracked_studio: Option<crate::studio::Studio>,
     /// Quick properties popup position (plain right click in the viewport).
     quick_props: Option<egui::Pos2>,
     /// Tool to restore after the temporary color picker (P).
@@ -766,6 +795,11 @@ impl RetroApp {
         ctx: &egui::Context,
         startup: Option<PathBuf>,
     ) -> Self {
+        // Before anything reads the library (thumbnails, material stats).
+        let scans = crate::ambientcg::move_scans_out_of_library();
+        if scans > 0 {
+            eprintln!("{scans} Muse scans moved out of the library");
+        }
         style::apply(ctx);
         RetroApp {
             engine,
@@ -842,6 +876,11 @@ impl RetroApp {
             import_dialog: None,
             bake_job: None,
             show_view_settings: false,
+            studio_prev: None,
+            studio_queue: Vec::new(),
+            studio_job: None,
+            studio_fov: None,
+            studio_recenter: 0,
             show_set_settings: false,
             show_prefs: false,
             keymap: keymap::Keymap::load(),
@@ -868,12 +907,13 @@ impl RetroApp {
             sort_key: 0,
             tri_centers: None,
             last_autosave: Instant::now(),
-            autosave_minutes: 10.0,
+            autosave: autosave::Autosave::load(),
             dock: None,
             persist_layout: true,
             lock_cursor: true,
             gesture: None,
             canvas_mid: Rect::NOTHING,
+            last_view_2d: false,
             dock_rect: Rect::NOTHING,
             options_rect: Rect::NOTHING,
             layout_loaded: false,
@@ -882,6 +922,7 @@ impl RetroApp {
             flyout_at: [None; 2],
             status_shown: (String::new(), Instant::now()),
             set_settings_visible: false,
+            muse: muse::Muse::new(),
             logo_tex: None,
             toast: None,
             close_prompt: false,
@@ -899,6 +940,7 @@ impl RetroApp {
             tracked: None,
             tracked_doc: 0,
             tracked_history: 0,
+            tracked_studio: None,
             quick_props: None,
             prev_tool: None,
             ui_hidden: false,
@@ -948,6 +990,9 @@ impl RetroApp {
         let (min, max) = (mesh.bbox_min, mesh.bbox_max);
         let tris = mesh.triangle_count();
         let sets = mesh.submeshes.len();
+        // Many texture sets: a resolution that fits the GPU memory.
+        let asked = res;
+        let res = Document::fitting_resolution(sets, res);
         let doc = Document::new(&self.engine, mesh, name.clone(), res);
         let empty: Vec<String> =
             doc.sets.iter().filter(|s| !s.raster.tri.iter().any(|t| *t >= 0)).map(|s| s.name.clone()).collect();
@@ -962,6 +1007,9 @@ impl RetroApp {
             self.message(format!("Texture set '{e}' has degenerate UVs (zero area): it cannot be painted."));
         }
         self.message(format!("Imported '{name}': {tris} triangles, {sets} texture set(s) at {res}x{res}"));
+        if res < asked {
+            self.message(format!("{sets} texture sets at {asked} px would not fit in the graphics card's memory: imported at {res} px."));
+        }
         Ok(())
     }
 
@@ -1135,6 +1183,7 @@ impl RetroApp {
                     doc.path = Some(path.clone());
                     doc.modified = false;
                 }
+                self.last_autosave = Instant::now();
                 crate::library::add_recent(&path);
                 self.message(format!("Saved {}", path.display()));
             }
@@ -1334,11 +1383,25 @@ impl RetroApp {
     fn track_edits(&mut self, history_len_before: u64) {
         let Some(doc) = &mut self.doc else {
             self.tracked = None;
+            self.tracked_studio = None;
             return;
         };
         let set = doc.active;
         let hash = doc.sets[set].fingerprint_hash();
         let explicit = self.history.version != history_len_before || self.history.version != self.tracked_history;
+        // Studio edits: one step per slider drag (frames close together merge).
+        match self.tracked_studio.take() {
+            Some(old) if old != doc.studio && !explicit && self.tracked_doc == self.generation => {
+                doc.modified = true;
+                let merge = matches!(self.history.undo.last(), Some(Entry::Studio { .. })) && self.last_edit.elapsed().as_secs_f32() < 0.8;
+                if !merge {
+                    self.history.push(Entry::Studio { label: "Edit studio".into(), studio: Box::new(old) });
+                }
+                self.last_edit = Instant::now();
+            }
+            _ => {}
+        }
+        self.tracked_studio = Some(doc.studio.clone());
         match self.tracked.take() {
             Some((s, h, state)) if s == set && h != hash && !explicit && self.tracked_doc == self.generation => {
                 doc.modified = true;
@@ -1509,13 +1572,21 @@ impl RetroApp {
             }
         }
         self.sort_blended();
+        self.studio_camera();
+        let studio_busy = self.studio_step(&mut encoder);
+        let studio = self.studio_gpu();
         let vp = &self.engine.viewport;
         let aspect = vp.width as f32 / vp.height as f32;
         let view_proj = self.camera.view_proj(aspect);
         let (light_dir, light_vp) = self.key_light();
         let env = &self.engine.env;
         let v = &self.view;
-        let (disp, disp_kind) = v.display.code();
+        let (mut disp, disp_kind) = v.display.code();
+        // Muse's pieces over the material view.
+        let pieces = v.display == Display::Material && self.muse.piece_tex(0).is_some();
+        if pieces {
+            disp = 13.0;
+        }
         let raw = disp > 0.5;
         let diag = self.doc.as_ref().map(|d| d.mesh.diagonal()).unwrap_or(1.0);
         let camera = CameraUniform {
@@ -1539,13 +1610,14 @@ impl RetroApp {
             Some(doc) => doc
                 .sets
                 .iter()
-                .map(|s| DrawSet {
+                .enumerate()
+                .map(|(i, s)| DrawSet {
                     submesh: s.submesh,
                     base: &s.gpu.final_base,
                     orm: &s.gpu.final_orm,
                     normal: &s.gpu.final_normal,
                     emissive: &s.gpu.final_emissive,
-                    display: display_texture(s, v.display),
+                    display: self.muse.piece_tex(i).filter(|_| pieces).unwrap_or_else(|| display_texture(s, v.display)),
                     params: SetUniform {
                         k: [
                             s.shader_alpha(),
@@ -1575,13 +1647,14 @@ impl RetroApp {
                 }
                 (v.env_rotation.to_bits(), v.flat_bg, v.bg_blur.to_bits(), v.bg_intensity.to_bits(), env.name.as_str()).hash(&mut h);
                 (vp.width, vp.height, self.engine.pathtracer.bounces).hash(&mut h);
+                bytemuck::bytes_of(&studio).hash(&mut h);
                 h.finish()
             };
             if key != self.pt_key || composited {
                 self.pt_key = key;
                 self.engine.pathtracer.reset();
             }
-            if !self.engine.pathtracer.done() {
+            if !self.engine.pathtracer.done() && !studio_busy {
                 let mut emi = [0.0f32; 8];
                 let (mut am, mut cut) = ([0.0f32; 8], [0.5f32; 8]);
                 let slots: Vec<[&crate::engine::Tex; 4]> = doc
@@ -1609,7 +1682,7 @@ impl RetroApp {
                     cut_b: [cut[4], cut[5], cut[6], cut[7]],
                 };
                 let hdr = self.engine.viewport.hdr();
-                self.engine.pathtracer.render(&self.engine.device, &mut encoder, u, &slots, &self.engine.env.view, hdr);
+                self.engine.pathtracer.render(&self.engine.device, &mut encoder, u, &slots, &self.engine.env.view, hdr, &studio);
             }
         }
         // The denoised image (Open Image Denoise) over the path traced one.
@@ -1699,6 +1772,9 @@ impl RetroApp {
         if pt {
             self.engine.pathtracer.after_submit(&self.engine.device, &self.engine.queue);
         }
+        if studio_busy {
+            self.studio_finish();
+        }
     }
 
     /// Sorts the triangles of alpha blended sets back to front when the
@@ -1733,30 +1809,6 @@ impl RetroApp {
         let ortho = self.camera.ortho;
         let doc = self.doc.as_mut().unwrap();
         crate::document::sort_blended(doc, &self.engine, &centers, &blended, eye, fwd, ortho);
-    }
-
-    /// Saves a recovery copy of a modified project every few minutes to
-    /// %APPDATA%\SP_RETRO\autosave (the project file itself is untouched).
-    fn autosave(&mut self) {
-        if self.autosave_minutes <= 0.0 || self.stroke.is_some() || self.bake_job.is_some() {
-            return;
-        }
-        if self.last_autosave.elapsed().as_secs_f32() < self.autosave_minutes * 60.0 {
-            return;
-        }
-        self.last_autosave = Instant::now();
-        let Some(doc) = &self.doc else { return };
-        if !doc.modified {
-            return;
-        }
-        let dir = crate::library::library_dir().parent().map(|p| p.join("autosave")).unwrap_or_else(|| PathBuf::from("autosave"));
-        let _ = std::fs::create_dir_all(&dir);
-        let name: String = doc.mesh_name.chars().map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { '_' }).collect();
-        let path = dir.join(format!("{name}_autosave.sprp"));
-        match project::save(&self.engine, doc, &self.camera, &path) {
-            Ok(()) => self.status = format!("Autosaved to {}", path.display()),
-            Err(e) => self.status = format!("Autosave failed: {e:#}"),
-        }
     }
 
     /// Refreshes the layer stack thumbnails of the active set (throttled).
@@ -1797,6 +1849,10 @@ impl RetroApp {
         let mut fills = Vec::new();
         crate::document::visit(&s.layers, &mut |l| {
             if let crate::document::LayerKind::Fill(f) = &l.desc.kind {
+                // Only fills with a base color map show a ball.
+                if !layers::fill_has_ball(f) {
+                    return;
+                }
                 let mut h = std::collections::hash_map::DefaultHasher::new();
                 format!("{f:?}").hash(&mut h);
                 (look.key(), &env, &base).hash(&mut h);
@@ -2204,10 +2260,24 @@ impl RetroApp {
         if rb {
             self.brush.size = (self.brush.size * 1.15).min(1000.0);
         }
+        // F frames the view under the mouse (in Split, the one it was over last).
+        if let Some(p) = ctx.input(|i| i.pointer.hover_pos()) {
+            if self.view.layout == Layout::Both && self.canvas_mid.contains(p) {
+                self.last_view_2d = self.uv_rect.contains(p);
+            }
+        }
         if f {
-            self.frame_mesh();
-            self.view.uv_zoom = 0.0;
-            self.view.uv_rot = 0.0;
+            let uv = match self.view.layout {
+                Layout::Only3D => false,
+                Layout::Only2D => true,
+                Layout::Both => self.last_view_2d,
+            };
+            if uv {
+                self.view.uv_zoom = 0.0;
+                self.view.uv_rot = 0.0;
+            } else {
+                self.frame_mesh();
+            }
         }
         // C / Shift + C: material and channels, N / Shift + N: mesh maps.
         let cycle = |cur: Display, range: std::ops::RangeInclusive<usize>, step: isize| -> Display {
@@ -2457,6 +2527,7 @@ pub fn apply_bake(engine: &Engine, s: &mut TextureSet, r: &bake::BakeResult) {
     g.baked_thickness.write_bytes(q, &f32_to_f16_bytes(&r.thickness));
     g.baked_id.write_bytes(q, &f32_to_f16_bytes(bytemuck::cast_slice(&r.id)));
     s.baked = true;
+    s.removed_maps = 0;
     s.bake_rev += 1;
     s.dirty = true;
 }
@@ -2532,7 +2603,12 @@ impl RetroApp {
             }
         }
         if let Some(res) = self.pending_res.take() {
-            if let Some(doc) = &mut self.doc {
+            let fits = self.doc.as_ref().is_some_and(|doc| {
+                Document::sets_bytes(doc.sets.iter().enumerate().map(|(i, s)| if i == doc.active { res } else { s.resolution() })) <= crate::document::SET_BUDGET
+            });
+            if !fits && self.doc.is_some() {
+                self.message(format!("{res} px would not fit in the graphics card's memory with the other texture sets: resolution kept."));
+            } else if let Some(doc) = &mut self.doc {
                 let set = doc.active;
                 doc.change_resolution(&self.engine, set, res);
                 self.history.clear();
@@ -2543,7 +2619,10 @@ impl RetroApp {
         }
         let dropped = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect::<Vec<_>>());
         for p in &dropped {
-            self.open_path(p);
+            // Images dropped on the Muse panel are references for Muse.
+            if !self.muse_drop(ctx, p) {
+                self.open_path(p);
+            }
         }
 
         let history_len_before = self.history.version;
@@ -2614,13 +2693,13 @@ impl RetroApp {
             self.update_brush_ball();
             self.prof("update_brush_ball", t);
         }
-        if self.view.path_trace && !self.engine.pathtracer.done() {
+        if self.studio_job.is_some() || (self.view.path_trace && !self.engine.pathtracer.done()) {
             ctx.request_repaint();
         } else if self.view.path_trace && self.engine.pathtracer.denoise_pending() {
             ctx.request_repaint_after(std::time::Duration::from_millis(30));
         }
         let t = Instant::now();
-        self.autosave();
+        self.autosave(ctx);
         self.prof("autosave", t);
         let t = Instant::now();
         self.generate_thumbnails(ctx);

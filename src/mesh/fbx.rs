@@ -459,7 +459,7 @@ pub fn load(path: &Path) -> Result<RawMesh> {
                 .get(mat_slot.max(0) as usize)
                 .and_then(|m| materials.get(m))
                 .cloned()
-                .unwrap_or_else(|| if model_name.is_empty() { "DefaultMaterial".into() } else { model_name.clone() });
+                .unwrap_or_else(|| "DefaultMaterial".into());
             let g = *group_of.entry(name.clone()).or_insert_with(|| {
                 raw.groups.push((name.clone(), Vec::new(), Vec::new()));
                 raw.polys.push(Vec::new());

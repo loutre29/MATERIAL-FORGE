@@ -267,6 +267,14 @@ impl Previewer {
         p
     }
 
+    /// Fill layer rows: a ball filling the frame in the studio light, like
+    /// the library's material thumbnails (not graded like the viewport).
+    pub fn new_layer(engine: &Engine) -> Self {
+        let mut p = Self::with_mesh(engine, material_ball(), true, 1024, THUMB);
+        p.camera.distance *= 0.8;
+        p
+    }
+
     /// Procedural textures preview flat, seen straight on.
     pub fn new_flat(engine: &Engine) -> Self {
         let mut p = Self::with_mesh(engine, flat_square(), false, RES, THUMB);
@@ -280,6 +288,11 @@ impl Previewer {
     /// show wear and dirt the way the real application's previews do.
     pub fn new_box(engine: &Engine) -> Self {
         Self::with_mesh(engine, rounded_cube(), false, RES, THUMB)
+    }
+
+    /// A large rounded box (smart material checks).
+    pub fn sized_box(engine: &Engine, res: u32, size: u32) -> Self {
+        Self::with_mesh(engine, rounded_cube(), false, res, size)
     }
 
     fn with_mesh(engine: &Engine, mesh: MeshData, ball: bool, res: u32, size: u32) -> Self {

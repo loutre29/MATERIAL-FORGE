@@ -1,7 +1,9 @@
 //! The canvas layout (docs/design/material_forge_design_system.html): the
-//! views fill the window; rounded panels float over them (project and
-//! layers on the left, library top right, properties bottom right); the
-//! tools live in one dock at the bottom with their options right above it;
+//! views fill the window; rounded panels dock over them, Painter style
+//! (by default layers top left, library bottom left, Muse top right and
+//! properties under it; a header carries a panel to the other column,
+//! or the library to the bottom); the tools live in one dock at the bottom
+//! of the free canvas with their options right above it;
 //! the view controls sit in a bar at the top center, Export top right.
 
 use super::icons::{self, Icon};
@@ -18,10 +20,13 @@ pub enum Tab {
     TextureSets,
     Layers,
     SetSettings,
+    Muse,
+    /// The packshot studio (shows while the studio is on).
+    Studio,
 }
 
 impl Tab {
-    pub const PANELS: [Tab; 5] = [Tab::Layers, Tab::Assets, Tab::Properties, Tab::TextureSets, Tab::SetSettings];
+    pub const PANELS: [Tab; 7] = [Tab::Layers, Tab::Assets, Tab::Properties, Tab::TextureSets, Tab::SetSettings, Tab::Muse, Tab::Studio];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -31,12 +36,32 @@ impl Tab {
             Tab::TextureSets => "Texture sets",
             Tab::Layers => "Layers",
             Tab::SetSettings => "Texture set settings",
+            Tab::Muse => "Muse",
+            Tab::Studio => "Packshot studio",
         }
     }
 }
 
+/// Where a panel docks: the left or right column (stacked top down), or
+/// the strip along the bottom between them (the library only).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+pub enum Slot {
+    Left,
+    Right,
+    Bottom,
+}
+
+/// The docked panels, in `Panels` array order.
+pub const PANEL_IDS: [&str; NP] = ["left", "library", "properties", "set settings", "muse", "studio"];
+const NP: usize = 6;
+const LAYERS: usize = 0;
+const LIBRARY: usize = 1;
+const MUSE: usize = 4;
+const STUDIO: usize = 5;
+
 /// Which panels show and where. `RetroApp::dock` None is the default
-/// arrangement. Saved between sessions (`layout_v3.json`).
+/// arrangement. Saved between sessions (`layout_v6.json`; a v5 one is
+/// read with the studio panel added).
 #[derive(Clone, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct Panels {
@@ -45,22 +70,30 @@ pub struct Panels {
     pub left: bool,
     pub library: bool,
     pub properties: bool,
-    /// The texture set settings window.
+    /// The texture set settings panel.
     pub set_settings: bool,
-    /// Library / properties split of the right column (0..1).
-    pub right_split: f32,
-    /// Docked widths of the left panel and of the right column.
+    /// The Muse panel (texturing by prompt).
+    pub muse: bool,
+    /// Where each panel docks (layers, library, properties, set settings,
+    /// Muse, studio).
+    pub slots: [Slot; NP],
+    /// Their order in a column, top first.
+    pub order: [u8; NP],
+    /// Their share of the column's height.
+    pub weights: [f32; NP],
+    /// Widths of the left and right columns.
     pub left_w: f32,
     pub right_w: f32,
-    /// Floating panels (left, library, properties): their rect (x0, y0,
-    /// x1, y1) once moved or resized away from their docked place.
-    pub rects: [Option<[f32; 4]>; 3],
+    /// Height of the bottom strip.
+    pub bottom_h: f32,
     /// Panels can neither move nor resize.
     pub locked: bool,
     /// Split view: the UV on the left, the 3D on the right (F4).
     pub swap_views: bool,
     /// Split view: where the divider sits (0..1).
     pub view_split: f32,
+    /// The views shown: 0 3D, 1 split, 2 UV.
+    pub view_layout: u8,
 }
 
 impl Default for Panels {
@@ -71,23 +104,198 @@ impl Default for Panels {
             library: true,
             properties: true,
             set_settings: false,
-            right_split: 0.46,
+            muse: true,
+            // Layers top left, library bottom left (set settings between
+            // them when shown); Muse top right, properties under it.
+            // The studio (while it is on) on top of the right column.
+            slots: [Slot::Left, Slot::Left, Slot::Right, Slot::Left, Slot::Right, Slot::Right],
+            order: [0, 2, 2, 1, 1, 0],
+            weights: [1.0, 0.75, 0.62, 0.7, 0.38, 1.0],
             left_w: LEFT_W,
             right_w: RIGHT_W,
-            rects: [None; 3],
+            bottom_h: BOTTOM_H,
             locked: false,
             swap_views: false,
             view_split: 0.5,
+            view_layout: 0,
         }
     }
 }
 
+impl Panels {
+    /// A panel's slot (only the library goes to the bottom).
+    pub fn slot(&self, i: usize) -> Slot {
+        match self.slots[i] {
+            Slot::Bottom if i != LIBRARY => Slot::Right,
+            s => s,
+        }
+    }
+
+    /// The studio panel follows the studio (`RetroApp::canvas_ui`).
+    fn shown(&self) -> [bool; NP] {
+        [self.left, self.library, self.properties, self.set_settings, self.muse, false]
+    }
+
+    /// The shown panels of a column, top first.
+    fn column(&self, s: Slot, shown: [bool; NP]) -> Vec<usize> {
+        let mut v: Vec<usize> = (0..NP).filter(|&i| shown[i] && self.slot(i) == s).collect();
+        v.sort_by_key(|&i| (self.order[i], i));
+        v
+    }
+
+    /// Panel `i` docked to `s`, before panel `before` (None: last).
+    pub fn docked(&self, i: usize, s: Slot, before: Option<usize>) -> Panels {
+        let mut q = self.clone();
+        let shown = self.shown();
+        let others = self.column(s, shown).into_iter().filter(|&j| j != i).collect::<Vec<_>>();
+        if self.slot(i) != s && !others.is_empty() {
+            // It takes an average share of its new column.
+            q.weights[i] = others.iter().map(|&j| self.weights[j].max(0.05)).sum::<f32>() / others.len() as f32;
+        }
+        q.slots[i] = s;
+        let mut all: Vec<usize> = (0..NP).filter(|&j| j != i && q.slot(j) == s).collect();
+        all.sort_by_key(|&j| (self.order[j], j));
+        let at = before.and_then(|b| all.iter().position(|&j| j == b)).unwrap_or(all.len());
+        all.insert(at, i);
+        for (k, &j) in all.iter().enumerate() {
+            q.order[j] = k as u8;
+        }
+        q
+    }
+}
+
 fn layout_path() -> std::path::PathBuf {
-    crate::library::library_dir().join("..").join("layout_v3.json")
+    crate::library::library_dir().join("..").join("layout_v6.json")
+}
+
+/// The saved arrangement: v6, or v5 (five panels) with the studio panel
+/// on top of the right column.
+fn read_layout() -> Option<Panels> {
+    if let Some(p) = std::fs::read_to_string(layout_path()).ok().and_then(|t| serde_json::from_str::<Panels>(&t).ok()) {
+        return Some(p);
+    }
+    let old = crate::library::library_dir().join("..").join("layout_v5.json");
+    let mut v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(old).ok()?).ok()?;
+    for (k, extra) in [("slots", serde_json::json!("Right")), ("order", serde_json::json!(0)), ("weights", serde_json::json!(1.0))] {
+        let a = v.get_mut(k)?.as_array_mut()?;
+        if a.len() == NP - 1 {
+            a.push(extra);
+        }
+    }
+    let mut p: Panels = serde_json::from_value(v).ok()?;
+    // The right column's panels go one down, under the studio.
+    for i in 0..STUDIO {
+        if p.slot(i) == Slot::Right {
+            p.order[i] = p.order[i].saturating_add(1);
+        }
+    }
+    Some(p)
 }
 
 pub const LEFT_W: f32 = 272.0;
 pub const RIGHT_W: f32 = 312.0;
+pub const BOTTOM_H: f32 = 280.0;
+/// Room left between stacked panels (their split grip).
+const STACK_GAP: f32 = 8.0;
+/// The smallest height of a stacked panel.
+const MIN_PANEL_H: f32 = 120.0;
+
+/// Where the shown panels go on `screen`.
+pub(super) struct Placed {
+    /// Each panel's rect (None: hidden).
+    pub rects: [Option<Rect>; NP],
+    /// The free canvas between them.
+    pub mid: Rect,
+    /// The left and right columns: their area and their panels, top first.
+    pub cols: [(Rect, Vec<usize>); 2],
+}
+
+pub(super) fn place(p: &Panels, screen: Rect, shown: [bool; NP]) -> Placed {
+    let g = crate::style::GAP;
+    let (lw, rw) = (p.left_w.clamp(220.0, 520.0), p.right_w.clamp(260.0, 620.0));
+    let left = p.column(Slot::Left, shown);
+    let right = p.column(Slot::Right, shown);
+    let bottom_on = shown[LIBRARY] && p.slot(LIBRARY) == Slot::Bottom;
+    // The left column starts under the corner menu, which shows while the
+    // layers panel (the menu's home) is hidden; the right one under the
+    // Export bar.
+    let ltop = screen.min.y + g + if shown[LAYERS] { 0.0 } else { 42.0 };
+    let rtop = screen.min.y + g + 42.0;
+    let bottom = screen.max.y - g;
+    let lcol = Rect::from_min_max(Pos2::new(screen.min.x + g, ltop), Pos2::new(screen.min.x + g + lw, bottom));
+    let rcol = Rect::from_min_max(Pos2::new(screen.max.x - g - rw, rtop), Pos2::new(screen.max.x - g, bottom));
+    let mut rects = [None; NP];
+    for (col, ids) in [(lcol, &left), (rcol, &right)] {
+        let total: f32 = ids.iter().map(|&i| p.weights[i].max(0.05)).sum();
+        let room = col.height() - STACK_GAP * ids.len().saturating_sub(1) as f32;
+        let mut y = col.min.y;
+        for (k, &i) in ids.iter().enumerate() {
+            let y1 = if k + 1 == ids.len() { col.max.y } else { (y + room * p.weights[i].max(0.05) / total).round() };
+            rects[i] = Some(Rect::from_min_max(Pos2::new(col.min.x, y), Pos2::new(col.max.x, y1)));
+            y = y1 + STACK_GAP;
+        }
+    }
+    let mut mid_l = if left.is_empty() { screen.min.x } else { lcol.max.x };
+    let mut mid_r = if right.is_empty() { screen.max.x } else { rcol.min.x };
+    if mid_r - mid_l < 200.0 {
+        (mid_l, mid_r) = (screen.min.x, screen.max.x);
+    }
+    let mut mid_b = screen.max.y;
+    if bottom_on {
+        let x0 = if left.is_empty() { screen.min.x + g } else { lcol.max.x + g };
+        let x1 = if right.is_empty() { screen.max.x - g } else { rcol.min.x - g };
+        let h = p.bottom_h.clamp(140.0, (screen.height() * 0.6).max(140.0));
+        let r = Rect::from_min_max(Pos2::new(x0, bottom - h), Pos2::new(x1.max(x0 + 200.0), bottom));
+        rects[LIBRARY] = Some(r);
+        mid_b = r.min.y;
+    }
+    Placed {
+        rects,
+        mid: Rect::from_min_max(Pos2::new(mid_l, screen.min.y), Pos2::new(mid_r, mid_b)),
+        cols: [(lcol, left), (rcol, right)],
+    }
+}
+
+/// Where panel `i` docks when dropped at `pos`: the arrangement it gives
+/// (None: over the canvas, it goes back where it was).
+fn drop_target(p: &Panels, placed: &Placed, screen: Rect, i: usize, pos: Pos2) -> Option<Panels> {
+    let g = crate::style::GAP;
+    // A column catches its own width, or a band along the edge when empty.
+    let band = 140.0;
+    let in_left = if placed.cols[0].1.iter().any(|&j| j != i) { pos.x < placed.cols[0].0.max.x + g } else { pos.x < screen.min.x + band };
+    let in_right = if placed.cols[1].1.iter().any(|&j| j != i) { pos.x > placed.cols[1].0.min.x - g } else { pos.x > screen.max.x - band };
+    let slot = if in_left {
+        Slot::Left
+    } else if in_right {
+        Slot::Right
+    } else if i == LIBRARY && pos.y > screen.max.y - band.max(p.bottom_h * 0.6) {
+        Slot::Bottom
+    } else {
+        return None;
+    };
+    let before = match slot {
+        Slot::Bottom => None,
+        s => placed.cols[if s == Slot::Left { 0 } else { 1 }].1.iter().copied().filter(|&j| j != i).find(|&j| placed.rects[j].is_some_and(|r| pos.y < r.center().y)),
+    };
+    Some(p.docked(i, slot, before))
+}
+
+/// While a panel's header is carried: a tag with its name under the
+/// pointer, and the place it would take when let go, highlighted.
+fn drop_preview(ctx: &egui::Context, p: &Panels, placed: &Placed, screen: Rect, shown: [bool; NP], i: usize, pos: Pos2) {
+    const NAMES: [&str; NP] = ["Layers", "Library", "Properties", "Texture set settings", "Muse", "Packshot studio"];
+    let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("panel drop")));
+    let target = drop_target(p, placed, screen, i, pos).and_then(|q| place(&q, screen, shown).rects[i]);
+    if let Some(r) = target {
+        painter.rect(r, crate::style::R_PANEL, crate::style::ACCENT.gamma_multiply(0.14), egui::Stroke::new(2.0f32, crate::style::ACCENT));
+        super::mark(ctx, "panel drop", r);
+    }
+    let g = painter.layout_no_wrap(NAMES[i].to_string(), crate::style::bold(12.0), crate::style::TEXT);
+    let tag = Rect::from_min_size(pos + egui::vec2(12.0, 8.0), g.size() + egui::vec2(24.0, 14.0));
+    painter.add(crate::style::shadow(2).as_shape(tag, crate::style::R_CONTROL));
+    painter.rect(tag, crate::style::R_CONTROL, crate::style::PANEL, egui::Stroke::new(1.0f32, if target.is_some() { crate::style::ACCENT } else { crate::style::LINE }));
+    painter.galley(tag.min + egui::vec2(12.0, 7.0), g, crate::style::TEXT);
+}
 
 /// Tool dock groups: the entries of each group (a tool, or a command).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -213,20 +421,28 @@ pub fn dock_slots() -> Vec<&'static [DockItem]> {
 /// What the user did to a panel's frame this frame.
 #[derive(Default)]
 struct PanelDrag {
-    /// The panel's new rect (moved by its header, or resized by an edge or
-    /// corner): it floats there.
-    rect: Option<Rect>,
-    /// Header double clicked: back to its docked place.
-    reset: bool,
-    /// A docked panel's inner edge dragged by this much (its docked width).
+    /// Its header is being dragged: the pointer.
+    moving: Option<Pos2>,
+    /// Its header was let go there.
+    dropped: Option<Pos2>,
+    /// Its inner edge dragged by this much (the column's width, or the
+    /// bottom strip's height).
     inner: f32,
 }
 
-/// A rounded floating panel at `rect` (elevation 1); its content is laid
-/// out in a child bounded and clipped to it. Unless `locked`, the top
-/// `header` points move the panel and every edge and corner resizes it; a
-/// docked panel's `inner` edge (-1 left, 1 right) changes its docked width.
-fn float_panel<R>(ctx: &egui::Context, id: &str, rect: Rect, header: f32, docked: bool, inner: f32, locked: bool, add: impl FnOnce(&mut Ui) -> R) -> (R, PanelDrag) {
+/// The edge of a docked panel that faces the canvas.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Edge {
+    Left,
+    Right,
+    Top,
+}
+
+/// A rounded docked panel at `rect` (elevation 1); its content is laid
+/// out in a child bounded and clipped to it. Unless `locked`, dragging the
+/// top `header` points carries the panel to another dock place, and the
+/// `edge` facing the canvas resizes its column (or the bottom strip).
+fn dock_panel<R>(ctx: &egui::Context, id: &str, rect: Rect, header: f32, edge: Edge, locked: bool, add: impl FnOnce(&mut Ui) -> R) -> (R, PanelDrag) {
     egui::Area::new(egui::Id::new(("panel", id)))
         .fixed_pos(rect.min)
         .order(egui::Order::Middle)
@@ -238,15 +454,17 @@ fn float_panel<R>(ctx: &egui::Context, id: &str, rect: Rect, header: f32, docked
             let mut d = PanelDrag::default();
             let hr = Rect::from_min_size(rect.min, egui::vec2(rect.width(), header));
             if !locked {
-                // The header moves the panel: under the header's own buttons.
+                // The header carries the panel: under the header's own buttons.
                 let h = ui.interact(hr, egui::Id::new(("panel move", id)), Sense::click_and_drag());
-                if h.dragged() {
-                    d.rect = Some(rect.translate(h.drag_delta()));
+                let at = || ctx.input(|i| i.pointer.interact_pos().or(i.pointer.latest_pos()));
+                if h.drag_stopped() {
+                    d.dropped = at();
+                } else if h.dragged() {
+                    d.moving = at();
                     ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
                 } else if h.hovered() {
                     ctx.set_cursor_icon(egui::CursorIcon::Grab);
                 }
-                d.reset = h.double_clicked() && !docked;
             }
             let p = ui.painter();
             p.add(crate::style::shadow(1).as_shape(rect, crate::style::R_PANEL));
@@ -259,64 +477,29 @@ fn float_panel<R>(ctx: &egui::Context, id: &str, rect: Rect, header: f32, docked
             if locked {
                 return (r, d);
             }
-            // Edges and corners, on top of the content (a thin band inside the border).
+            // The inner edge, on top of the content (a thin band inside the border).
             let (x0, y0, x1, y1) = (rect.min.x, rect.min.y, rect.max.x, rect.max.y);
-            let e = 5.0;
-            let c = 14.0;
-            use egui::CursorIcon as C;
-            // (handle, moves left / top / right / bottom edge, cursor, name)
-            let handles: [(Rect, [bool; 4], C, &str); 8] = [
-                (Rect::from_min_max(Pos2::new(x0, y0 + c), Pos2::new(x0 + e, y1 - c)), [true, false, false, false], C::ResizeHorizontal, "left"),
-                (Rect::from_min_max(Pos2::new(x1 - e, y0 + c), Pos2::new(x1, y1 - c)), [false, false, true, false], C::ResizeHorizontal, "right"),
-                (Rect::from_min_max(Pos2::new(x0 + c, y0), Pos2::new(x1 - c, y0 + 4.0)), [false, true, false, false], C::ResizeVertical, "top"),
-                (Rect::from_min_max(Pos2::new(x0 + c, y1 - e), Pos2::new(x1 - c, y1)), [false, false, false, true], C::ResizeVertical, "bottom"),
-                (Rect::from_min_size(Pos2::new(x0, y0), egui::vec2(c, c)), [true, true, false, false], C::ResizeNwSe, "top left"),
-                (Rect::from_min_size(Pos2::new(x1 - c, y1 - c), egui::vec2(c, c)), [false, false, true, true], C::ResizeNwSe, "bottom right"),
-                (Rect::from_min_size(Pos2::new(x1 - c, y0), egui::vec2(c, c)), [false, true, true, false], C::ResizeNeSw, "top right"),
-                (Rect::from_min_size(Pos2::new(x0, y1 - c), egui::vec2(c, c)), [true, false, false, true], C::ResizeNeSw, "bottom left"),
-            ];
-            for (hrect, sides, cursor, name) in handles {
-                let resp = ui.interact(hrect, egui::Id::new(("panel resize", id, name)), Sense::drag());
-                super::mark(ctx, format!("panel {name}:{id}"), hrect);
-                if resp.hovered() || resp.dragged() {
-                    ctx.set_cursor_icon(cursor);
-                    let st = egui::Stroke::new(3.0f32, crate::style::ACCENT);
-                    let pnt = ui.painter();
-                    if sides[0] && !sides[1] && !sides[3] {
-                        pnt.line_segment([Pos2::new(x0, hrect.center().y - 24.0), Pos2::new(x0, hrect.center().y + 24.0)], st);
-                    } else if sides[2] && !sides[1] && !sides[3] {
-                        pnt.line_segment([Pos2::new(x1, hrect.center().y - 24.0), Pos2::new(x1, hrect.center().y + 24.0)], st);
-                    } else if sides[1] && !sides[0] && !sides[2] {
-                        pnt.line_segment([Pos2::new(hrect.center().x - 24.0, y0), Pos2::new(hrect.center().x + 24.0, y0)], st);
-                    } else if sides[3] && !sides[0] && !sides[2] {
-                        pnt.line_segment([Pos2::new(hrect.center().x - 24.0, y1), Pos2::new(hrect.center().x + 24.0, y1)], st);
-                    } else {
-                        pnt.circle_filled(hrect.center(), 4.0, crate::style::ACCENT);
-                    }
-                }
-                if !resp.dragged() {
-                    continue;
-                }
-                let dv = resp.drag_delta();
-                let only_inner = docked && !sides[1] && !sides[3] && ((inner < 0.0 && sides[0] && !sides[2]) || (inner > 0.0 && sides[2] && !sides[0]));
-                if only_inner {
-                    d.inner = dv.x;
-                    continue;
-                }
-                let mut nr = d.rect.unwrap_or(rect);
-                if sides[0] {
-                    nr.min.x += dv.x;
-                }
-                if sides[1] {
-                    nr.min.y += dv.y;
-                }
-                if sides[2] {
-                    nr.max.x += dv.x;
-                }
-                if sides[3] {
-                    nr.max.y += dv.y;
-                }
-                d.rect = Some(nr);
+            let (e, c) = (5.0, 14.0);
+            let (hrect, cursor, name) = match edge {
+                Edge::Left => (Rect::from_min_max(Pos2::new(x0, y0 + c), Pos2::new(x0 + e, y1 - c)), egui::CursorIcon::ResizeHorizontal, "left"),
+                Edge::Right => (Rect::from_min_max(Pos2::new(x1 - e, y0 + c), Pos2::new(x1, y1 - c)), egui::CursorIcon::ResizeHorizontal, "right"),
+                Edge::Top => (Rect::from_min_max(Pos2::new(x0 + c, y0), Pos2::new(x1 - c, y0 + 4.0)), egui::CursorIcon::ResizeVertical, "top"),
+            };
+            let resp = ui.interact(hrect, egui::Id::new(("panel resize", id, name)), Sense::drag());
+            super::mark(ctx, format!("panel {name}:{id}"), hrect);
+            if resp.hovered() || resp.dragged() {
+                ctx.set_cursor_icon(cursor);
+                let st = egui::Stroke::new(3.0f32, crate::style::ACCENT);
+                let m = hrect.center();
+                let seg = match edge {
+                    Edge::Left => [Pos2::new(x0, m.y - 24.0), Pos2::new(x0, m.y + 24.0)],
+                    Edge::Right => [Pos2::new(x1, m.y - 24.0), Pos2::new(x1, m.y + 24.0)],
+                    Edge::Top => [Pos2::new(m.x - 24.0, y0), Pos2::new(m.x + 24.0, y0)],
+                };
+                ui.painter().line_segment(seg, st);
+            }
+            if resp.dragged() {
+                d.inner = if edge == Edge::Top { resp.drag_delta().y } else { resp.drag_delta().x };
             }
             (r, d)
         })
@@ -404,6 +587,8 @@ impl RetroApp {
             Tab::Layers => p.left && p.left_tab == 0,
             Tab::TextureSets => p.left && p.left_tab == 1,
             Tab::SetSettings => p.set_settings,
+            Tab::Muse => p.muse,
+            Tab::Studio => self.view.studio,
         }
     }
 
@@ -413,6 +598,12 @@ impl RetroApp {
 
     /// Shows a panel (and its left tab).
     pub(super) fn focus_tab(&mut self, tab: Tab) {
+        if tab == Tab::Studio {
+            if !self.view.studio {
+                self.toggle_studio();
+            }
+            return;
+        }
         let p = self.panels();
         match tab {
             Tab::Viewport => {}
@@ -427,6 +618,8 @@ impl RetroApp {
                 p.left_tab = 1;
             }
             Tab::SetSettings => p.set_settings = true,
+            Tab::Muse => p.muse = true,
+            Tab::Studio => {}
         }
     }
 
@@ -436,6 +629,10 @@ impl RetroApp {
             self.focus_tab(tab);
             return;
         }
+        if tab == Tab::Studio {
+            self.toggle_studio();
+            return;
+        }
         let p = self.panels();
         match tab {
             Tab::Viewport => {}
@@ -443,6 +640,8 @@ impl RetroApp {
             Tab::Properties => p.properties = false,
             Tab::Layers | Tab::TextureSets => p.left = false,
             Tab::SetSettings => p.set_settings = false,
+            Tab::Muse => p.muse = false,
+            Tab::Studio => {}
         }
     }
 
@@ -456,19 +655,31 @@ impl RetroApp {
         if !self.layout_loaded {
             self.layout_loaded = true;
             if self.persist_layout && self.dock.is_none() {
-                self.dock = std::fs::read_to_string(layout_path()).ok().and_then(|t| serde_json::from_str::<Panels>(&t).ok());
+                // (Layouts of before Muse are not read: the new default wins.)
+                self.dock = read_layout();
                 if let Some(p) = &self.dock {
                     self.view.swap_views = p.swap_views;
                     self.view.split = p.view_split.clamp(0.15, 0.85);
+                    self.view.layout = match p.view_layout {
+                        1 => Layout::Both,
+                        2 => Layout::Only2D,
+                        _ => Layout::Only3D,
+                    };
                 }
             }
         }
         if self.persist_layout && self.layout_saved.0.elapsed().as_secs_f32() > 0.5 {
             self.layout_saved.0 = Instant::now();
             let (swap, split) = (self.view.swap_views, self.view.split);
+            let views = match self.view.layout {
+                Layout::Only3D => 0,
+                Layout::Both => 1,
+                Layout::Only2D => 2,
+            };
             let p = self.panels();
             p.swap_views = swap;
             p.view_split = split;
+            p.view_layout = views;
             if let Ok(json) = serde_json::to_string(&self.dock.clone().unwrap_or_default()) {
                 if json != self.layout_saved.1 {
                     let _ = std::fs::write(layout_path(), &json);
@@ -477,53 +688,12 @@ impl RetroApp {
             }
         }
         let screen = ctx.screen_rect();
-        let g = crate::style::GAP;
         let p = self.dock.clone().unwrap_or_default();
-        let show = !self.ui_hidden && self.doc.is_some();
-        let (lw, rw) = (p.left_w.clamp(220.0, 520.0), p.right_w.clamp(260.0, 620.0));
-        // Floating rects are kept on screen and at least 220 x 160.
-        let keep = |r: Rect| {
-            let w = r.width().clamp(220.0, screen.width() - 2.0 * g);
-            let h = r.height().clamp(160.0, screen.height() - 2.0 * g);
-            let r = Rect::from_min_size(r.min, egui::vec2(w, h));
-            let dx = (screen.min.x - r.min.x).max(0.0) + (screen.max.x - r.max.x).min(0.0);
-            let dy = (screen.min.y - r.min.y).max(0.0) + (screen.max.y - r.max.y).min(0.0);
-            r.translate(egui::vec2(dx, dy))
-        };
-        let float = |i: usize| p.rects[i].map(|v| keep(Rect::from_min_max(Pos2::new(v[0], v[1]), Pos2::new(v[2], v[3]))));
-        let rx = screen.max.x - g - rw;
-        let top = screen.min.y + g + 42.0;
-        let bottom = screen.max.y - g;
-        let both_docked = p.library && p.properties && p.rects[1].is_none() && p.rects[2].is_none();
-        let split = if both_docked {
-            top + (bottom - top) * p.right_split.clamp(0.2, 0.8)
-        } else if p.library && p.rects[1].is_none() {
-            bottom
-        } else {
-            top
-        };
-        let left = float(0).unwrap_or(Rect::from_min_max(screen.min + egui::vec2(g, g), Pos2::new(screen.min.x + g + lw, screen.max.y - g)));
-        let lib = float(1).unwrap_or(Rect::from_min_max(Pos2::new(rx, top), Pos2::new(screen.max.x - g, if both_docked { split - 4.0 } else { bottom })));
-        let props = float(2).unwrap_or(Rect::from_min_max(Pos2::new(rx, if p.library && p.rects[1].is_none() { split + 4.0 } else { top }), Pos2::new(screen.max.x - g, bottom)));
+        let mut shown = if !self.ui_hidden && self.doc.is_some() { p.shown() } else { [false; NP] };
+        shown[STUDIO] = self.view.studio && !self.ui_hidden && self.doc.is_some();
+        let placed = place(&p, screen, shown);
         // The free canvas between the panels: bars and overlays center on it.
-        let mut mid_l = screen.min.x;
-        let mut mid_r = screen.max.x;
-        if show {
-            for (on, r) in [(p.left, left), (p.library, lib), (p.properties, props)] {
-                if !on {
-                    continue;
-                }
-                if r.center().x < screen.center().x {
-                    mid_l = mid_l.max(r.max.x);
-                } else {
-                    mid_r = mid_r.min(r.min.x);
-                }
-            }
-        }
-        if mid_r - mid_l < 200.0 {
-            (mid_l, mid_r) = (screen.min.x, screen.max.x);
-        }
-        self.canvas_mid = Rect::from_min_max(Pos2::new(mid_l, screen.min.y), Pos2::new(mid_r, screen.max.y));
+        self.canvas_mid = placed.mid;
 
         egui::CentralPanel::default().frame(egui::Frame::none().fill(crate::style::BG)).show(ctx, |ui| self.central(ui));
         if self.doc.is_none() {
@@ -533,42 +703,71 @@ impl RetroApp {
         if self.ui_hidden {
             return;
         }
-        let lock = p.locked;
-        let mut drags: [PanelDrag; 3] = Default::default();
-        if p.left {
-            drags[0] = float_panel(ctx, "left", left, 46.0, p.rects[0].is_none(), 1.0, lock, |ui| self.left_panel(ui, ctx)).1;
-        } else {
+        if !p.left {
             // Its menu stays reachable (with the way back to the panels).
             self.home_menu(ctx);
         }
-        if p.library {
-            drags[1] = float_panel(ctx, "library", lib, 42.0, p.rects[1].is_none(), -1.0, lock, |ui| self.assets_ui(ui, ctx)).1;
-        }
-        if p.properties {
-            drags[2] = float_panel(ctx, "properties", props, 42.0, p.rects[2].is_none(), -1.0, lock, |ui| self.properties_ui(ui, ctx)).1;
+        let lock = p.locked;
+        let mut drags: [PanelDrag; NP] = Default::default();
+        for i in 0..NP {
+            let Some(r) = placed.rects[i] else { continue };
+            let edge = match p.slot(i) {
+                Slot::Left => Edge::Right,
+                Slot::Right => Edge::Left,
+                Slot::Bottom => Edge::Top,
+            };
+            let id = PANEL_IDS[i];
+            drags[i] = match i {
+                LAYERS => dock_panel(ctx, id, r, 46.0, edge, lock, |ui| self.left_panel(ui, ctx)).1,
+                LIBRARY => dock_panel(ctx, id, r, 42.0, edge, lock, |ui| self.assets_ui(ui, ctx)).1,
+                2 => dock_panel(ctx, id, r, 42.0, edge, lock, |ui| self.properties_ui(ui, ctx)).1,
+                MUSE => dock_panel(ctx, id, r, 42.0, edge, lock, |ui| self.muse_panel(ui)).1,
+                STUDIO => dock_panel(ctx, id, r, 42.0, edge, lock, |ui| self.studio_panel(ui)).1,
+                _ => dock_panel(ctx, id, r, 42.0, edge, lock, |ui| self.set_settings_panel(ui)).1,
+            };
         }
         {
+            // The inner edges: a column's width, the bottom strip's height.
+            let max_h = (screen.height() * 0.6).max(140.0);
             let pm = self.panels();
             for (i, d) in drags.iter().enumerate() {
-                if let Some(r) = d.rect {
-                    pm.rects[i] = Some([r.min.x, r.min.y, r.max.x, r.max.y]);
+                if d.inner == 0.0 {
+                    continue;
                 }
-                if d.reset {
-                    pm.rects[i] = None;
+                match p.slot(i) {
+                    Slot::Left => pm.left_w = (pm.left_w.clamp(220.0, 520.0) + d.inner).clamp(220.0, 520.0),
+                    Slot::Right => pm.right_w = (pm.right_w.clamp(260.0, 620.0) - d.inner).clamp(260.0, 620.0),
+                    Slot::Bottom => pm.bottom_h = (pm.bottom_h.clamp(140.0, max_h) - d.inner).clamp(140.0, max_h),
                 }
             }
-            pm.left_w = (pm.left_w.clamp(220.0, 520.0) + drags[0].inner).clamp(220.0, 520.0);
-            pm.right_w = (pm.right_w.clamp(260.0, 620.0) - drags[1].inner - drags[2].inner).clamp(260.0, 620.0);
         }
-        if both_docked && !lock {
-            self.right_split_grip(ctx, Rect::from_min_max(Pos2::new(rx + 20.0, split - 4.0), Pos2::new(screen.max.x - g - 20.0, split + 4.0)), top, bottom);
+        // A header carried: where the panel would dock; let go: it docks
+        // there (over the canvas it stays where it was).
+        if let Some((i, pos)) = drags.iter().enumerate().find_map(|(i, d)| d.moving.map(|q| (i, q))) {
+            drop_preview(ctx, &p, &placed, screen, shown, i, pos);
+        }
+        if let Some((i, pos)) = drags.iter().enumerate().find_map(|(i, d)| d.dropped.map(|q| (i, q))) {
+            if let Some(q) = drop_target(&p, &placed, screen, i, pos) {
+                let pm = self.panels();
+                pm.slots = q.slots;
+                pm.order = q.order;
+                pm.weights = q.weights;
+            }
+        }
+        if !lock {
+            for (col, ids) in placed.cols.iter() {
+                for w in ids.windows(2) {
+                    let (ra, rb) = (placed.rects[w[0]].unwrap(), placed.rects[w[1]].unwrap());
+                    let grip = Rect::from_min_max(Pos2::new(col.min.x + 20.0, ra.max.y), Pos2::new(col.max.x - 20.0, rb.min.y));
+                    self.split_grip(ctx, grip, w[0], w[1], *col, ids);
+                }
+            }
         }
         self.top_right_bar(ctx);
         self.view_bar(ctx);
         let dock_h = self.tool_dock(ctx);
         self.options_bar(ctx, dock_h);
         self.canvas_status(ctx);
-        self.set_settings_window(ctx);
     }
 
     /// The app menu in the corner, when the left panel (its usual home) is
@@ -603,18 +802,30 @@ impl RetroApp {
         });
     }
 
-    /// The gap between the library and properties drags their split.
-    fn right_split_grip(&mut self, ctx: &egui::Context, r: Rect, top: f32, bottom: f32) {
-        egui::Area::new(egui::Id::new("right split")).fixed_pos(r.min).order(egui::Order::Middle).show(ctx, |ui| {
+    /// The gap between two stacked panels `a` (above) and `b` drags their
+    /// split; each keeps `MIN_PANEL_H`.
+    fn split_grip(&mut self, ctx: &egui::Context, r: Rect, a: usize, b: usize, col: Rect, ids: &[usize]) {
+        egui::Area::new(egui::Id::new(("panel split", a, b))).fixed_pos(r.min).order(egui::Order::Middle).show(ctx, |ui| {
             let resp = ui.allocate_rect(Rect::from_min_size(r.min, r.size()), Sense::drag());
+            super::mark(ctx, format!("panel split:{}", PANEL_IDS[a]), r);
             if resp.hovered() || resp.dragged() {
                 ctx.set_cursor_icon(egui::CursorIcon::ResizeVertical);
                 ui.painter().line_segment([Pos2::new(r.center().x - 18.0, r.center().y), Pos2::new(r.center().x + 18.0, r.center().y)], egui::Stroke::new(3.0f32, crate::style::ACCENT));
             }
-            if resp.dragged() {
-                if let Some(pos) = resp.interact_pointer_pos() {
-                    self.panels().right_split = ((pos.y - top) / (bottom - top).max(1.0)).clamp(0.2, 0.8);
-                }
+            if !resp.dragged() || resp.drag_delta().y == 0.0 {
+                return;
+            }
+            let dy = resp.drag_delta().y;
+            let pm = self.panels();
+            let total: f32 = ids.iter().map(|&i| pm.weights[i].max(0.05)).sum();
+            let room = (col.height() - STACK_GAP * ids.len().saturating_sub(1) as f32).max(1.0);
+            let (wa, wb) = (pm.weights[a].max(0.05), pm.weights[b].max(0.05));
+            let pair = wa + wb;
+            let min = MIN_PANEL_H * total / room;
+            if pair > 2.0 * min {
+                let na = (wa + dy * total / room).clamp(min, pair - min);
+                pm.weights[a] = na;
+                pm.weights[b] = pair - na;
             }
         });
     }
@@ -640,7 +851,7 @@ impl RetroApp {
                     ),
                     None => ("Material Forge".into(), String::new()),
                 };
-                ui.set_max_width(170.0);
+                ui.set_max_width((ui.available_width() - 72.0).clamp(60.0, 170.0));
                 ui.add(egui::Label::new(RichText::new(name).font(crate::style::bold(12.5))).truncate());
                 ui.add(egui::Label::new(RichText::new(file).size(11.0).color(crate::style::TEXT3)).truncate());
             });
@@ -648,6 +859,14 @@ impl RetroApp {
                 ui.add_space(8.0);
                 let m = ui.menu_button(RichText::new("\u{2630}").size(15.0), |ui| self.app_menu(ui, ctx));
                 super::mark(ctx, "menu:App", m.response.rect);
+                // Locks the panels where they are (Window > Lock panels).
+                let locked = self.dock.clone().unwrap_or_default().locked;
+                let tip = if locked { "Panels locked; click to unlock" } else { "Lock the panels (no more moving or resizing)" };
+                let l = icons::button(ui, if locked { Icon::Lock } else { Icon::Unlock }, locked, 26.0, tip);
+                super::mark(ctx, "panel lock", l.rect);
+                if l.clicked() {
+                    self.panels().locked = !locked;
+                }
             });
         });
         ui.add_space(8.0);
@@ -824,6 +1043,11 @@ impl RetroApp {
             if icons::button(ui, Icon::Render, self.view.path_trace, 28.0, &tip).clicked() {
                 self.view.path_trace = !self.view.path_trace;
             }
+            let tip = if self.view.studio { "Leave the packshot studio" } else { "Packshot studio: studio lights, background, lens and format (path traced), in its own panel" };
+            let s = icons::button(ui, Icon::Studio, self.view.studio, 28.0, tip);
+            if s.clicked() {
+                self.toggle_studio();
+            }
         });
         // Baking: progress and cancel under the bar.
         if let Some(job) = &self.bake_job {
@@ -836,6 +1060,12 @@ impl RetroApp {
                 }
             });
         }
+    }
+
+    /// How far the tool dock sits above the window's bottom: over the
+    /// library when it is docked along the bottom.
+    fn dock_lift(&self, ctx: &egui::Context) -> f32 {
+        (ctx.screen_rect().max.y - self.canvas_mid.max.y).max(0.0)
     }
 
     /// The dock entry of the current tool.
@@ -896,7 +1126,7 @@ impl RetroApp {
                 self.dock_last[i] = cur;
             }
         }
-        let off = egui::vec2(self.canvas_mid.center().x - ctx.screen_rect().center().x, -12.0);
+        let off = egui::vec2(self.canvas_mid.center().x - ctx.screen_rect().center().x, -12.0 - self.dock_lift(ctx));
         let mut picked = None;
         let by_map_open = self.sel_by_map.is_some();
         let r = float_bar(ctx, "tool dock", egui::Align2::CENTER_BOTTOM, off, 18.0, 2, |ui| {
@@ -974,7 +1204,7 @@ impl RetroApp {
 
     /// The active tool's options, in a bar right above the dock.
     fn options_bar(&mut self, ctx: &egui::Context, dock_h: f32) {
-        let off = egui::vec2(self.canvas_mid.center().x - ctx.screen_rect().center().x, -12.0 - dock_h - 8.0);
+        let off = egui::vec2(self.canvas_mid.center().x - ctx.screen_rect().center().x, -12.0 - self.dock_lift(ctx) - dock_h - 8.0);
         let max_w = (self.canvas_mid.width() - 80.0).max(300.0);
         let item = self.dock_current();
         // A selected fill shows its projection here instead of the tool.
@@ -1034,24 +1264,14 @@ impl RetroApp {
         p.text(Pos2::new(x, y), egui::Align2::LEFT_BOTTOM, text, font, c.gamma_multiply(alpha));
     }
 
-    /// Texture set settings: a window next to the left panel.
-    fn set_settings_window(&mut self, ctx: &egui::Context) {
-        let mut open = self.dock.clone().unwrap_or_default().set_settings;
-        if !open {
-            return;
+    /// Texture set settings, docked (left column by default).
+    fn set_settings_panel(&mut self, ui: &mut Ui) {
+        self.set_settings_visible = true;
+        let mut close = false;
+        panel_header(ui, "Texture set settings", "", |ui| close = icons::button(ui, Icon::Close, false, 24.0, "Close").clicked());
+        self.set_settings_ui(ui);
+        if close {
+            self.panels().set_settings = false;
         }
-        egui::Window::new(RichText::new("TEXTURE SET SETTINGS").font(crate::style::bold(11.5)))
-            .id(egui::Id::new("set settings window"))
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(true)
-            .default_pos(Pos2::new(LEFT_W + 24.0, 60.0))
-            .default_size(egui::vec2(300.0, 520.0))
-            .vscroll(true)
-            .show(ctx, |ui| {
-                self.set_settings_visible = true;
-                self.set_settings_ui(ui);
-            });
-        self.panels().set_settings = open;
     }
 }

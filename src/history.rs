@@ -3,7 +3,9 @@
 //!   texture (texture identity never changes, so stack snapshots stay valid).
 //!   Brush strokes back up only the tiles they touch, as they touch them;
 //! - `State`: a snapshot of a texture set's layer tree, selection and settings.
-//!   Layers hold their textures in `Arc`s, so snapshots are cheap.
+//!   Layers hold their textures in `Arc`s, so snapshots are cheap;
+//! - `Studio`: the packshot studio's lights, background and camera before
+//!   an edit.
 
 use crate::document::{Document, SetState};
 use crate::engine::{Engine, Tex};
@@ -38,6 +40,7 @@ pub enum Entry {
     /// A texture set's selection before the change (selections are never
     /// edited in place, so the old texture is the backup).
     Selection { label: String, set: usize, selection: Option<Arc<Tex>> },
+    Studio { label: String, studio: Box<crate::studio::Studio> },
 }
 
 fn copy_region(enc: &mut wgpu::CommandEncoder, src: &Tex, so: (u32, u32), dst: &Tex, d_o: (u32, u32), w: u32, h: u32) {
@@ -56,7 +59,7 @@ fn tile_size(t: &Tex, origin: (u32, u32)) -> (u32, u32) {
 impl Entry {
     pub fn label(&self) -> &str {
         match self {
-            Entry::Stroke { label, .. } | Entry::State { label, .. } | Entry::Hidden { label, .. } | Entry::Selection { label, .. } => label,
+            Entry::Stroke { label, .. } | Entry::State { label, .. } | Entry::Hidden { label, .. } | Entry::Selection { label, .. } | Entry::Studio { label, .. } => label,
         }
     }
 
@@ -64,7 +67,7 @@ impl Entry {
         match self {
             Entry::Stroke { textures, .. } => textures.iter().map(|(_, b)| b.bytes()).sum(),
             Entry::Selection { selection, .. } => selection.as_ref().map_or(0, |t| t.byte_size()),
-            Entry::State { .. } | Entry::Hidden { .. } => 0,
+            Entry::State { .. } | Entry::Hidden { .. } | Entry::Studio { .. } => 0,
         }
     }
 
@@ -200,6 +203,10 @@ impl History {
                     None => selection,
                 };
                 Entry::Selection { label, set, selection: old }
+            }
+            Entry::Studio { label, studio } => {
+                let old = std::mem::replace(&mut doc.studio, *studio);
+                Entry::Studio { label, studio: Box::new(old) }
             }
         }
     }

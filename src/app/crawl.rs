@@ -420,6 +420,7 @@ impl Baseline {
             doc.refresh_visibility(&app.engine);
         }
         app.tracked = None;
+        app.tracked_studio = None;
         true
     }
 }
@@ -523,7 +524,13 @@ fn scenarios() -> Vec<Scenario> {
             },
         },
         Scenario { name: "texture set settings", setup: |app| app.focus_tab(dock::Tab::SetSettings) },
+        Scenario {
+            name: "library at the bottom",
+            setup: |app| app.dock = Some(dock::Panels { slots: [dock::Slot::Left, dock::Slot::Bottom, dock::Slot::Right, dock::Slot::Left, dock::Slot::Right, dock::Slot::Right], ..Default::default() }),
+        },
         Scenario { name: "display settings", setup: |app| app.show_view_settings = true },
+        Scenario { name: "packshot studio", setup: |app| app.toggle_studio() },
+        Scenario { name: "preferences", setup: |app| app.show_prefs = true },
         Scenario { name: "history", setup: |app| app.show_history = true },
         Scenario { name: "log", setup: |app| app.show_log = true },
         Scenario { name: "export dialog", setup: |app| app.open_export() },
@@ -766,7 +773,7 @@ pub fn ui_crawl(out: &Path) -> anyhow::Result<usize> {
         let mut app = RetroApp::build(engine, Arc::new(egui::mutex::RwLock::new(renderer)), &ctx, with);
         app.persist_layout = false;
     app.lock_cursor = false;
-        app.autosave_minutes = 0.0;
+        app.autosave.on = false;
         let d = Driver { ctx, size, time: 0.0, frames: 0, shapes: Vec::new(), texts: Vec::new(), text_clips: Vec::new(), clashes: Vec::new() };
         Ok((app, d))
     };

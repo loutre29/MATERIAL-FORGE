@@ -29,6 +29,7 @@ target\release\material_forge.exe --bench
 target\release\material_forge.exe --uibench <mesh>   # per-section frame timings, headless (SP_BENCH_SIZE=WxH)
 target\release\material_forge.exe --uicrawl <out_dir> # clicks every widget: report + screenshots (MF_UITEST_SIZE, MF_CRAWL_ONLY=<state>)
 target\release\material_forge.exe --floodbench <mesh> [res]  # magic wand / bucket timings per set
+target\release\material_forge.exe --studioshot <project.sprp | mesh> <out.png>  # packshot (MF_STUDIO=<json>, MF_YAW, MF_PITCH, MF_SPP, MF_LONG, MF_FRAME)
 ```
 
 UX direction (2026-10-23): read `docs/UX_AUDIT.md` before UI work. Painter
@@ -273,8 +274,8 @@ Done:
   the position before the warp event arrives is skipped); the circle
   stays at the press. Tests set `lock_cursor = false`.
 - Split view swap: F4, View > Swap, and a swap button in the view bar
-  when Split is on; saved with the panels (`Panels::swap_views`,
-  `view_split` in layout_v3.json).
+  when Split is on; saved with the panels (`Panels::swap_views`, `view_layout` 3D / Split / UV,
+  `view_split` in layout_v4.json).
 - UV projection frame (2D view manipulator, `uvgizmo.rs tex_of_frame`):
   a higher tiling packs repeats around the frame's middle instead of
   moving the frame to the bottom right.
@@ -360,7 +361,7 @@ Done:
   under the cursor), onto Properties slots (fill channels, mask fill, alpha,
   stencil, brush material); image files dropped on the window become project
   resources; layer rows drag to reorder.
-- Window: see "Canvas layout" under UI conventions (floating panels, tool
+- Window: see "Canvas layout" under UI conventions (docked panels, tool
   dock, view bar, app menu File / Edit (Preferences, Ctrl+K: interface options and shortcuts) / Select / Window / View).
 - Bakers (AO 64 rays, edge-aware UV denoise of AO and thickness;
   curvature from the mesh per welded vertex, sharp edges as a falloff,
@@ -394,7 +395,7 @@ src/app/mod.rs           app state, frame loop, history tracking, bake thread, t
 src/app/panels.rs        menu bar, Cmd + run_cmd, shared property widgets (combo, projection, filters)
 src/app/props.rs         Properties panel: tool settings, fill / mask / effect editors, drop slots
 src/app/layers.rs        right dock: texture set list, layer rows, texture set settings tab
-src/app/dock.rs          canvas layout: floating panels, view bar, tool dock, options bar, app menu host
+src/app/dock.rs          canvas layout: docked panels, view bar, tool dock, options bar, app menu host
 src/app/layout.rs        tool options (the options bar content), flyout switching, geometry mask helpers
 src/app/icons.rs         painter-drawn icons, icon button, panel header
 src/app/widgets.rs       Painter widgets: label/value slider, gradient slider, color bar, chips, slots, cards, icon tabs, picker popup
@@ -425,15 +426,405 @@ src/selftest.rs          headless end-to-end test and bench
 
 ## UI conventions
 
-- Panels move by their header and resize by every edge and corner (a
-  docked panel's inner edge only changes its docked width; anything else
-  makes it float, `Panels::rects`; a double click on the header docks it
-  back); Window > Lock panels freezes them, Reset panels restores the
-  layout. The arrangement is saved in `layout_v3.json` (not in tests).
+- Panels dock, Painter style, never float free (user request
+  2026-10-26): five panels (`dock::PANEL_IDS`: layers stack, library,
+  properties, texture set settings, Muse), each in a `Slot`: the left or right
+  column (stacked top down by `Panels::order`, heights shared by
+  `Panels::weights`, the gap between two drags their split, each keeps
+  120 px) or, for the library only, the bottom strip between the columns
+  (`bottom_h`; the tool dock and options bar sit above it, `dock_lift`).
+  Carrying a header shows a name tag and the highlighted place it would
+  take (`drop_preview` / `drop_target`: a column's width or a 140 px band
+  at an empty side, the bottom band for the library; over the canvas it
+  stays); `place()` computes every rect and `canvas_mid`. The inner edge
+  (facing the canvas) sets the column width or the strip height. Window >
+  Lock panels freezes them, Reset panels restores the layout. Default
+  (user request 2026-10-26): layers top left, library bottom left, Muse
+  top right, properties under it. Saved in `layout_v5.json` (older
+  layouts are not read, so the new default shows; not in tests).
+  `MF_UITEST_ONLY=panels` and the crawl state "library at the bottom"
+  check it.
+- Muse panel (`app/muse.rs`, for the Meta Global AI Developer Hackathon,
+  submissions due 2026-11-04): texturing by prompt with Meta's Muse
+  models on the Meta Model API (`https://api.meta.ai/v1`, Bearer key from
+  MODEL_API_KEY or `<data dir>/muse_key.txt`, typed in the panel; blocking
+  `ureq` on a worker thread). Parts (`parts()`: each object of a texture
+  set when it holds several, else the set), limited to the texture sets
+  checked in the panel (any number; Cancel drops a running job: the
+  worker checks a flag between steps, a request in flight finishes and
+  is ignored). Muse does not trust part names (user, 2026-10-26:
+  they are rarely meaningful). Pieces (`app/pieces.rs`, user 2026-10-27:
+  "weird gradient when multiple textures like metal and wood are applied
+  to the same texture set"; Muse must understand polygons): each part is
+  split into its connected mesh pieces (welded by position; a part of a
+  single piece splits into its UV islands), alike pieces grouped (same
+  area and box within ~15%: chain links, hooks), at most 36 (the smallest
+  of a part merge). `look_at` rasterizes the model on the CPU from four
+  sides (2x2, or a row of four tall views for a tall model), each piece in
+  its palette color with its number drawn on it (3x5 digit font, labels
+  never overlap), the rest gray, sent as an image to `muse-spark-1.3`
+  (chat completions, vision) with per-piece facts: part, alike count,
+  size, center and y span in Position gradient units
+  (`bake::position_map`). The numbered view also shows in the chat, so the
+  user can say "make piece 3 wood". The last
+  view is saved to `<data dir>/muse/last_view.png`; `--museview <project>
+  <out.png>` renders it and prints the facts. Muse answers looks: a list
+  of pieces and a layer stack (JSON, bottom first): a source (color, pattern with two
+  colors, smart material, material, or `texture_prompt` made by
+  `muse-image-1.0`), any channel (roughness/metallic/height as values or
+  patterns, emissive, opacity, and optional channels: transmission, IOR
+  stored (ior-1)/2, absorption, scattering, coat, sheen, specular, which
+  get switched on in the set), blend mode, layer opacity, a mask of
+  steps (generators with level/contrast/axis, patterns, levels, invert,
+  blur, each with a mask blend) and filters (content effects).
+  Realism (user, 2026-10-27: results were "really bad, not realistic"):
+  the prompt asks for an "analysis" first (what each part is in real
+  life, its real size), scanned materials as bases (grouped by category
+  in `Shelf::material_names`), physically based values and subtle wear.
+  Scanned material layers are tri-planar at Muse's `scale` (about the
+  object's size in meters: a scan covers ~1 m), `tint` is the average
+  color to reach (divided by the scan's average, `average_color`),
+  `relief` scales its height (0 also drops the normal map),
+  `roughness_min/max` remap its roughness. Generators get noise at most
+  0.1 unless Muse sets it (library defaults up to 0.5 spread wear
+  everywhere; position cuts keep 0). Muse folders go on top of the root
+  stack (inserting at the selection put them inside a user folder,
+  under the user's layers). Each run saves `muse/last_view.png` and
+  `muse/last_plan.json`. `--musetest <project> <dir> <prompt> [sets]`
+  runs it headless (key from MODEL_API_KEY) and saves before.png,
+  result.png (project camera) and result_full.png; MF_MUSE_PLAN=<json>
+  replays a saved plan without the API, MF_MUSE_DUMP=1 prints the stack.
+  `muse_apply` builds one folder per look and texture set ("Muse:
+  <what>"), masked by a Paint mask effect written on the CPU
+  (`pieces::owners`: the piece of each texel from the UVs, grown 4 texels
+  into empty space; `pieces::mask`), so materials meet on exact polygon
+  borders (no ID map needed). A look takes its pieces from the looks
+  that had them (their masks get a new texture, undo keeps the old one;
+  an emptied look's folder is replaced in place). Muse may still cut a
+  zone of one piece with a sharp Position gradient when a single mesh
+  really holds two materials.
+  Conversation (user, 2026-10-27: "ask muse to modify something without
+  always redoing"): the panel is a chat (`Convo`: the system text and
+  views and pieces of the first turn, the (user, reply) turns, the
+  `Look`s applied). The first message looks at the model; later ones
+  resend the history plus "CURRENT LOOKS" and Muse returns only the looks
+  it changes or adds (complete lists), or none for a question. One
+  checkpoint per turn ("Muse: <message>"). The panel lays out bottom up
+  (buttons and message box pinned, the chat scrolls above them). Sets lock while a conversation
+  exists; "New conversation" forgets it (layers stay); a different
+  document (`doc_key`) resets it. Replies go through `no_dashes`. A plan
+  layer's source keys may also sit on the layer itself (`source()`).
+  ambientCG (`src/ambientcg.rs`, CC0): the material catalog (~2000, tags,
+  popularity) is cached for a week at `<data dir>/ambientcg_catalog.json`;
+  its 300 most used tags go in the instructions; a layer source
+  `{"ambientcg": "tag words"}` picks the best match (`best`: category,
+  tags, popularity) and downloads its 2K JPG zip (1K fallback) into
+  `<library>/materials/<category>/<id>` (color, roughness, metallic,
+  height, normal GL, material.json), which `texture_materials()` also
+  scans, so it shows in the Materials shelf. `--musetest` splits the
+  prompt on `||` into turns and saves turnN.png after each but the last.
+  Toolset (user, 2026-10-27: Muse ignored blend modes and could not get
+  height on glass; "muse needs to know how to use the software better than
+  anyone"): the instructions explain the per-channel compositing exactly
+  (`common.wgsl blend_layer`: Normal vs Replace on height, every mode's
+  math, recipes). A layer's "blend" is one mode for every channel it gives
+  (the normal keeps its own) or an object per channel; "channel_opacity"
+  per channel; "projection" (mode, scale, rotation, offset); patterns get
+  balance, warp, invert and every `ProcKind` but the normal generators;
+  generators get noise_scale, seed, height_reactive; masks get threshold
+  and levels gamma; filters every kind plus "channels"; anisotropy and its
+  angle. "texture_sets" changes height_scale, alpha_mode and
+  emissive_intensity (`sets_text` tells Muse the current ones). Height
+  calibration (tested on the lantern glass): slope ~ height_scale x range
+  x pattern scale, so fine patterns get 0.03 to 0.1, height_scale stays
+  0.02 for most objects. Reference images: the Image button or a drop on
+  the panel (`muse_drop`, from `RetroApp` file drops) attach images to the
+  next message (thumbnails, click removes); they become R1, R2... (copy in
+  `muse/refs`, sent as JPEG data URLs of at most 1024 px with their turn,
+  resent with the history); a layer source {"reference": n} uses one as a
+  texture. Every turn's plan is kept in `muse/plans/turn_N.json`.
+  `--musetest` with MF_MUSE_REFS=<image;image> attaches images to the
+  first message.
+  Since v37 the material choice is the point, not the layers (the user:
+  Muse over-layered and washed out good scans): the instructions ask for
+  1 to 3 layers per look, no dust, bleaching or wear unless asked or seen
+  in a reference, no Cells / Voronoi hammer marks (they read as cracks).
+  Each scanned material is listed with its average color and roughness
+  (`library::material_stats`, read from its maps once, cached in
+  `<data>/material_stats.json` by folder and color map mtime). While the
+  Muse panel is open, any dropped image goes to Muse (Windows gives no
+  pointer position during a file drag) and a "Drop images for Muse"
+  overlay shows while files hover; reference thumbnails sit in fixed rows
+  (`ref_row`, bigger on hover); a click on the numbered views shows them
+  over the whole window (`muse_view_big`, click or Escape closes).
+  MF_MUSE_ATTACH=<image;image> attaches images at start (UI checks).
+  v38: scan scale never below 1 (stretched scans looked low quality);
+  a scan's tint is normalized to at most 1 per channel (it can darken or
+  shift the hue, never brighten), so the tint bar shows the real value
+  and white gives the scan back. `--musetest` takes MF_VIEW_TONEMAP (0
+  ACES, 1 filmic, 2 AgX-like, 3 linear) and MF_VIEW_EXPOSURE. The
+  viewport defaults to linear (clamp) tone mapping (user's choice, back
+  to it on 2026-10-28 after a while on AgX-like).
+  v40, reliability: (1) the MATERIAL SHEET: every scan's preview sphere
+  numbered in list order (`material_lines` returns it; `muse/material_
+  sheet.png`), sent as the second image of the first message, the
+  numbers also in the text list. (2) SELF CHECK: after a turn that changed
+  the model (not a replay, not MF_MUSE_NOCHECK), `Muse.check` waits until
+  no set is left to composite, `muse_shot` renders front and back off
+  screen (its own `Viewport`, the view's look), and a check turn asks
+  Muse to fix only what is clearly wrong; it is remembered without its
+  render, its plan is `plans/turn_N_check.json`, its render
+  `muse/last_check.png`, and it is its own undo step. (3) GUARDS
+  (`guard_plan`, on the plan JSON before it is applied): a scan tinted
+  far (CIELAB distance above 20) from its own average gives way to the
+  closest scan of its category sharing a material word (`kind_words`:
+  wicker is not taken for oak); cell / Voronoi height on a scanned look is
+  dropped; at most 4 layers per look.
+  v41 panel: not connected, a "Connect Muse" card (opens KEYS_URL
+  https://dev.meta.ai/ via explorer; "Paste key and connect" reads the
+  clipboard with arboard, or the key is typed) checks the key with a free
+  GET /v1/models (401: refused) before saving it; Meta has no official
+  sign-in for third-party apps (a community route reuses Muse Code's own
+  client: not used). Connected: a bar with the Pieces chip, New
+  conversation and a "Connected" chip (Disconnect deletes the key file);
+  texture sets as chips; an empty state with example prompts; a status
+  card with Cancel; the composer (attachments, text, + Image, Send) is a
+  bottom panel `show_inside`, the chat a central panel. PIECES ON THE
+  MODEL replace the numbered image in the chat: `muse_update_pieces`
+  builds a 1024 piece-color texture per set (`pieces::owners`) shown by
+  display code 13 (shaded display color, viewport.wgsl) over the
+  material view, and `muse_piece_labels` draws the numbers on the view:
+  `piece_label_spots` renders the model at 240 px on the CPU with a depth
+  test (cached per camera) and puts each label on the visible pixel
+  nearest the middle of what its piece shows. MF_MUSE_PIECES=1 turns them
+  on at start (UI checks). An empty MODEL_API_KEY no longer hides the
+  saved key.
+  v42 PRINTS (labels, logos, screens; a TV session tiled tiny labels all
+  over the housing with Transform scale 0.035, guessed planar offsets
+  blind, and its self check then deleted the prints). New projection
+  mode ProjMode::Decal (code 6): `position` / `orient` (x right, y up, z
+  out of the surface) / `axes` (width, height, depth, mesh units) make a
+  box; `Projection::decal_uniform` maps the position map into its 0..1
+  space (v down) and sources.wgsl `decal_cov` cuts the whole layer to 0
+  outside it and on faces turned away (smoothstep on the normal). Muse
+  places a print with "decal": [x0, y0, x1, y1] (pixels of the numbered
+  views image; `views_of` is the framing `look_at` uses, `Views::hit`
+  raycasts the look's triangles, the box edges go onto the surface plane,
+  upright as that view shows it, image aspect kept, `trimmed` crops the
+  reference's blank border once into muse/prints) or "fit": true
+  (`decal_fit`: stretched over the look's pieces along their summed
+  normal; refused when they do not face one way). Transform filters are
+  dropped on placed prints; a print's "emissive" uses its image (a lit
+  screen). Prints do not count in the 4-layer cap, and `keep_prints`
+  puts back any print a self check leaves out. --musetest also opens a
+  mesh file as a new project (MF_MUSE_PLAN is a file path).
+  v43 PRINTS IN THE UV. `surfaces_of` builds the SURFACES image (third
+  image of the first message, muse/last_surfaces.png): the main UV islands
+  (`pieces::components` with uv, at least 0.4% of the area, up to 24),
+  each flattened along its summed normal and upright, all at one scale
+  (packed in rows, 1536 wide), what sits in front dimmed, a grid every 5%
+  of the longest side, numbered; its facts go in the instructions. A print
+  placed with "surface": k, "box" (SURFACES pixels) becomes a decal in that
+  island's frame (`Surface::place`). {"text", "font", "bold", "color"}
+  draws text with ab_glyph from a Windows font (`text_fonts`,
+  `text_image`, cached in muse/prints). `uv_sheet_of` flags attached
+  images laid out on a set's UV map (content inside the islands, spread
+  over the image) and the message tells Muse to use "uv_sheet": true (UV
+  projection, as is). The self check also gets the SURFACES image as the
+  model looks now (`surfaces_now`, from read-back final base and emissive;
+  muse/last_check_surfaces.png). `keep_prints` only restores prints no
+  look of the check kept; `screen_glass` turns see-through glass over a
+  glowing print into dark glossy glass carrying that image (transmission
+  shows the environment, not the pieces behind). MF_MUSE_SAVE=<sprp> keeps
+  a --musetest result as a project.
+  v44 REALISM. `muse_prepare` (first message): sets in scope go up to 2048
+  px (history cleared) and unbaked ones start a bake (--musetest waits for
+  it). Each look carries "finish" (FINISHES) and "age" 0..1;
+  `apply_finishes` rebuilds its "Finish:" layers (`finish_layers`:
+  roughness variation, smudges, fine scratches, grime from Dirt x grunge,
+  dust from Directional light, rubbed, polished or chipped edges, opacity
+  by age); they and prints are outside the 4 layer cap. Muse is told not to
+  make its own everyday wear. The check render is 2x2: front and back, then
+  `muse_closeups` (the two surfaces with the most print area, else the
+  largest not facing down, seen from the side; `Surface::to_ru`). A print
+  placed with "surface" gets a painted mask of that surface's piece (the
+  box no longer prints on what sits in front). `flat_screens` drops height
+  layers from looks with a glowing print.
+  v45 PRINT PLACEMENT (any object). `surfaces_of` keeps, per surface, which
+  piece wins each pixel in front of it (`Surface::cover`) and lists the
+  compact parts in front (`front`: "4b" = piece 4's second part, with its
+  box; frames around a surface are left out) in the facts
+  (muse/last_surfaces.txt). A print can be anchored: "surface", "near",
+  "side" (above, below, left, right), "size", "gap" (`Surface::near_box`;
+  above or below it is no wider than the space to the next part on its
+  row). Muse keeps where each surface print went (`Muse::placed`) and the
+  self check gets `placement_facts`: each print's box, the share hidden
+  behind pieces in front (pixel by pixel), off its surface, overlaps.
+  v46 IMAGES AS TOOLS (any object). `muse_project_files`: the images the
+  user imported into the project (Resource.imported) go with the next
+  message as references, once each (`Muse::files_sent`, written to
+  muse/files; same name as an attached ref: skipped), marked "project
+  file". `image_facts` adds each image's size as Muse sees it (max 1024),
+  transparency, black and white. `uv_sheet_of` also tells a UV layout
+  (fills the islands with a few flat colors: a guide, never a texture)
+  and the UV sheet note is conditional (never a photo or logo). Layer
+  source {"sample": n, "region", "flatten", "scale"}: `sample_texture`
+  cuts the region, evens its light falloff, makes it seamless (half shift
+  cross-fade) and it tiles like a scan. Mask steps and *_pattern maps take
+  {"reference": n, "uv_sheet" | "scale"}: `image_maps`/`gray_map` import
+  a gray version (`gray_image`, lightness x alpha) as "texture_id"; a UV
+  sheet channel map puts the layer on the UV map. muse/last_message.txt
+  keeps the last user message as sent.
+  v47 UV-AWARE PROJECTION (any object). `uv_fit` measures each piece's UVs
+  (coverage, degenerate share, uneven texel size, squash, overlap) and the
+  length direction of every UV island: UV-space PCA, turned a quarter
+  when the strip wraps a tube (its ends meet in 3D), else the 3D long
+  axis carried into the UV. `uv_facts` sends this to Muse ("UV LAYOUT of
+  each piece", muse/last_uv.txt). Projection UV takes "along": "length" |
+  "across": `fill_grain` measures the grain of the fill's own map (image,
+  or the pattern rendered at 256, structure tensor in `grain_of`) and
+  `uv_turn` rotates it onto the island direction; UV "scale" is in model
+  units like tri-planar (`UvFit::unit`). Islands that point different
+  ways (`uv_groups`, 15 degrees, at most 6) split the layer into a folder
+  with one copy per direction, each masked to its islands
+  (`muse_mask_islands`). Cut-outs: `ambientcg::best` skips single /
+  decal / leaf assets unless asked, and `is_cutout` rejects a downloaded
+  scan whose color map is an object on a flat background. `best` also
+  needs a material word match (category or tag), so color and finish
+  words alone ("green smooth") pick nothing.
+  v48 A CALMER SELF CHECK. The check used to redo every look (retuned
+  tints and scales, swapped scans for flat colors), mostly for the worse.
+  Now its prompt keeps the first answer unless the render shows a clear
+  defect, each returned look must name it in "problem", and
+  `guard_check` drops looks without one, or whose base was a scan and is
+  no longer a found scan (fix a wrong scan with another scan or a
+  texture_prompt, never plain colors). Each ambientCG layer of the
+  stored looks carries "got" (name, id, category, tags), so Muse can
+  judge the scan it really got. `ambientcg::best(cat, query, avoid)`:
+  stems plurals (leaves, leaf), requires the query's material noun (a
+  catalog category word) when it has one, "-word" excludes a tag, and a
+  new query never gets back a scan the looks already use (`scans_of`,
+  `Request::scans`).
+  v49 GLOSSY STAYS SMOOTH, PHOTO SAMPLES TRUE TO COLOR (ADP cap and
+  glaze). The lumps came from Muse's own instructions (broad waviness
+  "can use the whole range"; "polished surfaces still need relief"): on
+  a glossy surface the reflection magnifies every bump. Now the HEIGHT
+  text and the glass recipe say glossy surfaces (roughness 0.3 or less)
+  stay smooth, and `guard_plan` caps every height_pattern of such a look
+  at a range of 0.03 (range x layer_opacity). Samples: "flatten" now
+  divides out a quadratic fit of the region's lightness (`solve6`), so
+  only the light falloff goes and broad washes stay (the old 1/16 blur
+  removed the pattern itself); "mean": "#RRGGBB" moves the sample's
+  linear average to the surface's real color (a lit photo reads
+  lighter); projection "repeat": n sets the scale to n repeats across the
+  look's own pieces (their largest side). musetest also writes
+  result_check.png (the check's 2x2 render, `muse_test_shot`).
+  v50: the viewport defaults to linear (clamp) tone mapping again.
+  v51 GPU MEMORY (crash on "Cabane 2.fbx": 117 objects, no materials).
+  The FBX loader made one texture set per object when a polygon had no
+  material: 117 sets ran the graphics card out of memory and wgpu
+  aborted. Objects without a material now share one "DefaultMaterial"
+  set, as in Painter (that file's objects all reuse the same plank UVs).
+  And the texture sets keep within `SET_BUDGET` (3 GiB, about 96 bytes a
+  texel each, `Document::sets_bytes`): an import lowers its resolution
+  (`fitting_resolution`, with a message), a resolution change past it is
+  refused, and `muse_prepare` raises sets to 2048 only when they fit.
+  MF_MUSE_PLAN takes "a.json;b.json" (one plan per turn).
+  v52 MUSE ANSWERS THAT ARE NOT VALID JSON ("expected , or ]"). The raw
+  answer is written to muse/last_answer.txt. `parse_answer` reads it,
+  and when it does not parse, `repair_json` fixes the usual slips
+  (comments, missing and trailing commas, raw newlines in strings, a
+  bracket of the wrong kind, an answer cut short); a wrong-kind bracket
+  is read both ways (missing closer, one too many) and the reading whose
+  looks keep the most layers wins. Still unreadable: Muse is asked once
+  to send its answer again as valid JSON (one more API call, only then).
+  MF_MUSE_PLAN files go through `parse_answer` too.
+  v53 ONE RESULT PER PROMPT, TEXTURING STYLE, PHOTO LABELS.
+  One result: while Muse works and runs its self check, the viewport
+  shows a frozen copy of the view (`Muse.hold`, `muse_hold` /
+  `muse_release`, drawn by view3d through `muse_hold_tex`) and the chat
+  line waits (`Muse.pending`); the check's reply is merged into it
+  ("Refined after looking at the result: ..."), and the check's apply
+  takes no checkpoint (one undo step for the prompt). Failure, cancel
+  and the check's early returns release the hold.
+  Style: `enum Style {Auto, Product, Realistic, Stylized}`, a combo in
+  the Muse bar; on Auto Muse picks it (plan "style", kept in
+  `Convo.style`). The message states the style, the system prompt has a
+  TEXTURING STYLE section, and `apply_style` enforces it (product: finish
+  "none", age 0; stylized: finish "none"); the check is stricter for
+  product (clean, exact to the reference).
+  Photo labels: a print source takes "crop" [x0,y0,x1,y1] or "quad"
+  (4 corners TL TR BR BL) on Rn, plus "arc" degrees to unroll a part
+  wrapped around a cylinder (`cut_print`: homography `square_to_quad`,
+  `bilinear`, output at real proportions in muse/prints/cut_*.png).
+  `snap_quad` moves each side along its normal (reach 25% of the short
+  side) to the strongest edge, weighted by how close the color 6 px
+  inside it is to the quad's most common color (so a label edge wins
+  over the bottle's own edge); "snap": false keeps the corners. Print
+  "stretch": true fills its box (place() with aspect 0); a stretched
+  print whose box covers over 85% of the surface takes the whole
+  surface. Tested on ADP_mesh.fbx with the 405839 photo: two different
+  first crops snap to the same label (about 198 x 278 px). A photo label
+  is only as sharp as the photo (about 200 px wide there).
+  v54 PRODUCTS WITH LABELS (user's box.fbx, a medicine carton, 8 photos:
+  6 faces on a wooden table, 2 at an angle; v53 stretched portrait
+  photos over landscape surfaces, kept the table, missed the nested end
+  flaps and put faces on the wrong sides). New `src/app/photo.rs`:
+  `find_object` (background = k-means of the photo's border band in Lab,
+  the largest region unlike it, holes filled, the largest quad on its
+  convex hull; `fill` near 1 for one flat face), `paper_of` (the most
+  common light, nearly neutral color), `neutral_gains` / `balanced`
+  (white balance in linear light), `turned`, `sides` (the six faces of
+  a look's box: walls upright, top and bottom with -z up, as SURFACES),
+  `solve_sides` (deals the free face photos to the sides their
+  proportions fit, then the turns that fit, scored by how the colors
+  change along each shared edge (strip means removed) plus a quarter of
+  the mean difference; a move costs 1.5). Edge colors alone cannot tell
+  a box from the same box turned 180 deg, and are weak when faces differ
+  in color, so Muse gives "up" (the photo edge its letters' tops point
+  to) and "toward" for the top and bottom; the solver decides the rest.
+  muse.rs: print placement "side": "+x" (`side_decal`: a decal over the
+  whole side of the look's frame, from just outside to 15% of its depth
+  in, so every piece seen there gets it, flaps and folds included;
+  "area" for part of it). `look_frame`: the world axes unless most of
+  the surface faces other perpendicular ways. `muse_sides` (before a
+  look's layers): cut each face (crop / quad, or `find_object` then
+  `snap_quad` at 3% reach), one shared cast taken out (the largest group
+  of photos whose papers agree; each of them by its own paper, the
+  others by the group's), solve, save muse/prints/side_*.png as
+  "cut_file". SIDES facts (`sides_facts`: size, proportions, best view,
+  pieces seen, from a 96 x 96 depth raster) go to Muse with SURFACES;
+  each photo's facts give its face corners, share, proportions and a
+  tinted light color. `cut_quad` split out of `cut_print`; `snap_quad`
+  takes its reach. Cylinder wrap: new ProjMode::Wrap (code 7; shader
+  `wrap_uv`, coverage inside the height and arc on outward faces,
+  0.2 < r < 0.5 of the box; arc in `scale` degrees, 360 below 5).
+  "wrap": {facing, from, to, arc, axis} (`wrap_decal`: axis = least
+  eigenvector of the normals' covariance (`least_axis`, Jacobi), circle
+  by least squares, 64 slice radii (empty slices interpolated), the
+  straight part by default; a partial piece (a label mesh) gives its own
+  facing, height and arc; what is left out follows the print's
+  proportions). `Muse.resolved`: what the app chose for a print (side:
+  reference, "turned"; wrap: from, to, arc, facing) is written into the
+  stored looks, so the check and later turns see it; "rotate" is only
+  Muse's own. The check prompt knows up / turned / wrap and that the
+  cast removal is not a defect. MF_MUSE_CHECK=1 runs the check in
+  replays (its plan the next MF_MUSE_PLAN file); MF_MUSE_DUMP prints the
+  sides and wrap measurements. Real run on box.fbx (2 calls): Muse used
+  six side prints with the right proportions; its first "up" for the
+  front was wrong and the check fixed it (verified in a replay).
+- Mesh maps can be removed one by one in the texture set settings (X on
+  Normal, ID, AO, Curvature, Thickness; not Position and World normal,
+  which place the tri-planar projections): `TextureSetGpu::clear_map`
+  writes the unbaked constant, `TextureSet::removed_maps` (saved in the
+  project) shows "removed"; the next bake brings them all back.
+- Mask Blur works in UV space: it cannot cross UV seams, so with a large
+  radius each UV island blurs alone and the island borders show as
+  straight-edged blocks.
 - Canvas layout (`app/dock.rs`, since 2026-10-23, the approved design in
   `docs/design/material_forge_design_system.html`): the views fill the
-  window (CentralPanel); rounded panels float over them as egui Areas
-  (`float_panel`: elevation-1 shadow, radius 12, 10 px from the window
+  window (CentralPanel); rounded panels lie over them as egui Areas
+  (`dock_panel`: elevation-1 shadow, radius 12, 10 px from the window
   edge; the panel rect is allocated first so the content lies on top for
   hover and wheel): left 272 px (project button with the app menu, Layers /
   Texture sets / History segmented tabs), right column 312 px (Library on
@@ -455,14 +846,15 @@ src/selftest.rs          headless end-to-end test and bench
   `widgets::slide` is the same slider without its label (grid rows in the
   bake, display and texture set settings windows; no `egui::Slider`
   anywhere); `gradient_slider` (uniform channel values) is a rounded
-  black-to-white pill with a knob of the value's gray. Panels move by
-  their header (`Panels::offsets`, double click puts one back) and resize
-  by their inner edge (`left_w`, `right_w`); with the left panel hidden,
+  black-to-white pill with a knob of the value's gray. Panels dock (see
+  above) and resize by their inner edge (`left_w`, `right_w`,
+  `bottom_h`); with the left panel hidden,
   a logo + menu button sits in the top left corner (`home_menu`, with
   "Show the layers panel"). View overlays (labels, badge, axes, modifier
   help, toasts) use `visible_part` (the view minus the panels); toasts sit
   under the view bar. Texture set settings is
-  a window (gear in the layers panel). Panel visibility is `dock::Panels`
+  a docked panel (left column by default, under the layers; the gear in
+  the layers panel toggles it). Panel visibility is `dock::Panels`
   (`tab_open` / `focus_tab` / `toggle_tab` keep the old tab names); there
   is no menu bar, right icon strip or status bar any more (status text is
   faint in the canvas corner, left of the dock). In Split the views divide
@@ -606,7 +998,31 @@ src/selftest.rs          headless end-to-end test and bench
   smart materials. Thumbnails decode the files on a worker
   (`Shelf::decoded_files`, 512 px) and render on the rounded box (user
   smart materials now show their textures too). The old procedural stacks
-  are `procedural_smart_materials` (self test and bench only). The self
+  are `procedural_smart_materials` (self test and bench only). The 12
+  "Hand-painted ..." smart materials (`hand_painted_smart_materials`, no
+  files; a painted animated film look, user request 2026-10-26; the
+  earlier "Stylized" and "Painterly" sets were refused and removed, they
+  read as plastic and camo; then one recipe recolored 12 times was
+  refused as "all the same") each have their own build: gilded brass
+  (hexagon engraving, glints), rusted plate (chipped teal paint, rust,
+  streaks), chem copper (verdigris drips, glowing pockets), graffiti
+  bricks (mortar, neon splatter), hextech crystal (Cells facets, glowing
+  Cracks veins), shimmer glass (Marble swirls, Dots bubbles), enforcer
+  steel (Cells dents, scratches), worn leather, coat cloth (weave),
+  cobblestone (Cells tones, Cracks gaps, moss), weathered planks (Bricks
+  with aspect 0.25 as boards, old paint), skin (blush, freckles). Shared:
+  `painted_base` (the "Brush strokes" procedural mixing two colors),
+  `painted_light` (soft cool shadow, warm light, strokes only nudge the
+  border: a hard Levels cut made camo blobs), `crevices`, `edge_light`.
+  Patterns: Brush strokes (case 28), Paint splatter (29: blobs with
+  spiky borders, droplets, drips down -y) and Streaks (30: vertical runs)
+  in procedural.wgsl; Bricks, Hexagons, Brush strokes and Splatter are
+  `planar_kind`: in tri-planar projection `proc_tri` gives each face its
+  own plane (dominant axis, ragged border, no blend). Colors are picked
+  in sRGB and converted with `lin()` (fill values are linear).
+  `--matshot <dir> procs` renders every procedural in one sheet.
+  `--matshot <dir> sm:<name>` renders each such smart material's layers
+  added one by one on a sphere, then on the box. The self
   test checks every brush tip and recipe and writes `brushes.png` /
   `smart_materials.png` sheets. `--matsheet <dir>` renders every
   material thumbnail into one sheet; `--matshot <dir> [name|calib]` renders
@@ -754,10 +1170,25 @@ Designer node documentation images (clean-room: nothing copied).
 - Flakes (`ProcKind::Flakes`, folder "Normals", analytic_id 27): a normal
   procedural (voronoi cells as tilted mirrors; Scale, Tilt, Coverage) for
   the normal slot (`sources.wgsl` kind 27).
-- Fill layer rows show the material ball (metal reads as metal), with
-  the exact uniform base color in a small corner square (the eyedropper
-  picks it); a fill writing only a uniform color (and opacity) is a flat
-  swatch.
+- Fill layer rows show their base color as a flat swatch (the
+  eyedropper picks it); only a base color map (texture or procedural,
+  `layers::fill_has_ball`) shows a material ball, rendered like the
+  library thumbnails (`Previewer::new_layer`: studio light, the ball
+  filling the frame, not graded like the viewport).
+- Library: the grid / list button opens a menu: small, medium, large
+  thumbnails (`Shelf::thumb_size`, min tile 52 / 66 / 104 px) or list.
+  Thumbnails decode on up to (cores - 1, 2..8) worker threads, shrink on
+  the worker, every finished one shows the same frame, at most two GPU
+  renders per frame (`generate_thumbnails`).
+- F frames the view under the mouse (in Split, the last one it was over,
+  `last_view_2d`), not both.
+- Mask fill effects place their UV projection like fill layers (per-axis
+  scale and pivot, `m_uv` in sources.wgsl), so the 2D manipulator scales them.
+- egui 0.29.1 is vendored (`vendor/egui`, `[patch.crates-io]`): sub-menus
+  open to the left when the screen has no room on the right (menus of a
+  panel docked right), see "Material Forge" comments in its menu.rs.
+  File > Open recent is a regular flyout sub-menu again. The layers panel
+  header has a padlock next to the menu button (locks the panels).
 
 ## Performance (RTX 4060)
 
@@ -781,6 +1212,215 @@ resolution change of the 4 sets ~4 s (CPU maps in parallel, `make_sets`).
 Before tiling / lazy textures that project needed 7.5 GB and paged.
 Bake (1024, AA 2x2): 243k-triangle watch 7 s (was 48 s on the CPU).
 Path tracer: ~700 samples per second at 960 x 600 on simple scenes.
+
+- v55 (2026-10-29) LIBRARY: materials Muse downloads (ambientCG, in
+  `<library>/materials`) were listed as Starter assets. `Shelf::source_of`:
+  a texture material under the library dir is Project when the open
+  project uses it (its maps are resources, "<name> color.<ext>";
+  `Shelf::project_mats`, rebuilt in `browse`), else Your assets; the
+  Project category lists those materials too.
+- v55 PACKSHOT STUDIO (`src/studio.rs`, `app/studio_panel.rs`, shader
+  `pathtrace.wgsl` "studio" section): button next to Render (Icon::Studio)
+  turns it on (path traced, Material display, perspective) and opens its
+  flyout (flip_flyout 3, `flyout_at[2]`); again: the panel; again: off.
+  `Document.studio` (saved in the project header, serde default) holds up
+  to 8 lights (`StudioLight`: on, kind Softbox / Octabox / Gobo projector,
+  sRGB color, power, azimuth (0 the camera's side, + its right),
+  elevation, distance and sizes in object sizes (half the box diagonal),
+  softbox grid angle, gobo pattern / beam / focus / scale / rotation), the
+  background (shown exactly: linear, divided by the exposure), ground
+  shadows + opacity, room bounce, environment light, follow camera, lens
+  mm, format, output size and samples. Power: irradiance pi * power at the
+  subject (softbox radiance P pi d^2 / A, gobo intensity P pi d^2), then
+  physical inverse square. Shader: every light sampled at each bounce
+  (shadow ray; `trace` now takes a far limit) with per-lobe MIS against
+  BSDF rays meeting softboxes (`hit_lights`: fronts emit, rays pass
+  through; projectors are never met). Gobo projector = thin-lens profile
+  spot: a point on the lens (radius 0.08 d), the ray through p crosses the
+  focus plane (d / (1 - 0.85 focus)), seen from the lens center that is the
+  gate position; outside the gate circle nothing, flat field -25% at the
+  edge; patterns `gobo_pattern` (window, blinds, leaves fbm, dots, bars,
+  arch, grid). Ground (camera rays only, at the model's lowest y):
+  `ground_shade` = background * mix(1, lit / open, opacity), lit with
+  shadow rays and the gobo, open without either (beam pools never show,
+  shadows and gobo patterns do; plus a bounce term blocked near the
+  subject). Misses: the background from the camera and through
+  refractions, else background * room + environment * its light. Lens: the
+  frame's long side is 36 mm; `studio_camera` sets the view's fov so the
+  format's frame (`frame_in`, 92% x 90% of the view) gets it (the old fov
+  back when leaving); `studio_overlay` darkens outside the frame and marks
+  the lights that are on. "Render and save the image": `StudioJob` (its
+  own PathTracer + Viewport at the output size, about 2 M pixel samples a
+  frame, the view's tracer waits), then OIDN, the view's post pass and a
+  PNG. `--studioshot` renders one headless. Crawl state "packshot studio".
+
+- v56 (2026-10-29) STUDIO, from the user's session (ADP bottle: tall
+  strips at power 3.5 and env light to get a dull result): the studio is a
+  docked panel (dock.rs panel 5 "studio", Tab::Studio, shown while
+  `view.studio`; layout_v6.json, a v5 one is read with it added on top of
+  the right column); the flyout is gone. The frame fits the part the
+  panels leave visible (`studio_frame` = `visible_part`), and
+  `OrbitCamera.shift` (serde skip, a clip-space translation in `proj`)
+  puts the target at its center. Softbox power counts the box's whole
+  area (`box_irradiance`, 32 x 32), so large near boxes give the power
+  asked. LightKind::Flag (black card, kind 4): ends reflection rays
+  (`hit_lights` -> LightHit.stop). `SETUPS` / `Studio::setup`: soft high
+  key (default), glossy bottle (strips at +-105, front diffuser, top
+  octabox, flags at +-40), packaging, dark, window, blinds, leaves;
+  "Back to my lights" (`studio_prev`). Lock the camera (`lock_camera`,
+  `shot`, restored each frame in `studio_camera`). Background default
+  white. `--studioshot` MF_SETUP=<n>.
+- v57 (2026-10-29) STUDIO: the frame also stays under the view bar
+  (GAP + 46) and above the tool dock / options bar when they overlap it
+  horizontally (`studio_frame`, `dock_rect` / `options_rect`).
+- v58 (2026-10-29) AUTOSAVE (`app/autosave.rs`): Preferences > Autosave,
+  kept in `autosave.json` next to the library (`Autosave::load / save`):
+  on (default), every 1..60 minutes (default 10, counted from the first
+  change since the last save), save into recovery copies (default;
+  `<library>/../autosave/<name>_autosave.sprp` the newest, then `_2`, `_3`...,
+  1..20 kept, default 3; the project stays modified) or the project file
+  itself (clears modified; a project never saved gets copies). Waits for a
+  stroke, bake, save or studio render to end; wakes the app when due. "Open
+  the recovery folder". The old display settings slider is gone. Uitest
+  `autosave_check` (MF_UITEST_ONLY=autosave); crawl state "preferences".
+  Known: the full uitest fails at "no live color under the cursor while
+  armed" (eyedropper check), already in v53, not looked into yet.
+- v59 (2026-10-29) STUDIO, perfume and cosmetics only (user: "only
+  packshot type lights"): gobo projectors removed (enum Gobo, the shader's
+  gobo_pattern / noise, LightS.open); an old "Gobo" light reads as a
+  Softbox (`kind_or_softbox`). LightKind: Strip, Softbox, Octabox, Scrim
+  (diffusion panel), Card (white bounce: its radiance = color * power *
+  E / pi, E from the emitting lights at its middle, `Emitter::irradiance`,
+  12 x 12, no shadows), Flag. `LightKind::shape` gives a new kind its size
+  and soft edges (`set_kind`; "Add a light..." picks the kind).
+  StudioLight `feather` (soft edges) and `gradient` (top + / bottom -):
+  `profile` in studio.rs and the shader (GpuLight.prof), counted in
+  `box_irradiance` so the power holds. Studio: `falloff` + `pool`
+  (background darker away from the product: `bg_seen(d)`, around the
+  direction camera -> model center, radius atan(pool * 12 / lens mm)),
+  `floor_reflection` + `reflection_fade` (glossy plexi floor: the camera
+  ray at the ground adds ground_shade * (1 - k) and goes on reflected with
+  throughput k, its next hit fading to the background by exp(-t / fade);
+  guides from what it shows). `gpu()` now takes the eye.
+  `take_lighting` ("Back to my lights"). SETUPS: perfume white two strips
+  (default), backlit glass, white plexi, black and gold dark plexi,
+  cosmetics jars top light, lipstick and metal, skincare high key.
+- v60 (2026-10-30): studio edits are undo steps (history `Entry::Studio`,
+  `tracked_studio` in track_edits: frames within 0.8 s merge, so a drag is
+  one step; uitest MF_UITEST_ONLY=studioundo). Muse's ambientCG scans go to
+  `<data>/muse/scans/<category>/<id>` (`ambientcg::scans_dir`), not the
+  library; `move_scans_out_of_library` (at start) moves old ones there
+  (material.json source ambientCG). The shelf lists scans only in the
+  Project category of a project whose resources hold their maps
+  (`library::scan_materials`, Shelf.scans). Path tracer: F0 from the
+  specular level (finals' emissive alpha, 0.08 * level, like the viewport);
+  the ray off the glossy floor skips `hit_lights` (no light panels in the
+  plexi). Filter Curves (FilterKind code 17): `FilterDesc.curves` (RGB, R,
+  G, B; up to 8 points), `curve_eval` / stack.wgsl `curve` (monotone
+  cubic, flat past the ends), FilterU.curve; editor `curves_ui` in
+  panels.rs; selftest `curves_check`. Studio camera angles
+  (`Studio.angles`, CameraAngle: view, lens, format; View / Update /
+  Remove, "Save this angle", "Render every angle..." into a folder through
+  `studio_queue` and `render_studio_shot`). Lighting presets: "Save as
+  preset" writes `<library>/lighting/<name>.json` (`studio::save_preset`,
+  no angles); they list under "My presets" in the setup menu (Delete
+  there) and load with `take_lighting` (keeps camera and angles).
+- v61 (2026-11-03): the scan move runs first in `RetroApp::build`, failures
+  to stderr.
+- v62 (2026-11-03) STUDIO: entering it centers the model in the frame
+  (`studio::fit_camera`: from the camera's yaw and pitch, the model's
+  points (<= 20000) fill `FRAME_FILL` 0.7 of the frame, the picture of them
+  centered; `studio_recenter` frames in `studio_camera`, skipped when the
+  camera is locked); "Recenter the model" in Camera (a locked shot
+  follows); `--studioshot` MF_FRAME uses it. Leaving the studio
+  (`leave_studio`) turns path tracing off. LightKind::Spot "Hard light
+  (sun)": a small far disc (kind 2), crisp shadows. SETUPS replaced (8),
+  read from the user's Dior / Acqua di Parma references: pure white with
+  side strips (ADP e-commerce, default), light grey with a crisp side
+  shadow (Dior beauty), warm stone wall and window light (Dior Collection
+  Privee), white backlit glass, black rim strips and dark plexi, hard sun
+  long shadow (campaign), skincare top light, white plexi reflection;
+  `setup` now sets `pool` too. Muse lighting (`app/muse_light.rs`, in the
+  studio panel under the setups): photos (Add a photo... or dropped on the
+  window while in the studio, `studio_drop`) and a request go to Muse
+  Spark with SYSTEM (the studio's lighting model and how to read a photo's
+  shadows and highlights) and `to_json` of the lighting now; the answer's
+  "lighting" goes through `apply` (kinds by Debug name or display name,
+  values clamped, at most 8 lights), then a 640 px 96 spp check render
+  (`lighting_check.png` in muse/, through `render_studio_shot`) goes back
+  once with CHECK and the corrected lighting is applied. "Back to my
+  lights" restores the lighting before the request. MF_MUSE_LIGHT=<file>
+  replays an answer; uitest `studio_muse_check` (MF_UITEST_ONLY=studiomuse).
+- v63 (2026-11-03): the lighting request moved into Muse's texturing
+  conversation (user: "should be in the conversation we already had");
+  the studio panel only points there. `muse_light.rs` holds LIGHTING
+  (appended to `instructions` in `run`: the studio's model and how to
+  read a photo's light; answer key "lighting", no looks), `check_text`,
+  `apply`, `to_json`, `jpeg_url`. `muse_send` adds "[PACKSHOT STUDIO now:
+  <studio_facts> Its lighting: <json>]" to every message. `muse_answer`
+  applies "lighting" (`muse_lighting`: studio_prev kept, the studio
+  entered and recentered); a turn with only lighting renders a 640 px 96
+  spp studio check (`Muse.light_check`, `render_studio_shot` into
+  muse/lighting_check.png), `studio_finish` -> `muse_light_saved` sends it
+  back as a check Request, cancelling -> `muse_light_cancelled`. Tests:
+  MF_MUSE_PLAN turn;check + MF_MUSE_CHECK + MF_MUSE_OFFLINE (no ambientCG
+  catalog) + `muse_test_key`. Crash log: main's panic hook appends to
+  `<data>/crash.log` (the v62 "crash" left no trace; the old separate
+  studio chat is gone). Presets 0 to 2 retuned on the user's photos with
+  matching cameras (ADP square 100 mm pitch 9; Dior serum 3:2 pitch 12;
+  Gris Dior 2:3 85 mm pitch 4): a soft shadow needs the key to dominate
+  the ground's light (top lights weak, key a 1.4 softbox at distance 4.5,
+  not a big near scrim, whose shadow vanishes).
+- v64 (2026-11-04) MUSE LIGHTING, from the user's first real try (it baked
+  for nothing, light far from the photo): a new conversation's
+  `muse_prepare` (2048 px + mesh map bake, history cleared) is deferred to
+  the first answer with looks (`Muse.prepare`). `studio::photo_light`
+  measures a photo (background at the corners, the product's box from its
+  upper part, ground shadow at its foot left / right: darkness and reach in
+  product widths, a shadow along its sides, the brighter side); a message
+  `about_lighting` sends "[Light measures by the app: Rn ...]" for its
+  photos (`Muse.light_facts`), and the lighting check gives the photo's and
+  the render's measures. `muse_light::rules()` = LIGHTING + the 8 SETUPS
+  as JSON (tuned starting points) + measures and camera sections; the
+  answer may hold "camera": {"pitch", "lens_mm"} (applied unless the
+  camera is locked, then recentered). `to_json` rounds to 2 decimals.
+  `--lightmeasure <img>...` prints the measures. Muse's v63 answer on the
+  ADP photo: no shadow (measured: photo right 7%, 0.6 widths; preset 0:
+  9%, 1.0; Muse: none), camera at pitch 0.
+- v65 (2026-11-04) LIGHTING ONLY KEEPS THE MATERIALS. The user's v64 try:
+  Muse's lighting was about preset 0 with the right camera, but it also
+  sent looks (a cobalt lacquer body, a blue resin cap), so the bake and the
+  texture check ran and the lighting check never did. `lighting_only(text)`
+  (about the lighting, no texture / material / color / finish / label /
+  logo / print words; "highlight" ignored) sets `Muse.light_only`: the
+  message says "asks only for the packshot's lighting", and `muse_answer`
+  drops "looks" / "parts" with the note "Your materials were kept". The
+  studiomuse uitest replays a turn carrying looks and checks the stacks.
+  Preset 0 retuned on region colors of the ADP photo (SP cmp/regions.py:
+  cap, shoulder, body left / right means, label): the photo's left side
+  is a broad saturated sheen to the edge, its right a dim saturated blue
+  with no grey band. Now: key softbox el 22, sheen scrim 0.9 at az -100
+  d 2.0 2.6x3.6, front fill 0.5 at az 5 (its reflection hides behind the
+  label), back scrim 0.3 at 180 (shoulders), strip right 0.2 at az 135
+  (edge line only), top strip 0.15, shadow 0.4. Rules gained where a
+  light's reflection lands on a glossy cylinder (sine of half the
+  azimuth). The check text now puts the measures after the instructions.
+- v66 (2026-11-04) THE CLOSER LIGHTING STAYS. The user found v65's
+  Muse result worse: its check pass (driven by the left / right ratio
+  alone) dimmed the fill and strips; profile distance to the photo 0.23
+  against 0.12 for preset 0. `studio::photo_profile` (product box, its
+  color across the width at 3 heights x 16 steps, ground darkening 8 steps
+  right / 4 left) and `profile_distance` (mean abs, ground x3);
+  `photo_light` now ends with the brightness profile in words (8 steps,
+  3 heights) for Muse. `Muse.light_photo` = the photo's profile;
+  `muse_light_saved` stores `light_first` (studio, pitch, distance of the
+  first render); after the check answer the corrected lighting is
+  rendered to muse/lighting_verify.png (`light_verify`) and
+  `muse_light_verified` keeps the closer one (note "its first lighting was
+  kept" or "The correction is closer to your photo"). Preset 0 fitted by
+  coordinate descent (SP cmp/fit.py, 120 renders) on the ADP photo:
+  distance 0.121 to 0.064 (key 0.83 at az -60 el 12, sheen scrim 4.0
+  wide, fill el 20, back 0.45, strip right az 147, top 0.23).
 
 ## Tested meshes
 

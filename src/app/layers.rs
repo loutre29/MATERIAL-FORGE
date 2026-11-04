@@ -21,6 +21,13 @@ fn uv01() -> Rect {
     Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0))
 }
 
+/// Whether a fill layer's row shows a material ball: its base color is a
+/// map (otherwise a flat swatch of the color).
+pub(super) fn fill_has_ball(f: &crate::document::FillDesc) -> bool {
+    let ch = &f.channels[CH_COLOR];
+    ch.enabled && ch.source != crate::document::SourceKind::Uniform
+}
+
 fn draw_thumb(p: &egui::Painter, r: Rect, tex: Option<egui::TextureId>, swatch: Option<[f32; 3]>, icon: Option<Icon>, outline: bool) {
     p.rect_filled(r, 2.0, crate::style::warm(26));
     match (tex, swatch) {
@@ -357,6 +364,7 @@ impl RetroApp {
     fn set_settings_tab(&mut self, ui: &mut Ui) {
         let mut res_change = None;
         let mut bake = false;
+        let mut remove_map = None;
         let baking = self.bake_job.is_some();
         let doc = self.doc.as_mut().unwrap();
         let s = &mut doc.sets[doc.active];
@@ -474,15 +482,25 @@ impl RetroApp {
                 ui.label(RichText::new("MESH MAPS").strong().size(11.5));
                 ui.add_space(2.0);
                 for (i, name) in MESH_MAPS.iter().enumerate() {
+                    let removed = s.removed_maps & (1 << i) != 0;
+                    let has = s.baked && !removed;
                     ui.horizontal(|ui| {
                         let (r, _) = ui.allocate_exact_size(egui::vec2(40.0, 40.0), Sense::hover());
                         let tex = self.map_thumbs.get(&i).map(|t| t.2);
-                        draw_thumb(ui.painter(), r, if s.baked { tex } else { None }, None, None, false);
+                        draw_thumb(ui.painter(), r, if has { tex } else { None }, None, None, false);
                         ui.vertical(|ui| {
                             ui.add_space(4.0);
                             ui.label(*name);
-                            ui.weak(if s.baked { "baked" } else { "empty" });
+                            ui.weak(if has { "baked" } else if removed { "removed (bake again to get it back)" } else { "empty" });
                         });
+                        // Position and world normal place the tri-planar projections.
+                        if has && REMOVABLE_MAPS.contains(&i) {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if icons::button(ui, Icon::Close, false, 18.0, "Remove this map (the generators that read it get nothing)").clicked() {
+                                    remove_map = Some(i);
+                                }
+                            });
+                        }
                     });
                 }
                 ui.add_space(6.0);
@@ -497,8 +515,22 @@ impl RetroApp {
         if bake {
             self.open_bake_dialog();
         }
+        if let Some(i) = remove_map {
+            let doc = self.doc.as_mut().unwrap();
+            let s = &mut doc.sets[doc.active];
+            s.gpu.clear_map(&self.engine.queue, i);
+            s.removed_maps |= 1 << i;
+            s.bake_rev += 1;
+            s.dirty = true;
+            doc.modified = true;
+            let text = format!("{} map removed from {} (bake again to get it back).", MESH_MAPS[i], s.name);
+            self.message(text);
+        }
     }
 }
+
+/// The mesh maps the user may remove (not position and world normal).
+const REMOVABLE_MAPS: [usize; 5] = [0, 2, 3, 4, 6];
 
 /// Names of the mesh map thumbnails, in `map_textures` order.
 pub(super) const MESH_MAPS: [&str; 7] = ["Normal", "World space normal", "ID", "Ambient occlusion", "Curvature", "Position", "Thickness"];
@@ -574,20 +606,15 @@ fn layer_row(ui: &mut Ui, s: &TextureSet, l: &Layer, depth: usize, ch: usize, cm
     let tr = Rect::from_min_size(Pos2::new(x, cy - THUMB / 2.0 - 3.0), egui::vec2(THUMB, THUMB));
     let (tex, swatch, icon) = match &l.desc.kind {
         LayerKind::Paint => (thumbs.get(&(id, false)).copied(), None, None),
-        // A fill shows its material on a ball lit like the scene, so metal
-        // reads as metal; a uniform base color also shows exact in a corner
-        // (it can be eyedropped). A fill of nothing but a uniform color (and
-        // opacity) is a flat swatch.
+        // A fill shows its base color, flat (it can be eyedropped); a map in
+        // the base color shows on a material ball.
         LayerKind::Fill(f) => {
-            let ch = &f.channels[CH_COLOR];
-            let uniform = ch.enabled && ch.source == crate::document::SourceKind::Uniform;
-            let only_color = f.channels.iter().enumerate().all(|(c, x)| !x.enabled || c == CH_COLOR || c == crate::document::CH_OPACITY) && f.ext.iter().all(|x| !x.enabled);
-            let flat = only_color && (uniform || !ch.enabled);
-            (
-                if flat { None } else { thumbs.get(&(id, false)).copied() },
-                if flat { Some(if ch.enabled { ch.value } else { [0.3; 3] }) } else if uniform { Some(ch.value) } else { None },
-                None,
-            )
+            if fill_has_ball(f) {
+                (thumbs.get(&(id, false)).copied(), None, None)
+            } else {
+                let ch = &f.channels[CH_COLOR];
+                (None, Some(if ch.enabled { ch.value } else { [0.3; 3] }), None)
+            }
         }
         LayerKind::Filter(_) => (None, None, Some(Icon::Effect)),
         LayerKind::Folder => (None, None, Some(Icon::Folder)),

@@ -334,6 +334,9 @@ named_enum!(ProcKind {
     // Normal map generators (evaluated per texel, after the others so saved
     // codes keep their meaning).
     Flakes => "Flakes",
+    BrushStrokes => "Brush strokes",
+    Splatter => "Paint splatter",
+    Streaks => "Streaks",
 });
 
 impl ProcKind {
@@ -346,7 +349,7 @@ impl ProcKind {
     pub fn is_3d(self) -> bool {
         matches!(
             self,
-            ProcKind::Perlin3D | ProcKind::PerlinFractal3D | ProcKind::RidgedFractal3D | ProcKind::Simplex3D | ProcKind::Voronoi3D | ProcKind::VoronoiFractal3D | ProcKind::Worley3D
+            ProcKind::Perlin3D | ProcKind::PerlinFractal3D | ProcKind::RidgedFractal3D | ProcKind::Simplex3D | ProcKind::Voronoi3D | ProcKind::VoronoiFractal3D | ProcKind::Worley3D | ProcKind::BrushStrokes | ProcKind::Splatter | ProcKind::Streaks
         )
     }
 
@@ -371,6 +374,9 @@ impl ProcKind {
             ProcKind::VoronoiFractal3D => 25,
             ProcKind::Worley3D => 26,
             ProcKind::Flakes => 27,
+            ProcKind::BrushStrokes => 28,
+            ProcKind::Splatter => 29,
+            ProcKind::Streaks => 30,
             k if k.is_classic() => k.code(),
             _ => 0,
         }
@@ -384,6 +390,8 @@ named_enum!(ProjMode {
     PlanarY => "Planar Y",
     PlanarZ => "Planar Z",
     Object3D => "Object 3D (procedurals)",
+    Decal => "Decal",
+    Wrap => "Wrap (cylinder)",
 });
 
 named_enum!(SourceKind {
@@ -410,7 +418,50 @@ named_enum!(FilterKind {
     ColorCorrect => "Color correct",
     Mirror => "Mirror",
     Transform => "Transform",
+    Curves => "Curves",
 });
+
+/// Points of a curve the Curves filter allows (more go unused).
+pub const CURVE_POINTS: usize = 8;
+
+/// A tone curve through `pts` ((input, output), sorted by input): monotone
+/// cubic between the points, flat past the ends. Same as `curve` in
+/// stack.wgsl.
+pub fn curve_eval(pts: &[[f32; 2]], v: f32) -> f32 {
+    let n = pts.len().min(CURVE_POINTS);
+    if n == 0 {
+        return v;
+    }
+    if v <= pts[0][0] {
+        return pts[0][1];
+    }
+    if v >= pts[n - 1][0] {
+        return pts[n - 1][1];
+    }
+    let sec = |i: usize| (pts[i + 1][1] - pts[i][1]) / (pts[i + 1][0] - pts[i][0]).max(1e-5);
+    let slope = |i: usize| {
+        if i == 0 {
+            return sec(0);
+        }
+        if i == n - 1 {
+            return sec(n - 2);
+        }
+        let (a, b) = (sec(i - 1), sec(i));
+        if a * b <= 0.0 {
+            0.0
+        } else {
+            ((a + b) * 0.5).clamp(-3.0 * a.abs().min(b.abs()), 3.0 * a.abs().min(b.abs()))
+        }
+    };
+    let mut i = 0;
+    while i + 2 < n && v > pts[i + 1][0] {
+        i += 1;
+    }
+    let h = (pts[i + 1][0] - pts[i][0]).max(1e-5);
+    let t = (v - pts[i][0]) / h;
+    let (t2, t3) = (t * t, t * t * t);
+    (2.0 * t3 - 3.0 * t2 + 1.0) * pts[i][1] + (t3 - 2.0 * t2 + t) * h * slope(i) + (-2.0 * t3 + 3.0 * t2) * pts[i + 1][1] + (t3 - t2) * h * slope(i + 1)
+}
 
 named_enum!(Generator {
     Edges => "Edges (curvature)",
@@ -652,6 +703,9 @@ impl Projection {
         use glam::{Mat3, Vec3};
         let rinv = Mat3::from_quat(self.rotation3().inverse());
         let s = Vec3::from(self.axes).abs().max(Vec3::splat(1e-4));
+        if self.mode == ProjMode::Decal || self.mode == ProjMode::Wrap {
+            return self.decal_uniform(w, rinv, s);
+        }
         // Mesh point x to projection space: c + S^-1 R^-1 (x - c - t);
         // in position-map space (x = min + k p) that is L p + b.
         let m = Mat3::from_diagonal(1.0 / s) * rinv;
@@ -670,6 +724,34 @@ impl Projection {
             nr: [row(&rinv, 0, 0.0), row(&rinv, 1, 0.0), row(&rinv, 2, 0.0)],
             uvx: [self.stretch[0], self.stretch[1], self.wrap.code(), self.filter.code()],
             uvp: [self.pivot[0], self.pivot[1], 0.0, 0.0],
+        }
+    }
+}
+
+impl Projection {
+    /// A decal: one image on a box placed on the model (center `position`
+    /// from the mesh center, orientation `orient`: x right, y up, z out of
+    /// the surface; `axes`: width, height, depth in mesh units). The
+    /// position map goes to the box's 0..1 space (v down, as images go).
+    /// A wrap is a decal around the box's y axis (a label on a bottle): the
+    /// image goes around it over `scale` degrees (360 below 5), its middle
+    /// facing z.
+    fn decal_uniform(&self, w: &WorldMap, rinv: glam::Mat3, s: glam::Vec3) -> ProjU {
+        use glam::{Mat3, Vec3};
+        let f = Mat3::from_diagonal(Vec3::new(1.0, -1.0, 1.0) / s) * rinv;
+        let l = f * Mat3::from_diagonal(w.k);
+        let b = f * (w.min - w.center - Vec3::from(self.position)) + Vec3::splat(0.5);
+        let row = |m: &Mat3, i: usize, e: f32| {
+            let r = m.row(i);
+            [r.x, r.y, r.z, e]
+        };
+        ProjU {
+            proj: [self.mode.code() as f32, if self.mode == ProjMode::Wrap { (if self.scale >= 5.0 { self.scale.min(360.0) } else { 360.0 }).to_radians() } else { 1.0 }, 0.0, self.sharpness],
+            offs: [0.0, 0.0, 1.0, 1.0],
+            xf: [row(&l, 0, b.x), row(&l, 1, b.y), row(&l, 2, b.z)],
+            nr: [row(&rinv, 0, 0.0), row(&rinv, 1, 0.0), row(&rinv, 2, 0.0)],
+            uvx: [1.0, 1.0, 1.0, self.filter.code()],
+            uvp: [0.5, 0.5, 0.0, 0.0],
         }
     }
 }
@@ -744,6 +826,9 @@ pub struct FilterDesc {
     pub p: [f32; 8],
     pub color: [f32; 3],
     pub color2: [f32; 3],
+    /// Curves: RGB (every channel), then red, green, blue; (input, output)
+    /// points sorted by input.
+    pub curves: [Vec<[f32; 2]>; 4],
 }
 
 impl Default for FilterDesc {
@@ -785,7 +870,8 @@ impl FilterDesc {
         if matches!(kind, FilterKind::Mirror | FilterKind::Transform) {
             channels = [true; NCH];
         }
-        FilterDesc { kind, channels, p, color: [1.0, 0.8, 0.6], color2: [1.0, 1.0, 1.0] }
+        let line = || vec![[0.0, 0.0], [1.0, 1.0]];
+        FilterDesc { kind, channels, p, color: [1.0, 0.8, 0.6], color2: [1.0, 1.0, 1.0], curves: [line(), line(), line(), line()] }
     }
 
     fn blur_radius(&self) -> f32 {
@@ -1464,6 +1550,9 @@ pub struct TextureSet {
     pub gpu: TextureSetGpu,
     pub raster: bake::UvRaster,
     pub baked: bool,
+    /// Mesh maps removed by the user (bit i: `MESH_MAPS[i]`), constant
+    /// until the next bake.
+    pub removed_maps: u8,
     pub dirty: bool,
     /// Bumped when the mesh maps change (generators depend on them).
     pub bake_rev: u64,
@@ -1855,6 +1944,8 @@ fn plan_mask<'a>(l: &'a Layer, ctx: &PlanCtx<'a>) -> Option<MaskPlan<'a>> {
                 u.offs = pu.offs;
                 u.xf = pu.xf;
                 u.nr = pu.nr;
+                u.uvx = pu.uvx;
+                u.uvp = pu.uvp;
                 MaskStep::Effect { params: u, paint: None, texture: tex }
             }
             MaskEffectKind::Generator(g) => {
@@ -1922,6 +2013,20 @@ fn plan_layer<'a>(l: &'a Layer, ctx: &PlanCtx<'a>) -> Option<Plan<'a>> {
     })
 }
 
+/// The Curves filter's points for the shader: two (x, y) per vec4, eight
+/// per curve, x < 0 past the last one.
+fn curve_uniform(curves: &[Vec<[f32; 2]>; 4]) -> [[f32; 4]; 16] {
+    let mut out = [[-1.0f32; 4]; 16];
+    for (c, pts) in curves.iter().enumerate() {
+        for (i, p) in pts.iter().take(CURVE_POINTS).enumerate() {
+            let v = &mut out[c * 4 + i / 2];
+            v[(i % 2) * 2] = p[0].clamp(0.0, 1.0);
+            v[(i % 2) * 2 + 1] = p[1];
+        }
+    }
+    out
+}
+
 fn filter_plan<'a>(f: &FilterDesc, op_a: [f32; 4], op_b: [f32; 4], mask: Option<MaskPlan<'a>>) -> Plan<'a> {
     let bits = f.channels.iter().enumerate().fold(0u32, |acc, (i, &c)| acc | ((c as u32) << i));
     Plan::Filter {
@@ -1933,6 +2038,7 @@ fn filter_plan<'a>(f: &FilterDesc, op_a: [f32; 4], op_b: [f32; 4], mask: Option<
             p1: [f.p[4], f.p[5], f.p[6], f.p[7]],
             color: [f.color[0], f.color[1], f.color[2], 1.0],
             color2: [f.color2[0], f.color2[1], f.color2[2], 1.0],
+            curve: curve_uniform(&f.curves),
         },
         blur_radius: f.blur_radius(),
         mask,
@@ -2066,6 +2172,8 @@ pub struct Document {
     pub pick_map: Vec<(u32, u32)>,
     /// Geometry mask: hidden triangles per submesh.
     pub hidden: Vec<Vec<bool>>,
+    /// The packshot studio's lights, background and camera.
+    pub studio: crate::studio::Studio,
 }
 
 pub struct Hit {
@@ -2076,6 +2184,10 @@ pub struct Hit {
     pub uv: [f32; 2],
     pub dist: f32,
 }
+
+/// GPU memory the texture sets may take (bytes): past it the graphics card
+/// runs out and the app stops, so larger sets are refused or lowered.
+pub const SET_BUDGET: u64 = 3 << 30;
 
 impl Document {
     pub fn new(engine: &Engine, mesh: MeshData, mesh_name: String, res: u32) -> Self {
@@ -2098,6 +2210,7 @@ impl Document {
             bvh,
             pick_map,
             hidden: Vec::new(),
+            studio: Default::default(),
         };
         doc.reset_hidden();
         for s in 0..doc.sets.len() {
@@ -2145,6 +2258,7 @@ impl Document {
             gpu,
             raster,
             baked: false,
+            removed_maps: 0,
             dirty: true,
             bake_rev: 0,
             focus: None,
@@ -2714,6 +2828,23 @@ impl Document {
 
 impl Document {
     /// Resamples every layer and mesh map of a texture set to `res`.
+    /// The GPU memory of the texture sets at these resolutions (finals with
+    /// their mips, mesh maps, a paint layer and the compositing buffers:
+    /// about 96 bytes a texel), to keep a project within `SET_BUDGET`.
+    pub fn sets_bytes(res: impl IntoIterator<Item = u32>) -> u64 {
+        res.into_iter().map(|r| r as u64 * r as u64 * 96).sum()
+    }
+
+    /// The largest resolution (power of two, 256 at least) at which `n`
+    /// texture sets fit the budget.
+    pub fn fitting_resolution(n: usize, want: u32) -> u32 {
+        let mut res = want;
+        while res > 256 && Self::sets_bytes(std::iter::repeat(res).take(n)) > SET_BUDGET {
+            res /= 2;
+        }
+        res
+    }
+
     pub fn change_resolution(&mut self, engine: &Engine, set: usize, res: u32) {
         let mesh = self.mesh.clone();
         let s = &mut self.sets[set];

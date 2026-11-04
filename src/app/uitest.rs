@@ -87,10 +87,30 @@ pub fn ui_smoke(out: &Path) -> anyhow::Result<()> {
     d.idle(&mut app, 3);
     anyhow::ensure!(app.doc.is_some(), "project was not created: {}", app.status);
     println!("project created ({} frames, {:.1}s)", d.frames, t0.elapsed().as_secs_f32());
-    // MF_UITEST_ONLY=path / uvgizmo: that check alone (quick iterations).
+    // MF_UITEST_ONLY=path / uvgizmo / panels: that check alone (quick iterations).
     if std::env::var("MF_UITEST_ONLY").is_ok_and(|v| v == "path") {
         path_check(&mut d, &mut app)?;
         println!("UITEST OK (path only): {} frames in {:.1}s", d.frames, t0.elapsed().as_secs_f32());
+        return Ok(());
+    }
+    if std::env::var("MF_UITEST_ONLY").is_ok_and(|v| v == "panels") {
+        panel_dock_check(&mut d, &mut app)?;
+        println!("UITEST OK (panels only): {} frames in {:.1}s", d.frames, t0.elapsed().as_secs_f32());
+        return Ok(());
+    }
+    if std::env::var("MF_UITEST_ONLY").is_ok_and(|v| v == "autosave") {
+        autosave_check(&d, &mut app, out)?;
+        println!("UITEST OK (autosave only): {} frames in {:.1}s", d.frames, t0.elapsed().as_secs_f32());
+        return Ok(());
+    }
+    if std::env::var("MF_UITEST_ONLY").is_ok_and(|v| v == "studiomuse") {
+        studio_muse_check(&mut d, &mut app, out)?;
+        println!("UITEST OK (studio muse only): {} frames in {:.1}s", d.frames, t0.elapsed().as_secs_f32());
+        return Ok(());
+    }
+    if std::env::var("MF_UITEST_ONLY").is_ok_and(|v| v == "studioundo") {
+        studio_undo_check(&mut d, &mut app)?;
+        println!("UITEST OK (studio undo only): {} frames in {:.1}s", d.frames, t0.elapsed().as_secs_f32());
         return Ok(());
     }
     if std::env::var("MF_UITEST_ONLY").is_ok_and(|v| v == "uvgizmo") {
@@ -99,6 +119,9 @@ pub fn ui_smoke(out: &Path) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    autosave_check(&d, &mut app, out)?;
+    studio_undo_check(&mut d, &mut app)?;
+    studio_muse_check(&mut d, &mut app, out)?;
 
     // Every window.
     app.show_view_settings = true;
@@ -846,55 +869,8 @@ fn interaction_checks(d: &mut Driver, app: &mut RetroApp) -> anyhow::Result<()> 
     app.dock = None;
     app.view.layout = Layout::Both;
     d.idle(app, 2);
-    // Panels: the edge resizes, the header moves, a double click puts it
-    // back; a hidden left panel comes back from the corner menu.
-    app.dock = None;
-    d.idle(app, 2);
-    let edge = marked(&d.ctx, "panel right:left").ok_or_else(|| anyhow::anyhow!("left panel edge not drawn"))?.center();
-    d.drag(app, &line(edge, edge + egui::vec2(60.0, 0.0), 6), Modifiers::NONE);
-    d.idle(app, 1);
-    let lw = app.dock.clone().unwrap_or_default().left_w;
-    anyhow::ensure!(lw > dock::LEFT_W + 40.0, "dragging the left panel edge did not widen it ({lw})");
-    // The bottom right corner of the library: it floats and grows both ways.
-    let corner = marked(&d.ctx, "panel bottom right:library").ok_or_else(|| anyhow::anyhow!("library corner not drawn"))?.center();
-    d.drag(app, &line(corner, corner + egui::vec2(-30.0, 50.0), 6), Modifiers::NONE);
-    d.idle(app, 1);
-    let r = app.dock.clone().unwrap_or_default().rects[1].ok_or_else(|| anyhow::anyhow!("resizing the library corner did not float it"))?;
-    let lib0 = marked(&d.ctx, "panel header:library").unwrap();
-    anyhow::ensure!(r[3] - r[1] > 100.0 && (r[2] - r[0]) < dock::RIGHT_W, "the corner did not resize the library ({r:?}, header {lib0:?})");
-    let head = marked(&d.ctx, "panel header:library").ok_or_else(|| anyhow::anyhow!("library header not drawn"))?;
-    let h = Pos2::new(head.min.x + 60.0, head.center().y);
-    d.drag(app, &line(h, h + egui::vec2(-80.0, 40.0), 6), Modifiers::NONE);
-    d.idle(app, 1);
-    let r2 = app.dock.clone().unwrap_or_default().rects[1].unwrap();
-    anyhow::ensure!(r2[0] < r[0] - 60.0 && r2[1] > r[1] + 20.0, "dragging the library header did not move it ({r:?} -> {r2:?})");
-    // (Wait first: right after the drag it would count as a triple click.)
-    d.idle(app, 40);
-    let head = marked(&d.ctx, "panel header:library").ok_or_else(|| anyhow::anyhow!("library header not drawn"))?;
-    let h = Pos2::new(head.min.x + 60.0, head.center().y);
-    d.frame(app, vec![Event::PointerMoved(h)], Modifiers::NONE);
-    for _ in 0..2 {
-        d.frame(app, vec![Event::PointerButton { pos: h, button: PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE }], Modifiers::NONE);
-        d.frame(app, vec![Event::PointerButton { pos: h, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE }], Modifiers::NONE);
-    }
-    d.idle(app, 1);
-    anyhow::ensure!(app.dock.clone().unwrap_or_default().rects[1].is_none(), "a double click did not dock the library back");
-    // Locked: the edge no longer resizes.
-    app.dock.get_or_insert_with(Default::default).locked = true;
-    d.idle(app, 2);
-    let lw0 = app.dock.clone().unwrap_or_default().left_w;
-    d.drag(app, &line(edge, edge + egui::vec2(60.0, 0.0), 6), Modifiers::NONE);
-    d.idle(app, 1);
-    anyhow::ensure!(app.dock.clone().unwrap_or_default().left_w == lw0, "a locked panel resized");
-    app.dock = None;
-    d.idle(app, 2);
-    app.toggle_tab(dock::Tab::Layers);
-    d.idle(app, 2);
-    anyhow::ensure!(marked(&d.ctx, "menu:Home").is_some() && !app.tab_open(dock::Tab::Layers), "no menu in the corner while the left panel is hidden");
-    app.focus_tab(dock::Tab::Layers);
-    app.dock = None;
-    d.idle(app, 2);
-    println!("interactions: display menu, menu dismiss, Escape order, selection history, rename focus, dock icons OK");
+    panel_dock_check(d, app)?;
+    println!("interactions: display menu, menu dismiss, Escape order, selection history, rename focus, dock icons, panel docking OK");
     multi_select_check(d, app)?;
     gizmo_check(d, app)?;
     color_field_check(d, app)?;
@@ -1290,6 +1266,67 @@ fn uvgizmo_check(d: &mut Driver, app: &mut RetroApp) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn panel_dock_check(d: &mut Driver, app: &mut RetroApp) -> anyhow::Result<()> {
+    // Panels: the inner edge resizes; a header carried to another place
+    // docks the panel there (the library along the bottom, with the tool
+    // dock above it, then in the left column under the layers); let go over
+    // the canvas, it stays; a hidden left panel comes back from the corner
+    // menu.
+    app.dock = None;
+    d.idle(app, 2);
+    let edge = marked(&d.ctx, "panel right:left").ok_or_else(|| anyhow::anyhow!("left panel edge not drawn"))?.center();
+    d.drag(app, &line(edge, edge + egui::vec2(60.0, 0.0), 6), Modifiers::NONE);
+    d.idle(app, 1);
+    let lw = app.dock.clone().unwrap_or_default().left_w;
+    anyhow::ensure!(lw > dock::LEFT_W + 40.0, "dragging the left panel edge did not widen it ({lw})");
+    let screen = d.ctx.screen_rect();
+    let lib_head = |d: &Driver| marked(&d.ctx, "panel header:library").map(|r| Pos2::new(r.min.x + 60.0, r.center().y)).ok_or_else(|| anyhow::anyhow!("library header not drawn"));
+    let slot = |app: &RetroApp| app.dock.clone().unwrap_or_default().slot(1);
+    let h = lib_head(d)?;
+    d.drag(app, &line(h, app.canvas_mid.center(), 8), Modifiers::NONE);
+    d.idle(app, 2);
+    anyhow::ensure!(slot(app) == dock::Slot::Left, "the library let go over the canvas did not stay in its column");
+    let h = lib_head(d)?;
+    d.drag(app, &line(h, Pos2::new(app.canvas_mid.center().x, screen.max.y - 40.0), 8), Modifiers::NONE);
+    d.idle(app, 3);
+    anyhow::ensure!(slot(app) == dock::Slot::Bottom, "the library carried to the bottom did not dock there");
+    let lib = marked(&d.ctx, "panel header:library").ok_or_else(|| anyhow::anyhow!("library header not drawn at the bottom"))?;
+    anyhow::ensure!(lib.min.y > screen.center().y && app.dock_rect.max.y < lib.min.y && app.options_rect.max.y < app.dock_rect.min.y, "the tool dock is not above the bottom library (library {lib:?}, dock {:?})", app.dock_rect);
+    anyhow::ensure!(app.canvas_mid.max.y <= lib.min.y + 1.0, "the canvas still runs under the bottom library");
+    let top = marked(&d.ctx, "panel top:library").ok_or_else(|| anyhow::anyhow!("bottom library edge not drawn"))?.center();
+    d.drag(app, &line(top, top - egui::vec2(0.0, 50.0), 6), Modifiers::NONE);
+    d.idle(app, 1);
+    let bh = app.dock.clone().unwrap_or_default().bottom_h;
+    anyhow::ensure!(bh > dock::BOTTOM_H + 30.0, "dragging the bottom library's edge did not raise it ({bh})");
+    let h = lib_head(d)?;
+    d.drag(app, &line(h, Pos2::new(screen.min.x + 100.0, screen.max.y - 60.0), 8), Modifiers::NONE);
+    d.idle(app, 3);
+    let pn = app.dock.clone().unwrap_or_default();
+    anyhow::ensure!(slot(app) == dock::Slot::Left && pn.order[1] > pn.order[0], "the library carried under the layers did not dock there ({:?} {:?})", pn.slots, pn.order);
+    let split = marked(&d.ctx, "panel split:left").ok_or_else(|| anyhow::anyhow!("no split between the layers and the library"))?.center();
+    let w0 = pn.weights;
+    d.drag(app, &line(split, split + egui::vec2(0.0, 60.0), 6), Modifiers::NONE);
+    d.idle(app, 1);
+    let w1 = app.dock.clone().unwrap_or_default().weights;
+    anyhow::ensure!(w1[0] / w1[1] > w0[0] / w0[1] * 1.05, "dragging the split did not grow the layers ({w0:?} -> {w1:?})");
+    // Locked: the edge no longer resizes.
+    app.dock.get_or_insert_with(Default::default).locked = true;
+    d.idle(app, 2);
+    let lw0 = app.dock.clone().unwrap_or_default().left_w;
+    d.drag(app, &line(edge, edge + egui::vec2(60.0, 0.0), 6), Modifiers::NONE);
+    d.idle(app, 1);
+    anyhow::ensure!(app.dock.clone().unwrap_or_default().left_w == lw0, "a locked panel resized");
+    app.dock = None;
+    d.idle(app, 2);
+    app.toggle_tab(dock::Tab::Layers);
+    d.idle(app, 2);
+    anyhow::ensure!(marked(&d.ctx, "menu:Home").is_some() && !app.tab_open(dock::Tab::Layers), "no menu in the corner while the left panel is hidden");
+    app.focus_tab(dock::Tab::Layers);
+    app.dock = None;
+    d.idle(app, 2);
+    Ok(())
+}
+
 fn path_check(d: &mut Driver, app: &mut RetroApp) -> anyhow::Result<()> {
     let key = |d: &mut Driver, app: &mut RetroApp, k: egui::Key| {
         d.frame(app, vec![Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE }], Modifiers::NONE);
@@ -1661,5 +1698,310 @@ fn gizmo_check(d: &mut Driver, app: &mut RetroApp) -> anyhow::Result<()> {
     anyhow::ensure!(app.history.version > before, "the gizmo drag is not in the history (version {} -> {}, last {:?})", before, app.history.version, app.history.undo.last().map(|e| e.label().to_string()));
     app.view.layout = Layout::Both;
     println!("projection manipulator: arrow drag moved the projection by {:.3}", moved.length());
+    Ok(())
+}
+
+/// `--musetest <project> <dir> <prompt> [set,set]`: Muse textures a copy of
+/// the project headless (the key from MODEL_API_KEY; data in `<dir>/data`),
+/// then the viewport is saved as `<dir>/result.png` next to Muse's views
+/// and plan (`data/muse`). The project file is not written.
+pub fn muse_test(project: &Path, out: &Path, prompt: &str, sets: &[String]) -> anyhow::Result<()> {
+    std::fs::create_dir_all(out)?;
+    std::env::set_var("MF_DATA_DIR", out.join("data"));
+    HEADLESS.store(true, std::sync::atomic::Ordering::Relaxed);
+    let t0 = Instant::now();
+    let engine = Engine::headless()?;
+    let renderer = egui_wgpu::Renderer::new(&engine.device, wgpu::TextureFormat::Bgra8Unorm, None, 1, false);
+    let ctx = egui::Context::default();
+    // A mesh file opens as a new project.
+    let mesh = !project.extension().is_some_and(|e| e.eq_ignore_ascii_case("sprp"));
+    let mut app = RetroApp::build(engine, Arc::new(egui::mutex::RwLock::new(renderer)), &ctx, (!mesh).then(|| project.to_path_buf()));
+    app.persist_layout = false;
+    app.lock_cursor = false;
+    if mesh {
+        app.create_project(project.to_path_buf(), 1024)?;
+    }
+    // MF_VIEW_TONEMAP / MF_VIEW_EXPOSURE: the render's look (comparisons).
+    if let Some(t) = std::env::var("MF_VIEW_TONEMAP").ok().and_then(|t| t.parse().ok()) {
+        app.view.tonemap = t;
+    }
+    if let Some(e) = std::env::var("MF_VIEW_EXPOSURE").ok().and_then(|e| e.parse().ok()) {
+        app.view.exposure = e;
+    }
+    let mut d = Driver { ctx, size: egui::vec2(1600.0, 950.0), frames: 0 };
+    d.idle(&mut app, 3);
+    anyhow::ensure!(app.doc.is_some(), "project not opened: {}", app.status);
+    let shot = |app: &RetroApp, name: &str| crate::selftest::screenshot(&app.engine, app.engine.viewport.output(), &out.join(name));
+    d.idle(&mut app, 20);
+    shot(&app, "before.png")?;
+    // Turns of the conversation, separated by "||"; a shot after each.
+    let turns: Vec<&str> = prompt.split("||").map(str::trim).filter(|t| !t.is_empty()).collect();
+    for (k, turn) in turns.iter().enumerate() {
+        println!("> {turn}");
+        // MF_MUSE_REFS=<image;image>: reference images with the first message.
+        if k == 0 {
+            for f in std::env::var("MF_MUSE_REFS").unwrap_or_default().split(';').filter(|f| !f.is_empty()) {
+                app.muse_attach(&d.ctx, Path::new(f));
+            }
+        }
+        app.muse_test_send(&d.ctx, turn, sets)?;
+        loop {
+            d.idle(&mut app, 1);
+            // Muse's first look may start a bake: the result waits for it.
+            if !app.muse_test_state().0 && app.bake_job.is_none() {
+                break;
+            }
+            anyhow::ensure!(t0.elapsed().as_secs() < 1800, "Muse took more than 30 minutes");
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        for l in app.muse_test_state().1 {
+            println!("  {l}");
+        }
+        if k + 1 < turns.len() {
+            d.idle(&mut app, 40);
+            app.engine.device.poll(wgpu::Maintain::Wait);
+            shot(&app, &format!("turn{}.png", k + 1))?;
+        }
+    }
+    // The stack Muse built (MF_MUSE_DUMP=1).
+    if std::env::var_os("MF_MUSE_DUMP").is_some() {
+        fn dump(l: &crate::document::Layer, depth: usize) {
+            let d = &l.desc;
+            let kind = match &d.kind {
+                LayerKind::Fill(f) => {
+                    let on: Vec<String> = f.channels.iter().enumerate().filter(|(_, c)| c.enabled).map(|(i, c)| format!("{i}:{:?}{:?}", c.source, c.value)).collect();
+                    format!("fill proj {:?} x{} [{}]", f.projection.mode, f.projection.scale, on.join(" "))
+                }
+                LayerKind::Folder => "folder".to_string(),
+                _ => "other".to_string(),
+            };
+            let mask = d.mask.as_ref().map(|m| format!(" mask base {} {:?}", m.base, m.effects.iter().map(|e| format!("{:?}", e.kind).chars().take(90).collect::<String>()).collect::<Vec<_>>())).unwrap_or_default();
+            println!("{}{} vis {} op {:?} {kind}{mask}", "  ".repeat(depth), d.name, d.visible, d.opacity[0]);
+            for c in l.children.iter().rev() {
+                dump(c, depth + 1);
+            }
+        }
+        if let Some(doc) = &app.doc {
+            for s in &doc.sets {
+                println!("set {}", s.name);
+                for l in s.layers.iter().rev() {
+                    dump(l, 1);
+                }
+            }
+        }
+    }
+    d.idle(&mut app, 40);
+    app.engine.device.poll(wgpu::Maintain::Wait);
+    shot(&app, "result.png")?;
+    // The render the self check sees: front, back and close-ups.
+    if let Some(img) = app.muse_test_shot() {
+        img.save(out.join("result_check.png"))?;
+    }
+    app.frame_mesh();
+    d.idle(&mut app, 10);
+    app.engine.device.poll(wgpu::Maintain::Wait);
+    shot(&app, "result_full.png")?;
+    // MF_MUSE_SAVE=<file.sprp>: keeps the result as a project to open.
+    if let (Some(p), Some(doc)) = (std::env::var_os("MF_MUSE_SAVE"), app.doc.as_ref()) {
+        crate::project::save(&app.engine, doc, &app.camera, Path::new(&p))?;
+    }
+    println!("done in {:.0}s", t0.elapsed().as_secs_f32());
+    Ok(())
+}
+
+/// Autosave: copies rotate (the newest `<name>_autosave`, the oldest past
+/// the count removed), "The project file" saves the project and clears its
+/// modified flag, an unmodified project is never saved.
+/// Entering the studio centers the model in the frame, leaving it turns the
+/// render mode off; Muse's lighting from a photo (a saved answer, no API
+/// call) is applied, checked with a render sent back, and applied again.
+fn studio_muse_check(d: &mut Driver, app: &mut RetroApp, out: &Path) -> anyhow::Result<()> {
+    if app.view.studio {
+        app.toggle_studio();
+    }
+    let (min, max) = {
+        let m = &app.doc.as_ref().unwrap().mesh;
+        (m.bbox_min, m.bbox_max)
+    };
+    let (center, size) = ((min + max) * 0.5, (max - min).length() * 0.5);
+    app.camera.target = (center + glam::Vec3::new(size * 3.0, size, 0.0)).into();
+    app.camera.distance = size * 20.0;
+    app.toggle_studio();
+    d.idle(app, 5);
+    anyhow::ensure!(app.view.studio && app.view.path_trace, "the studio must turn the render mode on");
+    let off = glam::Vec3::from(app.camera.target) - center;
+    anyhow::ensure!(
+        off.length() < size * 0.3 && app.camera.distance < size * 12.0,
+        "entering the studio must center the model (target off by {:.2} sizes, distance {:.1} sizes)",
+        off.length() / size,
+        app.camera.distance / size
+    );
+    app.toggle_studio();
+    d.idle(app, 1);
+    anyhow::ensure!(!app.view.studio && !app.view.path_trace, "leaving the studio must turn the render mode off");
+    // Muse's lighting in its conversation: two saved answers (the turn,
+    // then its check after a render), no API call.
+    let turn = out.join("muse_light_turn.json");
+    let check = out.join("muse_light_check.json");
+    std::fs::write(&turn, r##"{"reply": "A crisp key from the right and a strip on the left.", "lighting": {"background": "#ECEDF0", "falloff": 0.05, "shadow_opacity": 0.3, "lights": [{"name": "Sun right", "kind": "Spot", "power": 0.9, "azimuth": 70, "elevation": 45, "distance": 9, "width": 0.5}, {"name": "Strip left", "kind": "Strip softbox", "power": 0.6, "azimuth": -95, "color": "#FFF4E6"}, {"name": "Nonsense", "kind": "Laser"}], "camera": {"pitch": 9, "lens_mm": 100}}, "looks": [{"age": 0, "finish": "none", "layers": [{"metallic": 0.0, "name": "Cobalt blue lacquer", "roughness": 0.12, "source": {"color": "#20309F"}}], "pieces": [0], "what": "a retexture nobody asked for"}]}"##)?;
+    std::fs::write(&check, r##"{"reply": "Shadow a little lighter.", "lighting": {"background": "#ECEDF0", "falloff": 0.05, "shadow_opacity": 0.25, "lights": [{"name": "Sun right", "kind": "Spot", "power": 0.9, "azimuth": 70, "elevation": 45, "distance": 9, "width": 0.5}, {"name": "Strip left", "kind": "Strip", "power": 0.6, "azimuth": -95, "color": "#FFF4E6"}]}}"##)?;
+    std::env::set_var("MF_MUSE_PLAN", format!("{};{}", turn.display(), check.display()));
+    std::env::set_var("MF_MUSE_CHECK", "1");
+    std::env::set_var("MF_MUSE_OFFLINE", "1");
+    app.muse_test_key();
+    // A packshot photo: a blue product on white, its shadow on the right.
+    let photo = out.join("packshot_photo.png");
+    image::RgbaImage::from_fn(400, 400, |x, y| {
+        let px = if (150..250).contains(&x) && (80..330).contains(&y) {
+            [40, 60, 200]
+        } else if (250..340).contains(&x) && (310..330).contains(&y) {
+            [215, 215, 215]
+        } else {
+            [255, 255, 255]
+        };
+        image::Rgba([px[0], px[1], px[2], 255])
+    })
+    .save(&photo)?;
+    app.muse_attach(&d.ctx, &photo);
+    // MF_MUSE_PHOTOS=<img;img>: more photos.
+    for p in std::env::var("MF_MUSE_PHOTOS").unwrap_or_default().split(';').filter(|p| !p.is_empty()) {
+        app.muse_attach(&d.ctx, Path::new(p));
+    }
+    let before = app.doc.as_ref().unwrap().studio.clone();
+    let res_before: Vec<u32> = app.doc.as_ref().unwrap().sets.iter().map(|s| s.resolution()).collect();
+    let baked_before: Vec<bool> = app.doc.as_ref().unwrap().sets.iter().map(|s| s.baked).collect();
+    let stacks = |app: &RetroApp| -> Vec<Vec<String>> { app.doc.as_ref().unwrap().sets.iter().map(|s| s.layers.iter().map(|l| l.desc.name.clone()).collect()).collect() };
+    let stacks_before = stacks(app);
+    app.camera.pitch = 0.0;
+    app.muse_test_send(&d.ctx, "I want the lighting of the attached photo for my packshot", &[])?;
+    let t = Instant::now();
+    d.idle(app, 1);
+    while app.muse_test_state().0 && t.elapsed().as_secs() < 300 {
+        d.idle(app, 1);
+    }
+    for k in ["MF_MUSE_PLAN", "MF_MUSE_CHECK", "MF_MUSE_OFFLINE"] {
+        std::env::remove_var(k);
+    }
+    let (busy, lines) = app.muse_test_state();
+    anyhow::ensure!(!busy, "Muse still working after 300 s");
+    anyhow::ensure!(lines.iter().any(|l| l.starts_with("Lighting refined after a render")), "Muse's lighting must be checked once with a render: {lines:?}");
+    anyhow::ensure!(app.view.studio, "Muse's lighting must open the studio");
+    anyhow::ensure!(app.studio_prev.as_ref().is_some_and(|p| p.lights == before.lights), "\"Back to my lights\" must return to the lighting before the request");
+    let st = &app.doc.as_ref().unwrap().studio;
+    let kinds: Vec<_> = st.lights.iter().map(|l| l.kind).collect();
+    anyhow::ensure!(kinds == [crate::studio::LightKind::Spot, crate::studio::LightKind::Strip], "Muse's lights: {kinds:?}");
+    anyhow::ensure!((st.background[0] - 236.0 / 255.0).abs() < 1e-3 && st.lights[0].azimuth == 70.0 && st.lights[1].color[2] < 0.95, "Muse's lighting was not applied as answered");
+    // The corrected lighting is rendered and compared with the photo: the
+    // closer one stays.
+    let kept_first = lines.iter().any(|l| l.contains("its first lighting was kept"));
+    anyhow::ensure!(kept_first || lines.iter().any(|l| l.contains("The correction is closer to your photo")), "the corrected lighting must be compared with the photo: {lines:?}");
+    let want = if kept_first { 0.3 } else { 0.25 };
+    anyhow::ensure!((st.shadow_opacity - want).abs() < 1e-6, "the lighting kept is not the one said (shadow {}, kept first {kept_first})", st.shadow_opacity);
+    anyhow::ensure!(st.out_long == before.out_long && st.out_samples == before.out_samples, "Muse's lighting must keep the output settings");
+    anyhow::ensure!(st.lens_mm == 100.0 && (app.camera.pitch.to_degrees() - 9.0).abs() < 0.01, "Muse's camera (lens {}, pitch {:.1})", st.lens_mm, app.camera.pitch.to_degrees());
+    let res: Vec<u32> = app.doc.as_ref().unwrap().sets.iter().map(|s| s.resolution()).collect();
+    let baked: Vec<bool> = app.doc.as_ref().unwrap().sets.iter().map(|s| s.baked).collect();
+    anyhow::ensure!(res == res_before && baked == baked_before && app.bake_job.is_none(), "a lighting answer must not bake or raise the texture sets ({res_before:?} -> {res:?})");
+    anyhow::ensure!(stacks(app) == stacks_before, "a request for the lighting alone must keep the materials, even when Muse sends looks");
+    anyhow::ensure!(lines.iter().any(|l| l.contains("Your materials were kept")), "the dropped looks must be said: {lines:?}");
+    let msg = std::fs::read_to_string(crate::library::library_dir().join("..").join("muse").join("last_message.txt")).unwrap_or_default();
+    anyhow::ensure!(msg.contains("PACKSHOT STUDIO now:") && msg.contains("\"lights\""), "the message must give Muse the studio's lighting");
+    anyhow::ensure!(msg.contains("Light measures by the app: R1 background #FFFFFF") && msg.contains("ground shadow at its foot: right up to"), "the photo must be measured for Muse: {}", msg.lines().last().unwrap_or(""));
+    anyhow::ensure!(msg.contains("asks only for the packshot's lighting"), "the message must tell Muse the request is about the lighting only");
+    let check_sent = app.muse_test_turns();
+    anyhow::ensure!(check_sent == 2, "the turn and its check must be in the conversation ({check_sent} turns)");
+    app.toggle_studio();
+    println!("studio centering, render off on leaving and Muse lighting OK");
+    Ok(())
+}
+
+/// Studio edits are undo steps: a drag over several frames is one step,
+/// Ctrl+Z and Ctrl+Y walk them.
+fn studio_undo_check(d: &mut Driver, app: &mut RetroApp) -> anyhow::Result<()> {
+    let key = |d: &mut Driver, app: &mut RetroApp, k: egui::Key, m: Modifiers| {
+        d.frame(app, vec![Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: m }], m);
+        d.frame(app, vec![Event::Key { key: k, physical_key: None, pressed: false, repeat: false, modifiers: m }], m);
+    };
+    d.idle(app, 2);
+    let start = app.doc.as_ref().unwrap().studio.clone();
+    let steps = app.history.undo.len();
+    // A drag: the power changes over a few frames.
+    for p in [1.1, 1.3, 1.6] {
+        app.doc.as_mut().unwrap().studio.lights[0].power = p;
+        d.idle(app, 1);
+    }
+    anyhow::ensure!(app.history.undo.len() == steps + 1, "a studio drag must be one undo step ({} steps)", app.history.undo.len() - steps);
+    app.last_edit = Instant::now() - std::time::Duration::from_secs(5);
+    app.doc.as_mut().unwrap().studio.falloff = 0.7;
+    d.idle(app, 1);
+    anyhow::ensure!(app.history.undo.len() == steps + 2, "a later studio edit must be its own step");
+    key(d, app, egui::Key::Z, Modifiers::COMMAND);
+    let st = &app.doc.as_ref().unwrap().studio;
+    anyhow::ensure!(st.falloff == start.falloff && st.lights[0].power == 1.6, "Ctrl+Z: falloff {} power {}", st.falloff, st.lights[0].power);
+    key(d, app, egui::Key::Z, Modifiers::COMMAND);
+    anyhow::ensure!(app.doc.as_ref().unwrap().studio == start, "the second Ctrl+Z must restore the studio");
+    key(d, app, egui::Key::Y, Modifiers::COMMAND);
+    anyhow::ensure!(app.doc.as_ref().unwrap().studio.lights[0].power == 1.6, "Ctrl+Y must redo the drag");
+    key(d, app, egui::Key::Z, Modifiers::COMMAND);
+    anyhow::ensure!(app.doc.as_ref().unwrap().studio == start && app.history.undo.len() == steps, "studio undo left extra steps");
+    app.history.redo.clear();
+    // A lighting preset keeps the lights for any project; loading one
+    // keeps the project's camera angles.
+    let mut st = app.doc.as_ref().unwrap().studio.clone();
+    st.setup(3);
+    st.angles.push(crate::studio::CameraAngle { name: "Front".into(), ..Default::default() });
+    let p = crate::studio::save_preset("Test: black/gold?", &st)?;
+    anyhow::ensure!(p.file_name().is_some_and(|n| n == "Test  black gold.json"), "preset file name {}", p.display());
+    anyhow::ensure!(crate::studio::user_presets().iter().any(|(n, _)| n == "Test  black gold"), "the preset is not listed");
+    let back = crate::studio::load_preset(&p).ok_or_else(|| anyhow::anyhow!("the preset does not load"))?;
+    anyhow::ensure!(back.lights == st.lights && back.angles.is_empty(), "the preset must hold the lights and no camera angles");
+    let mut other = crate::studio::Studio { angles: vec![crate::studio::CameraAngle { name: "Mine".into(), ..Default::default() }], ..Default::default() };
+    other.take_lighting(&back);
+    anyhow::ensure!(other.lights == st.lights && other.angles.len() == 1 && other.angles[0].name == "Mine", "loading a preset must keep the angles");
+    std::fs::remove_file(&p)?;
+    println!("studio undo, presets and angles OK");
+    Ok(())
+}
+
+fn autosave_check(d: &Driver, app: &mut RetroApp, out: &Path) -> anyhow::Result<()> {
+    use super::autosave::{folder, Autosave, Target};
+    let keep = app.autosave.clone();
+    let name = app.doc.as_ref().unwrap().mesh_name.clone();
+    let _ = std::fs::remove_dir_all(folder());
+    app.autosave = Autosave { on: true, minutes: 5, target: Target::Copies, copies: 2 };
+    let due = |app: &mut RetroApp| app.last_autosave = Instant::now() - std::time::Duration::from_secs(6 * 60);
+    for _ in 0..3 {
+        app.doc.as_mut().unwrap().modified = true;
+        due(app);
+        app.autosave(&d.ctx);
+    }
+    let files = || -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(folder()).map(|r| r.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default();
+        v.sort();
+        v
+    };
+    let got = files();
+    anyhow::ensure!(got == vec![format!("{name}_autosave.sprp"), format!("{name}_autosave_2.sprp")], "autosave copies: {got:?} ({})", app.status);
+    anyhow::ensure!(app.doc.as_ref().unwrap().modified, "a recovery copy must leave the project modified");
+    // Not due yet: nothing written.
+    app.autosave.copies = 5;
+    app.autosave(&d.ctx);
+    anyhow::ensure!(files().len() == 2, "autosave ran before its interval");
+    let proj = out.join("autosave_project.sprp");
+    let _ = std::fs::remove_file(&proj);
+    app.autosave.target = Target::Project;
+    app.doc.as_mut().unwrap().path = Some(proj.clone());
+    due(app);
+    app.autosave(&d.ctx);
+    anyhow::ensure!(proj.is_file() && !app.doc.as_ref().unwrap().modified, "autosave into the project file: {}", app.status);
+    crate::project::load(&app.engine, &proj).map_err(|e| anyhow::anyhow!("the autosaved project does not open: {e:#}"))?;
+    // Unmodified: never saved.
+    std::fs::remove_file(&proj)?;
+    due(app);
+    app.autosave(&d.ctx);
+    anyhow::ensure!(!proj.exists(), "an unmodified project was autosaved");
+    app.doc.as_mut().unwrap().path = None;
+    app.autosave = keep;
+    println!("autosave: copies rotate, the project file saves and opens, nothing saved early or unmodified");
     Ok(())
 }

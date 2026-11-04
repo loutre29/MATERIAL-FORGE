@@ -349,7 +349,8 @@ impl PathTracer {
     }
 
     /// One sample per pixel into `out` (the viewport HDR target).
-    /// `sets`: per set slot (base, orm, normal, emissive) final maps.
+    /// `sets`: per set slot (base, orm, normal, emissive) final maps;
+    /// `studio`: the packshot studio (off by default).
     #[allow(clippy::too_many_arguments)]
     pub fn render(
         &mut self,
@@ -359,6 +360,7 @@ impl PathTracer {
         sets: &[[&Tex; 4]],
         env: &wgpu::TextureView,
         out: &Tex,
+        studio: &crate::studio::StudioGpu,
     ) {
         // Open Image Denoise (started on first use).
         let oidn = self.denoise_on && self.oidn_ok();
@@ -391,6 +393,11 @@ impl PathTracer {
             contents: bytemuck::bytes_of(&u),
             usage: wgpu::BufferUsages::UNIFORM,
         });
+        let sb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("pt studio"),
+            contents: bytemuck::bytes_of(studio),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
         let views: Vec<wgpu::TextureView> = (0..4)
             .flat_map(|k| (0..MAX_SETS).map(move |s| (k, s)))
             .map(|(k, s)| sets.get(s).map(|t| t[k].mip_view(0)).unwrap_or_else(|| self.dummy.mip_view(0)))
@@ -410,6 +417,7 @@ impl PathTracer {
         }
         let (aux, _, _) = self.dbufs.as_ref().unwrap();
         entries.push(wgpu::BindGroupEntry { binding: 39, resource: aux.as_entire_binding() });
+        entries.push(wgpu::BindGroupEntry { binding: 40, resource: sb.as_entire_binding() });
         let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("pt bg"),
             layout: &self.pipeline.get_bind_group_layout(0),

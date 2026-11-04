@@ -260,8 +260,155 @@ fn proc_raw(kind: u32, p: vec3<f32>, pp: ProcParams) -> f32 {
         case 26u: { return clamp(voronoi3(p * 2.0, 1.0).x * 1.3, 0.0, 1.0); }
         // Flakes: a gray per flake (a sparkle mask), see flake_normal.
         case 27u: { return flake(p, pp).w; }
+        // Brush strokes (hand-painted look)
+        case 28u: { return brush_strokes(p, density, gain); }
+        // Paint splatter (spray paint: splashes, droplets, drips)
+        case 29u: { return splatter(p, density); }
+        // Streaks running down (rust, grime, water)
+        case 30u: { return streaks(p, density); }
         default: { return 0.5; }
     }
+}
+
+// Brush strokes: flat strokes of paint laid over each other in the xy
+// plane (each z slab its own layout), three per cell, one gray per stroke,
+// ragged borders and bristle streaks along the stroke; they run within 40
+// degrees of x. Meant for tri-planar projection (`proc_tri`), where every
+// face gets its own strokes. density: stroke width, roughness (gain):
+// bristle streaks.
+fn brush_strokes(p: vec3<f32>, density: f32, bristle: f32) -> f32 {
+    let i = floor(p);
+    let f = vec2<f32>(fract(p.xy));
+    let w = 0.15 + clamp(density, 0.0, 1.0) * 0.25;
+    let rag = (vnoise3(p * 9.0) - 0.5) * 0.4 + (vnoise3(p * 23.0 + 5.0) - 0.5) * 0.12;
+    var top = -1.0;
+    var val = 0.5;
+    var near = 1e9;
+    var dab = 0.5;
+    for (var y = -1; y <= 1; y++) {
+        for (var x = -1; x <= 1; x++) {
+            let c = vec2<f32>(f32(x), f32(y));
+            for (var s = 0; s < 3; s++) {
+                let k = i + vec3<f32>(c, 0.0) + f32(s) * vec3<f32>(17.1, 3.9, 29.3);
+                let h = hash33(k);
+                let h2 = hash33(k + vec3<f32>(71.3, 19.1, 43.7));
+                let q = f - c - h.xy;
+                let ang = (h2.x - 0.5) * 1.4;
+                let d = vec2<f32>(cos(ang), sin(ang));
+                let t = dot(q, d);
+                let e = q - d * t;
+                // Up to one cell long: the 9 cells hold every stroke reaching p.
+                let len = 0.75 + h.x * 0.25;
+                let wid = w * (0.6 + h.y * 0.6);
+                let gray = fract(h.z * 7.31 + h2.z * 3.17);
+                let streak = (vnoise3(vec3<f32>(e * 26.0, 0.0) + h * 37.0) - 0.5) * bristle;
+                let u = abs(t) / len;
+                // Flat-ended ellipse, ragged, bristles breaking the ends.
+                let sd = length(vec2<f32>(u * u * u, length(e) / wid)) + rag + abs(streak) * 1.5 * smoothstep(0.55, 1.0, u);
+                let pr = fract(h2.z * 13.7 + h.y * 5.3 + f32(s) * 0.37);
+                if sd < 1.0 && pr > top {
+                    top = pr;
+                    val = gray + streak * 0.4;
+                }
+                let dq = dot(q, q);
+                if dq < near {
+                    near = dq;
+                    dab = gray;
+                }
+            }
+        }
+    }
+    return clamp(select(dab, val, top >= 0.0), 0.0, 1.0);
+}
+
+// Paint splatter: in some cells (density) a splash of spray paint, a blob
+// with a spiky border, droplets thrown around it and drips running down
+// (-y) from it, ending in a drop. 1 on paint. Planar (each z slab its own
+// layout), for tri-planar projection like brush strokes.
+fn splatter(p: vec3<f32>, density: f32) -> f32 {
+    let i = floor(p);
+    let f = p.xy - i.xy;
+    for (var y = -2; y <= 2; y++) {
+        for (var x = -2; x <= 2; x++) {
+            let c = vec2<f32>(f32(x), f32(y));
+            let k = vec3<f32>(i.xy + c, i.z);
+            let h = hash33(k);
+            let h2 = hash33(k + vec3<f32>(41.7, 13.3, 7.9));
+            if h2.x > clamp(density, 0.0, 1.0) {
+                continue;
+            }
+            let o = c + 0.2 + h.xy * 0.6;
+            let q = f - o;
+            let r = 0.12 + h.z * 0.2;
+            let dl = length(q);
+            let dir = q / max(dl, 1e-4);
+            let bumps = vnoise3(vec3<f32>(dir * 2.5, h.x * 50.0));
+            let spikes = pow(vnoise3(vec3<f32>(dir * 9.0, h.y * 50.0)), 4.0);
+            if dl < r * (0.75 + bumps * 0.5 + spikes * 1.4) {
+                return 1.0;
+            }
+            for (var n = 0; n < 8; n++) {
+                let hn = hash33(k + f32(n) * vec3<f32>(3.1, 7.7, 1.3) + 9.0);
+                let a = hn.x * 6.2831853;
+                let dp = o + vec2<f32>(cos(a), sin(a)) * r * (1.3 + hn.y * 1.7);
+                if length(f - dp) < r * (0.03 + 0.12 * hn.z * hn.z) {
+                    return 1.0;
+                }
+            }
+            for (var n = 0; n < 3; n++) {
+                let hn = hash33(k + f32(n) * vec3<f32>(5.3, 2.9, 8.1) + 21.0);
+                if hn.z < 0.3 {
+                    continue;
+                }
+                let x0 = o.x + (hn.x - 0.5) * r * 1.4;
+                let len = 0.3 + hn.y * 1.0;
+                let wd = r * 0.1 * (0.6 + hn.z);
+                let dy = o.y - f.y;
+                let wob = sin(dy * 7.0 + hn.x * 9.0) * 0.01;
+                if dy > 0.0 && dy < len && abs(f.x - x0 + wob) < wd * (1.0 - 0.35 * dy / len) {
+                    return 1.0;
+                }
+                if length(vec2<f32>(f.x - x0, (o.y - len) - f.y)) < wd * 1.5 {
+                    return 1.0;
+                }
+            }
+        }
+    }
+    return 0.0;
+}
+
+// Streaks: thin runs down the object (rust, grime, water), varying across
+// x and z and stretched along y, broken up along their length. density:
+// how many.
+fn streaks(p: vec3<f32>, density: f32) -> f32 {
+    let s = fbm_value(vec3<f32>(p.x * 6.0, p.y * 0.3, p.z * 6.0), 4, 0.5);
+    let b = fbm_value(vec3<f32>(p.x * 1.5, p.y * 0.7, p.z * 1.5) + 13.0, 3, 0.5);
+    let runs = smoothstep(0.62 - density * 0.2, 0.75 - density * 0.2, s);
+    return runs * smoothstep(0.35, 0.6, b);
+}
+
+// Tri-planar evaluation of a planar pattern (`planar_kind`): each texel
+// takes the plane its normal faces most, with a ragged border between
+// planes and no blend, so strokes stay crisp. p: projected position times
+// the scale, n: the projected normal.
+// Patterns drawn in the xy plane: tri-planar gives each face its plane.
+fn planar_kind(kind: u32) -> bool {
+    return kind == 10u || kind == 19u || kind == 28u || kind == 29u;
+}
+
+// (Coordinates only: the caller evaluates once, since every proc_eval call
+// site inlines the whole pattern switch and several made the driver's
+// compile take minutes.)
+fn proc_tri(p: vec3<f32>, n: vec3<f32>, offs: vec2<f32>) -> vec3<f32> {
+    let j = vec3<f32>(vnoise3(p * 2.0), vnoise3(p * 2.0 + 7.1), vnoise3(p * 2.0 + 3.3)) - 0.5;
+    let a = abs(n) + j * 0.3;
+    if a.x >= a.y && a.x >= a.z {
+        return vec3<f32>(p.zy + offs, 11.0);
+    }
+    if a.y >= a.z {
+        return vec3<f32>(p.xz + offs, 23.0);
+    }
+    return vec3<f32>(p.xy + offs, 37.0);
 }
 
 // Metallic flakes: each cell of a jittered grid is a small mirror tilted at

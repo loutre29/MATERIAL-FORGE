@@ -157,7 +157,7 @@ fn pick_fn<F: Fn(&TextureSet) -> &Tex>(f: F) -> F {
     f
 }
 
-fn screenshot(engine: &Engine, t: &Tex, path: &Path) -> Result<()> {
+pub(crate) fn screenshot(engine: &Engine, t: &Tex, path: &Path) -> Result<()> {
     let bytes = t.read_bytes(&engine.device, &engine.queue);
     image::RgbaImage::from_raw(t.width, t.height, bytes).context("screenshot size")?.save(path)?;
     Ok(())
@@ -614,7 +614,7 @@ pub fn run(out: &Path, mesh_path: Option<&Path>) -> Result<()> {
         };
         for _ in 0..96 {
             let mut enc = engine.device.create_command_encoder(&Default::default());
-            engine.pathtracer.render(&engine.device, &mut enc, u, &slots, &engine.env.view, engine.viewport.hdr());
+            engine.pathtracer.render(&engine.device, &mut enc, u, &slots, &engine.env.view, engine.viewport.hdr(), &Default::default());
             engine.queue.submit(Some(enc.finish()));
         }
         let mut frame = frame_for(&engine, &doc, &cam, 0.0, 0.0, &|s| &s.gpu.final_base);
@@ -1002,6 +1002,7 @@ pub fn run(out: &Path, mesh_path: Option<&Path>) -> Result<()> {
     opacity_check(&mut engine, out)?;
     projection_check(&mut engine, out)?;
     normal_filter_check(&mut engine, out)?;
+    curves_check(&mut engine, out)?;
     visibility_check(&mut engine, out)?;
     tiling_check(&mut engine, out)?;
     starter_assets_check(&engine, out)?;
@@ -1308,6 +1309,42 @@ fn materialize_all(engine: &Engine, doc: &mut Document) {
             }
         });
     }
+}
+
+/// The Curves filter: straight curves change nothing, raising the RGB
+/// curve's middle brightens a grey, a red curve changes red alone.
+fn curves_check(engine: &mut Engine, out: &Path) -> Result<()> {
+    let p = out.join("curves.obj");
+    std::fs::write(&p, test_obj())?;
+    let mut doc = Document::new(engine, mesh::load(&p)?, "curves".into(), 64);
+    doc.add_layer(engine, 0, LayerKind::Fill(Box::new(FillDesc::material([0.5, 0.5, 0.5], 0.5, 0.0))));
+    let read = |engine: &Engine, doc: &mut Document| -> [f32; 3] {
+        doc.sets[0].dirty = true;
+        composite_all(engine, doc);
+        let v = f16_bytes_to_f32(&doc.sets[0].gpu.final_base.read_bytes(&engine.device, &engine.queue));
+        let i = (32 * 64 + 32) * 4;
+        [v[i], v[i + 1], v[i + 2]]
+    };
+    let base = read(engine, &mut doc);
+    let id = doc.add_layer(engine, 0, LayerKind::Filter(FilterDesc::of(FilterKind::Curves)));
+    let straight = read(engine, &mut doc);
+    let edit = |doc: &mut Document, c: usize, pts: Vec<[f32; 2]>| {
+        if let Some(LayerKind::Filter(f)) = find_mut(&mut doc.sets[0].layers, id).map(|l| &mut l.desc.kind) {
+            f.curves[c] = pts;
+        }
+    };
+    edit(&mut doc, 0, vec![[0.0, 0.0], [0.5, 0.8], [1.0, 1.0]]);
+    let bright = read(engine, &mut doc);
+    edit(&mut doc, 0, vec![[0.0, 0.0], [1.0, 1.0]]);
+    edit(&mut doc, 1, vec![[0.0, 0.0], [0.5, 0.2], [1.0, 1.0]]);
+    let red = read(engine, &mut doc);
+    println!("curves: base {base:?}, straight {straight:?}, RGB mid up {bright:?}, red down {red:?}");
+    ensure!((0..3).all(|k| (straight[k] - base[k]).abs() < 0.01), "straight curves changed the color");
+    ensure!((0..3).all(|k| bright[k] > base[k] + 0.1), "the RGB curve did not brighten");
+    ensure!(red[0] < base[0] - 0.1 && (red[1] - base[1]).abs() < 0.01 && (red[2] - base[2]).abs() < 0.01, "the red curve must change red only");
+    let e = curve_eval(&[[0.0, 0.0], [0.5, 0.8], [1.0, 1.0]], 0.5);
+    ensure!((e - 0.8).abs() < 1e-4, "curve_eval misses its point ({e})");
+    Ok(())
 }
 
 /// Filters reach the normal channel: Levels at its defaults keeps a tilted
@@ -1680,7 +1717,7 @@ pub fn layer_shot(project_path: &Path, out: &Path) -> Result<()> {
             fills.push(l.desc.id);
         }
     });
-    let mut pv_mat = crate::preview::Previewer::new_material(&engine);
+    let mut pv_mat = crate::preview::Previewer::new_layer(&engine);
     let t = crate::preview::THUMB;
     let mut sheet = image::RgbaImage::new(t * 3 + 384, 384 * fills.len().max(1) as u32);
     for (row, id) in fills.iter().enumerate() {
@@ -1863,6 +1900,53 @@ pub fn mat_shot(out: &Path, filter: &str) -> Result<()> {
         return Ok(());
     }
     let filter = filter.to_lowercase();
+    // "procs": every procedural pattern, flat, in one sheet (12 a row, in
+    // `ProcKind::ALL` order, names printed).
+    if filter == "procs" {
+        let mut flat = crate::preview::Previewer::new_flat(&engine);
+        let none = std::collections::HashMap::new();
+        let ks = ProcKind::ALL;
+        let mut sheet = image::RgbaImage::new(128 * 12, 128 * (ks.len() as u32).div_ceil(12));
+        for (i, k) in ks.iter().enumerate() {
+            let mut f = FillDesc::default();
+            f.channels[CH_COLOR] = FillChannel { source: SourceKind::Procedural, procedural: ProcParams::of(*k), value: [0.03; 3], value_b: [0.9; 3], ..Default::default() };
+            f.projection = Projection { mode: ProjMode::Object3D, scale: 3.0, ..Default::default() };
+            let tree = LayerTree { desc: LayerDesc::new(0, k.name().into(), LayerKind::Fill(Box::new(f))), children: Vec::new() };
+            let tex = flat.render(&engine, &tree, &none);
+            let img = image::RgbaImage::from_raw(tex.width, tex.height, tex.read_bytes(&engine.device, &engine.queue)).unwrap();
+            image::imageops::overlay(&mut sheet, &img, (i as i64 % 12) * 128, (i as i64 / 12) * 128);
+            println!("{i}: {}", k.name());
+        }
+        sheet.save(out.join("procs.png"))?;
+        return Ok(());
+    }
+    // "sm:<name>": smart materials without files, one strip each: the
+    // layers added one by one on a sphere, then the result on the box.
+    if let Some(f) = filter.strip_prefix("sm:") {
+        let mut ball = crate::preview::Previewer::sized(&engine, 1024, 384);
+        let mut cube = crate::preview::Previewer::sized_box(&engine, 1024, 384);
+        let none = std::collections::HashMap::new();
+        for sm in library::smart_materials().iter().filter(|s| s.textures.is_empty() && s.name.to_lowercase().contains(f)) {
+            let n = sm.tree.children.len();
+            let mut strip = image::RgbaImage::new(384 * (n as u32 + 1), 384);
+            for k in 1..=n {
+                let mut tree = sm.tree.clone();
+                for (i, c) in tree.children.iter_mut().enumerate() {
+                    c.desc.visible = i < k;
+                }
+                let tex = ball.render(&engine, &tree, &none);
+                let img = image::RgbaImage::from_raw(tex.width, tex.height, tex.read_bytes(&engine.device, &engine.queue)).unwrap();
+                image::imageops::overlay(&mut strip, &img, (k as i64 - 1) * 384, 0);
+            }
+            let tex = cube.render(&engine, &sm.tree, &none);
+            let img = image::RgbaImage::from_raw(tex.width, tex.height, tex.read_bytes(&engine.device, &engine.queue)).unwrap();
+            image::imageops::overlay(&mut strip, &img, n as i64 * 384, 0);
+            let slug: String = sm.name.to_lowercase().chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect();
+            strip.save(out.join(format!("{slug}.png")))?;
+            println!("{}", sm.name);
+        }
+        return Ok(());
+    }
     for m in library::texture_materials().iter().filter(|m| m.name.to_lowercase().contains(&filter)) {
         let mut resources = std::collections::HashMap::new();
         let mut ids = std::collections::HashMap::new();
@@ -2034,6 +2118,114 @@ pub fn uv_check(mesh_path: &Path, out: &Path, method: &str) -> Result<()> {
     Ok(())
 }
 
+/// `--studioshot <project.sprp | mesh> <out.png>`: a packshot through the
+/// studio, the project's own (or MF_STUDIO=<json> over it) from its camera
+/// (MF_YAW / MF_PITCH in degrees, MF_SETUP=<n> a lighting setup), MF_SPP
+/// samples (256), MF_NODENOISE: raw.
+/// A plain mesh gets a grey satin material.
+pub fn studio_shot(input: &Path, out: &Path) -> Result<()> {
+    let mut engine = Engine::headless()?;
+    let (mut doc, mut cam) = if input.extension().is_some_and(|e| e.eq_ignore_ascii_case("sprp")) {
+        project::load(&engine, input)?
+    } else {
+        let mut doc = Document::new(&engine, mesh::load(input)?, "studio".into(), 1024);
+        for i in 0..doc.sets.len() {
+            let f = FillDesc::material([0.7, 0.7, 0.7], 0.35, 0.0);
+            let l = doc.new_layer(&engine, i, LayerKind::Fill(Box::new(f)), None);
+            doc.insert_layer(i, l);
+        }
+        let mut cam = OrbitCamera::default();
+        cam.frame(doc.mesh.bbox_min, doc.mesh.bbox_max);
+        (doc, cam)
+    };
+    if let Ok(p) = std::env::var("MF_STUDIO") {
+        doc.studio = serde_json::from_slice(&std::fs::read(&p)?).with_context(|| format!("reading {p}"))?;
+    }
+    // MF_SETUP=<n>: one of the lighting setups.
+    if let Some(i) = std::env::var("MF_SETUP").ok().and_then(|v| v.parse().ok()) {
+        doc.studio.setup(i);
+    }
+    let deg = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<f32>().ok()).map(f32::to_radians);
+    if let Some(y) = deg("MF_YAW") {
+        cam.yaw = y;
+    }
+    if let Some(p) = deg("MF_PITCH") {
+        cam.pitch = p;
+    }
+    let st = &doc.studio;
+    let aspect = st.format.aspect().unwrap_or(1.0);
+    let long = std::env::var("MF_LONG").ok().and_then(|v| v.parse().ok()).unwrap_or(1024u32);
+    let (w, h) = if aspect >= 1.0 { (long, (long as f32 / aspect).round() as u32) } else { ((long as f32 * aspect).round() as u32, long) };
+    cam.ortho = false;
+    cam.fov_y = 2.0 * st.tan_half_y(aspect).atan();
+    // MF_FRAME: centered like entering the studio.
+    if std::env::var("MF_FRAME").is_ok() {
+        let pts: Vec<glam::Vec3> = doc.mesh.vertices.iter().map(|v| glam::Vec3::from(v.pos)).collect();
+        crate::studio::fit_camera(&mut cam, &pts, st.tan_half_y(aspect), aspect, crate::studio::FRAME_FILL);
+    }
+    engine.viewport.resize(&engine.device, w, h);
+    let mut enc = engine.device.create_command_encoder(&Default::default());
+    let resources = doc.resources.clone();
+    for s in doc.sets.iter_mut() {
+        s.composite(&engine, &mut enc, &resources, None);
+    }
+    engine.queue.submit(Some(enc.finish()));
+    let (min, max) = (doc.mesh.bbox_min, doc.mesh.bbox_max);
+    let gpu = doc.studio.gpu(cam.yaw, cam.eye(), (min + max) * 0.5, ((max - min).length() * 0.5).max(1e-4), min.y, 1.0);
+    engine.pathtracer.build_scene(&engine.device, &doc, 1);
+    engine.pathtracer.denoise_on = std::env::var("MF_NODENOISE").is_err();
+    engine.pathtracer.bounces = 6;
+    let spp: u32 = std::env::var("MF_SPP").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
+    engine.pathtracer.max_samples = spp;
+    engine.pathtracer.reset();
+    let m = cam.view_proj(w as f32 / h as f32);
+    let (mut am, mut cut, mut emi) = ([0.0f32; 8], [0.5f32; 8], [0.0f32; 8]);
+    for (i, s) in doc.sets.iter().take(8).enumerate() {
+        am[i] = s.shader_alpha();
+        cut[i] = s.settings.alpha_cutoff;
+        emi[i] = s.settings.emissive_intensity;
+    }
+    let u = crate::engine::pathtrace::PtUniform {
+        inv_view_proj: m.inverse().to_cols_array_2d(),
+        eye: cam.eye().extend(doc.mesh.diagonal()).into(),
+        size: [0; 4],
+        env: [180f32.to_radians(), 1.0, 0.0, 0.0],
+        emi_a: [emi[0], emi[1], emi[2], emi[3]],
+        emi_b: [emi[4], emi[5], emi[6], emi[7]],
+        amode_a: [am[0], am[1], am[2], am[3]],
+        amode_b: [am[4], am[5], am[6], am[7]],
+        cut_a: [cut[0], cut[1], cut[2], cut[3]],
+        cut_b: [cut[4], cut[5], cut[6], cut[7]],
+    };
+    let slots: Vec<[&Tex; 4]> = doc.sets.iter().take(8).map(|s| [&s.gpu.final_base, &s.gpu.final_orm, &s.gpu.final_normal, &s.gpu.final_emissive]).collect();
+    let t = Instant::now();
+    for _ in 0..spp {
+        let mut enc = engine.device.create_command_encoder(&Default::default());
+        engine.pathtracer.render(&engine.device, &mut enc, u, &slots, &engine.env.view, engine.viewport.hdr(), &gpu);
+        engine.queue.submit(Some(enc.finish()));
+    }
+    engine.device.poll(wgpu::Maintain::Wait);
+    let traced = t.elapsed().as_secs_f32();
+    let denoised = engine.pathtracer.denoise_on && engine.pathtracer.denoise_now(&engine.device, &engine.queue, engine.viewport.hdr());
+    let mut enc = engine.device.create_command_encoder(&Default::default());
+    let frame = Frame {
+        camera: bytemuck::Zeroable::zeroed(),
+        post: PostUniform { a: [1.0, 3.0, 0.0, 1.0], b: [0.0, 1.0, 1.0, 0.0], texel: [0.0; 4] },
+        mesh: None,
+        sets: Vec::new(),
+        shadows: false,
+        wireframe: false,
+        wire_only: None,
+        selection: None,
+        path_traced: true,
+    };
+    engine.viewport.render(&engine.device, &engine.queue, &mut enc, &frame);
+    engine.queue.submit(Some(enc.finish()));
+    screenshot(&engine, engine.viewport.output(), out)?;
+    println!("studio shot {w} x {h}, {spp} samples in {traced:.1} s{}: {}", if denoised { ", denoised" } else { "" }, out.display());
+    Ok(())
+}
+
 /// `--alphashot <dir> [mesh]`: every set alpha blended at 40% opacity (and
 /// once with transmission), rendered from three angles, to check blending.
 pub fn alpha_shot(out: &Path, mesh_path: Option<&Path>) -> Result<()> {
@@ -2113,7 +2305,7 @@ pub fn alpha_shot(out: &Path, mesh_path: Option<&Path>) -> Result<()> {
             let slots: Vec<[&Tex; 4]> = doc.sets.iter().map(|s| [&s.gpu.final_base, &s.gpu.final_orm, &s.gpu.final_normal, &s.gpu.final_emissive]).collect();
             for _ in 0..spp {
                 let mut enc = engine.device.create_command_encoder(&Default::default());
-                engine.pathtracer.render(&engine.device, &mut enc, u, &slots, &engine.env.view, engine.viewport.hdr());
+                engine.pathtracer.render(&engine.device, &mut enc, u, &slots, &engine.env.view, engine.viewport.hdr(), &Default::default());
                 engine.queue.submit(Some(enc.finish()));
             }
             // Open Image Denoise when it is there (else the raw render stays).
@@ -2198,7 +2390,7 @@ pub fn material_previews(filter: &str) -> Result<()> {
         let slots: Vec<[&Tex; 4]> = doc.sets.iter().map(|s| [&s.gpu.final_base, &s.gpu.final_orm, &s.gpu.final_normal, &s.gpu.final_emissive]).collect();
         for k in 0..spp {
             let mut enc = engine.device.create_command_encoder(&Default::default());
-            engine.pathtracer.render(&engine.device, &mut enc, u, &slots, &engine.env.view, engine.viewport.hdr());
+            engine.pathtracer.render(&engine.device, &mut enc, u, &slots, &engine.env.view, engine.viewport.hdr(), &Default::default());
             engine.queue.submit(Some(enc.finish()));
             if k % 64 == 63 {
                 engine.device.poll(wgpu::Maintain::Wait);

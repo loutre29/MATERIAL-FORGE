@@ -95,6 +95,8 @@ impl RetroApp {
                 ui.label(RichText::new("Interface").strong());
                 ui.checkbox(&mut self.view.show_tool_keys, "Show the tool's shortcuts in the view (bottom left)");
                 ui.separator();
+                self.autosave_prefs(ui);
+                ui.separator();
                 ui.label(RichText::new("Shortcuts").strong());
                 ui.label(RichText::new("Click a key to change it, then press the new one (Shift allowed, Escape cancels).").size(11.5).color(crate::style::TEXT3));
                 ui.add_space(4.0);
@@ -661,13 +663,6 @@ impl RetroApp {
                     ui.set_width(180.0);
                     super::widgets::color_bar_named(ui, "wire color", "Wireframe", &mut v.wire_color);
                 });
-                ui.end_row();
-            });
-            ui.separator();
-            ui.label(RichText::new("Project").strong());
-            egui::Grid::new("proj grid").num_columns(2).show(ui, |ui| {
-                ui.label("Autosave every (min, 0 = off)");
-                super::widgets::slide(ui, &mut self.autosave_minutes, 0.0..=60.0, false, "");
                 ui.end_row();
             });
             ui.separator();

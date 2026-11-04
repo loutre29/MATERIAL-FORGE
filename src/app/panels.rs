@@ -313,7 +313,7 @@ impl RetroApp {
                     let recent = crate::library::recent_projects();
                     let mut open_recent = None;
                     ui.add_enabled_ui(!recent.is_empty(), |ui| {
-                        super::widgets::sub_menu(ui, "Open recent", |ui| {
+                        ui.menu_button("Open recent", |ui| {
                             ui.set_min_width(260.0);
                             for p in &recent {
                                 let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -1336,6 +1336,89 @@ pub(super) fn channels_table(ui: &mut Ui, d: &mut LayerDesc) {
     }
 }
 
+/// The Curves filter's editor: a tab per curve (RGB, red, green, blue).
+/// Drag a point to move it, click on the graph to add one, right click
+/// or double click a point to remove it.
+fn curves_ui(ui: &mut Ui, id: u64, curves: &mut [Vec<[f32; 2]>; 4]) {
+    use egui::{Color32, Pos2, Sense, Stroke};
+    let tab_id = egui::Id::new(("curves tab", id));
+    let mut tab: usize = ui.data(|d| d.get_temp(tab_id)).unwrap_or(0);
+    const NAMES: [&str; 4] = ["RGB", "Red", "Green", "Blue"];
+    const COLS: [Color32; 4] = [Color32::from_gray(230), Color32::from_rgb(235, 80, 70), Color32::from_rgb(90, 200, 90), Color32::from_rgb(80, 140, 240)];
+    ui.horizontal(|ui| {
+        for (i, n) in NAMES.iter().enumerate() {
+            if ui.selectable_label(tab == i, *n).clicked() {
+                tab = i;
+            }
+        }
+        if ui.small_button("Reset").on_hover_text("This curve back to a straight line").clicked() {
+            curves[tab] = vec![[0.0, 0.0], [1.0, 1.0]];
+        }
+    });
+    ui.data_mut(|d| d.insert_temp(tab_id, tab));
+    let side = ui.available_width().clamp(120.0, 260.0);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(side, side), Sense::click_and_drag());
+    let to_screen = |p: [f32; 2]| Pos2::new(rect.left() + p[0] * rect.width(), rect.bottom() - p[1].clamp(0.0, 1.0) * rect.height());
+    let from_screen = |s: Pos2| [((s.x - rect.left()) / rect.width()).clamp(0.0, 1.0), ((rect.bottom() - s.y) / rect.height()).clamp(0.0, 1.0)];
+    let drag_id = egui::Id::new(("curves drag", id));
+    let near = |pts: &[[f32; 2]], s: Pos2| pts.iter().enumerate().map(|(i, p)| (i, to_screen(*p).distance(s))).filter(|(_, d)| *d < 9.0).min_by(|a, b| a.1.total_cmp(&b.1)).map(|(i, _)| i);
+    {
+        let pts = &mut curves[tab];
+        if let Some(s) = resp.interact_pointer_pos() {
+            if resp.drag_started() || (resp.clicked() && near(pts, s).is_none()) {
+                let hit = match near(pts, s) {
+                    Some(i) => Some(i),
+                    None if pts.len() < CURVE_POINTS => {
+                        let p = from_screen(s);
+                        let at = pts.iter().position(|q| q[0] > p[0]).unwrap_or(pts.len());
+                        pts.insert(at, p);
+                        Some(at)
+                    }
+                    None => None,
+                };
+                ui.data_mut(|d| d.insert_temp(drag_id, hit));
+            }
+            let drag: Option<usize> = ui.data(|d| d.get_temp(drag_id)).flatten();
+            if let Some(i) = drag.filter(|i| *i < pts.len() && resp.dragged()) {
+                let mut p = from_screen(s);
+                // Points keep their order along the input axis.
+                let lo = if i > 0 { pts[i - 1][0] + 0.01 } else { 0.0 };
+                let hi = if i + 1 < pts.len() { pts[i + 1][0] - 0.01 } else { 1.0 };
+                p[0] = p[0].clamp(lo, hi.max(lo));
+                pts[i] = p;
+            }
+            if (resp.secondary_clicked() || resp.double_clicked()) && pts.len() > 2 {
+                if let Some(i) = near(pts, s) {
+                    pts.remove(i);
+                }
+            }
+        }
+        if resp.drag_stopped() {
+            ui.data_mut(|d| d.insert_temp::<Option<usize>>(drag_id, None));
+        }
+    }
+    let painter = ui.painter_at(rect.expand(4.0));
+    painter.rect_filled(rect, 3.0, Color32::from_gray(24));
+    for k in 1..4 {
+        let f = k as f32 / 4.0;
+        let g = Stroke::new(1.0_f32, Color32::from_gray(48));
+        painter.line_segment([Pos2::new(rect.left() + f * rect.width(), rect.top()), Pos2::new(rect.left() + f * rect.width(), rect.bottom())], g);
+        painter.line_segment([Pos2::new(rect.left(), rect.top() + f * rect.height()), Pos2::new(rect.right(), rect.top() + f * rect.height())], g);
+    }
+    painter.line_segment([rect.left_bottom(), rect.right_top()], Stroke::new(1.0_f32, Color32::from_gray(70)));
+    let line = |pts: &[[f32; 2]]| (0..=64).map(|k| k as f32 / 64.0).map(|x| to_screen([x, curve_eval(pts, x)])).collect::<Vec<_>>();
+    for (c, pts) in curves.iter().enumerate() {
+        if c != tab && pts[..] != [[0.0, 0.0], [1.0, 1.0]] {
+            painter.add(egui::Shape::line(line(pts), Stroke::new(1.0_f32, COLS[c].gamma_multiply(0.35))));
+        }
+    }
+    painter.add(egui::Shape::line(line(&curves[tab]), Stroke::new(2.0_f32, COLS[tab])));
+    for p in &curves[tab] {
+        painter.circle(to_screen(*p), 4.0, Color32::from_gray(20), Stroke::new(1.5_f32, COLS[tab]));
+    }
+    resp.on_hover_text("Drag a point; click to add one (8 at most); right click or double click a point to remove it");
+}
+
 pub(super) fn filter_ui(ui: &mut Ui, id: u64, f: &mut FilterDesc) {
     let before = f.kind;
     super::widgets::combo_row(ui, "Filter", ("fk", id), &mut f.kind, FilterKind::ALL, FilterKind::name);
@@ -1427,6 +1510,7 @@ pub(super) fn filter_ui(ui: &mut Ui, id: u64, f: &mut FilterDesc) {
                 None => {}
             }
         }
+        FilterKind::Curves => curves_ui(ui, id, &mut f.curves),
         FilterKind::Invert | FilterKind::Desaturate => {}
     }
     ui.add_space(4.0);

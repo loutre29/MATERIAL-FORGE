@@ -2,7 +2,10 @@
 // Requires common.wgsl and procedural.wgsl.
 //
 // Projection modes: 0 UV, 1 triplanar, 2 planar X, 3 planar Y, 4 planar Z,
-// 5 object 3D (procedurals only; textures fall back to triplanar).
+// 5 object 3D (procedurals only; textures fall back to triplanar), 6 decal
+// (one image on a box placed on the model: nothing outside it, nor on the
+// faces turned away from it), 7 wrap (a decal going around the box's y
+// axis over proj.y radians: a label on a bottle).
 
 //// ENTRY fill
 struct ChanSrc {
@@ -130,6 +133,13 @@ fn tri_weights(n: vec3<f32>) -> vec3<f32> {
     return w / max(w.x + w.y + w.z, EPS);
 }
 
+// Wrap: the image's u goes around the box's y axis (its middle facing the
+// box's z), v down it.
+fn wrap_uv(q: vec3<f32>) -> vec2<f32> {
+    let c = q.xz - vec2<f32>(0.5);
+    return vec2<f32>(0.5 + atan2(c.x, c.y) / max(F.proj.y, EPS), q.y);
+}
+
 // The projection's 3D placement (viewport manipulator).
 fn proj_pos(p: vec3<f32>) -> vec3<f32> {
     let h = vec4<f32>(p, 1.0);
@@ -148,6 +158,8 @@ fn sample_proj(slot: u32, lod: f32, uv: vec2<f32>, pos_in: vec3<f32>, wn_in: vec
     let wn = proj_nrm(wn_in);
     switch mode {
         case 0u: { return tex_uv(slot, uv_xform(uv), lod); }
+        case 6u: { return tex_at(slot, clamp(pos.xy, vec2<f32>(0.0), vec2<f32>(1.0)), lod); }
+        case 7u: { return tex_at(slot, clamp(wrap_uv(pos), vec2<f32>(0.0), vec2<f32>(1.0)), lod); }
         case 2u: { return tex_at(slot, pos.zy * s + F.offs.xy, lod); }
         case 3u: { return tex_at(slot, pos.xz * s + F.offs.xy, lod); }
         case 4u: { return tex_at(slot, pos.xy * s + F.offs.xy, lod); }
@@ -166,11 +178,31 @@ fn proc_coords(uv: vec2<f32>, pos_in: vec3<f32>) -> vec3<f32> {
     let pos = proj_pos(pos_in);
     switch mode {
         case 0u: { return vec3<f32>(uv_xform(uv), 0.0); }
+        case 6u: { return vec3<f32>(pos.xy, 0.0); }
+        case 7u: { return vec3<f32>(wrap_uv(pos), 0.0); }
         case 2u: { return vec3<f32>(pos.zy * s + F.offs.xy, 0.0); }
         case 3u: { return vec3<f32>(pos.xz * s + F.offs.xy, 0.0); }
         case 4u: { return vec3<f32>(pos.xy * s + F.offs.xy, 0.0); }
         default: { return pos * s + vec3<f32>(F.offs.xy, 0.0); }
     }
+}
+
+// Decal coverage: 1 inside its box on the faces turned toward it, 0
+// elsewhere (1 for the other projections).
+fn decal_cov(pos_in: vec3<f32>, wn_in: vec3<f32>) -> f32 {
+    let mode = u32(F.proj.x + 0.5);
+    if mode != 6u && mode != 7u { return 1.0; }
+    let q = proj_pos(pos_in);
+    if mode == 7u {
+        // Inside the cylinder's height and arc, on faces turned outward.
+        let c = q.xz - vec2<f32>(0.5);
+        let r = length(c);
+        let t = wrap_uv(q);
+        if q.y < 0.0 || q.y > 1.0 || t.x < 0.0 || t.x > 1.0 || r > 0.5 || r < 0.2 { return 0.0; }
+        return smoothstep(0.05, 0.25, dot(proj_nrm(wn_in).xz, c / r));
+    }
+    if any(q < vec3<f32>(0.0)) || any(q > vec3<f32>(1.0)) { return 0.0; }
+    return smoothstep(0.05, 0.25, proj_nrm(wn_in).z);
 }
 
 // Value of channel c as rgb (scalars in .x). Returns w = coverage.
@@ -200,10 +232,15 @@ fn channel(c: u32, uv: vec2<f32>, pos: vec3<f32>, wn: vec3<f32>) -> vec4<f32> {
             return vec4<f32>(mix(src.a.x, src.b.x, t.r), 0.0, 0.0, 1.0);
         }
         case 2u: {
-            let p = proc_coords(uv, pos) * select(1.0, src.t.w, src.t.w > 0.0);
+            var p = proc_coords(uv, pos) * select(1.0, src.t.w, src.t.w > 0.0);
             // Normal generators give the normal channel its own normals.
             if c == 6u && src.k.y == 27u {
                 return vec4<f32>(flake(p, ProcParams(src.pa, src.pb)).xyz, 1.0);
+            }
+            // Planar patterns take each face's plane in tri-planar.
+            if planar_kind(src.k.y) && u32(F.proj.x + 0.5) == 1u {
+                let ps = proj_pos(pos) * F.proj.y * select(1.0, src.t.w, src.t.w > 0.0);
+                p = proc_tri(ps, proj_nrm(wn), F.offs.xy);
             }
             let v = proc_eval(src.k.y, p, ProcParams(src.pa, src.pb));
             if c == 6u { return vec4<f32>(0.0, 0.0, 1.0, 1.0); }
@@ -234,10 +271,11 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {
     // Where a base color image is transparent the whole layer is: its
     // other channels too.
     let c0 = F.ch[0];
-    let cut = select(1.0, col.w, c0.k.w != 0u && c0.k.x == 1u && (c0.k.z & 4u) == 0u);
+    let dc = decal_cov(pos, wn);
+    let cut = select(1.0, col.w, c0.k.w != 0u && c0.k.x == 1u && (c0.k.z & 4u) == 0u) * dc;
     var smp: Sample;
     smp.col = col.rgb;
-    smp.a_col = col.w;
+    smp.a_col = col.w * dc;
     smp.val = vec3<f32>(r.x, m.x, h.x);
     smp.a_val = vec4<f32>(r.w, m.w, h.w, o.w) * cut;
     smp.emi = e.rgb;
@@ -308,8 +346,18 @@ struct MaskParams {
     n1: vec4<f32>,
     n2: vec4<f32>,
     colors: array<vec4<f32>, 8>,
+    // UV projection: per-axis scale, pivot (as `uv_xform` of the fill pass)
+    uvx: vec4<f32>,
+    uvp: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> M: MaskParams;
+
+// A mask fill's UV placement, the same as a fill layer's (`uv_xform`).
+fn m_uv(uv: vec2<f32>) -> vec2<f32> {
+    let st = select(vec2<f32>(1.0), M.uvx.xy, abs(M.uvx.x) > 1e-6);
+    let mir = vec2<f32>(select(1.0, M.offs.z, M.offs.z != 0.0), select(1.0, M.offs.w, M.offs.w != 0.0));
+    return rotate2((uv - M.uvp.xy) * mir, M.proj.z) * M.proj.y * st + M.uvp.xy + M.offs.xy;
+}
 @group(0) @binding(1) var m_in: texture_2d<f32>;
 @group(0) @binding(2) var paint: texture_2d<f32>;
 @group(0) @binding(3) var tex: texture_2d<f32>;
@@ -350,7 +398,8 @@ fn m_tex(uv: vec2<f32>, pos_in: vec3<f32>, wn_in: vec3<f32>) -> f32 {
     let wn = vec3<f32>(dot(M.n0.xyz, wn_in), dot(M.n1.xyz, wn_in), dot(M.n2.xyz, wn_in));
     var t: vec4<f32>;
     switch mode {
-        case 0u: { t = textureSampleLevel(tex, samp, rotate2((uv - 0.5) * vec2<f32>(select(1.0, M.offs.z, M.offs.z != 0.0), select(1.0, M.offs.w, M.offs.w != 0.0)), M.proj.z) * s + 0.5 + M.offs.xy, M.o.z); }
+        case 0u: { t = textureSampleLevel(tex, samp, m_uv(uv), M.o.z); }
+        case 6u: { t = textureSampleLevel(tex, samp, clamp(pos.xy, vec2<f32>(0.0), vec2<f32>(1.0)), M.o.z); }
         case 2u: { t = textureSampleLevel(tex, samp, pos.zy * s + M.offs.xy, M.o.z); }
         case 3u: { t = textureSampleLevel(tex, samp, pos.xz * s + M.offs.xy, M.o.z); }
         case 4u: { t = textureSampleLevel(tex, samp, pos.xy * s + M.offs.xy, M.o.z); }
@@ -367,19 +416,27 @@ fn m_tex(uv: vec2<f32>, pos_in: vec3<f32>, wn_in: vec3<f32>) -> f32 {
     return v;
 }
 
-fn m_proc(uv: vec2<f32>, pos_in: vec3<f32>) -> f32 {
+fn m_proc(uv: vec2<f32>, pos_in: vec3<f32>, wn_in: vec3<f32>) -> f32 {
     let mode = u32(M.proj.x + 0.5);
     let s = M.proj.y;
     let pos = m_pos(pos_in);
+    let kind = u32(M.sv.z + 0.5);
+    let k = select(1.0, M.sv.w, M.sv.w > 0.0);
     var p: vec3<f32>;
     switch mode {
-        case 0u: { p = vec3<f32>(rotate2((uv - 0.5) * vec2<f32>(select(1.0, M.offs.z, M.offs.z != 0.0), select(1.0, M.offs.w, M.offs.w != 0.0)), M.proj.z) * s + 0.5 + M.offs.xy, 0.0); }
-        case 2u: { p = vec3<f32>(pos.zy * s + M.offs.xy, 0.0); }
-        case 3u: { p = vec3<f32>(pos.xz * s + M.offs.xy, 0.0); }
-        case 4u: { p = vec3<f32>(pos.xy * s + M.offs.xy, 0.0); }
-        default: { p = pos * s + vec3<f32>(M.offs.xy, 0.0); }
+        case 0u: { p = vec3<f32>(m_uv(uv), 0.0) * k; }
+        case 6u: { p = vec3<f32>(pos.xy, 0.0) * k; }
+        case 2u: { p = vec3<f32>(pos.zy * s + M.offs.xy, 0.0) * k; }
+        case 3u: { p = vec3<f32>(pos.xz * s + M.offs.xy, 0.0) * k; }
+        case 4u: { p = vec3<f32>(pos.xy * s + M.offs.xy, 0.0) * k; }
+        default: { p = (pos * s + vec3<f32>(M.offs.xy, 0.0)) * k; }
     }
-    return proc_eval(u32(M.sv.z + 0.5), p * select(1.0, M.sv.w, M.sv.w > 0.0), ProcParams(M.pa, M.pb));
+    // Planar patterns take each face's plane in tri-planar.
+    if planar_kind(kind) && mode == 1u {
+        let wn = vec3<f32>(dot(M.n0.xyz, wn_in), dot(M.n1.xyz, wn_in), dot(M.n2.xyz, wn_in));
+        p = proc_tri(pos * s * k, wn, M.offs.xy);
+    }
+    return proc_eval(kind, p, ProcParams(M.pa, M.pb));
 }
 
 // id: tile local, gid: global texel.
@@ -457,7 +514,7 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {
         case 2u: {
             var v = M.o.y;
             if M.k.w == 1u { v = mix(M.sv.x, M.sv.y, tv); }
-            if M.k.w == 2u { v = mix(M.sv.x, M.sv.y, m_proc(uv, pos)); }
+            if M.k.w == 2u { v = mix(M.sv.x, M.sv.y, m_proc(uv, pos, wn)); }
             e = mblend(M.k.y, m, v);
         }
         case 3u: { e = mblend(M.k.y, m, generator(id, gid, pos, wn)); }

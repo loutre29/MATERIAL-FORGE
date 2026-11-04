@@ -181,8 +181,60 @@ struct FilterParams {
     p1: vec4<f32>,
     color: vec4<f32>,
     color2: vec4<f32>,
+    // Curves: RGB, red, green, blue; 8 (x, y) points each, two per vec4,
+    // x < 0 past the last one.
+    curve: array<vec4<f32>, 16>,
 };
 @group(0) @binding(0) var<uniform> P: FilterParams;
+
+fn curve_pt(c: u32, i: u32) -> vec2<f32> {
+    let v = P.curve[c * 4u + i / 2u];
+    return select(v.xy, v.zw, (i & 1u) == 1u);
+}
+
+fn curve_sec(c: u32, i: u32) -> f32 {
+    let a = curve_pt(c, i);
+    let b = curve_pt(c, i + 1u);
+    return (b.y - a.y) / max(b.x - a.x, 1e-5);
+}
+
+fn curve_slope(c: u32, i: u32, n: u32) -> f32 {
+    if i == 0u { return curve_sec(c, 0u); }
+    if i == n - 1u { return curve_sec(c, n - 2u); }
+    let a = curve_sec(c, i - 1u);
+    let b = curve_sec(c, i);
+    if a * b <= 0.0 { return 0.0; }
+    let lim = 3.0 * min(abs(a), abs(b));
+    return clamp((a + b) * 0.5, -lim, lim);
+}
+
+// Tone curve `c` at v: monotone cubic between the points, flat past the
+// ends (document.rs `curve_eval`).
+fn curve(c: u32, v: f32) -> f32 {
+    var n = 0u;
+    for (var i = 0u; i < 8u; i++) {
+        if curve_pt(c, i).x < 0.0 { break; }
+        n = i + 1u;
+    }
+    if n == 0u { return v; }
+    let first = curve_pt(c, 0u);
+    let last = curve_pt(c, n - 1u);
+    if v <= first.x { return first.y; }
+    if v >= last.x { return last.y; }
+    var i = 0u;
+    loop {
+        if i + 2u >= n || v <= curve_pt(c, i + 1u).x { break; }
+        i += 1u;
+    }
+    let p0 = curve_pt(c, i);
+    let p1 = curve_pt(c, i + 1u);
+    let h = max(p1.x - p0.x, 1e-5);
+    let t = (v - p0.x) / h;
+    let t2 = t * t;
+    let t3 = t2 * t;
+    return (2.0 * t3 - 3.0 * t2 + 1.0) * p0.y + (t3 - 2.0 * t2 + t) * h * curve_slope(c, i, n)
+        + (-2.0 * t3 + 3.0 * t2) * p1.y + (t3 - t2) * h * curve_slope(c, i + 1u, n);
+}
 @group(0) @binding(1) var a_col: texture_2d<f32>;
 @group(0) @binding(2) var a_mrh: texture_2d<f32>;
 @group(0) @binding(3) var a_emi: texture_2d<f32>;
@@ -243,6 +295,8 @@ fn f_color(c: vec3<f32>, blurred: vec3<f32>) -> vec3<f32> {
             h.y = clamp(h.y * P.p0.w, 0.0, 1.0);
             return hsv2rgb(h);
         }
+        // Curves: each channel's, then the RGB one
+        case 17u: { return vec3<f32>(curve(0u, curve(1u, c.r)), curve(0u, curve(2u, c.g)), curve(0u, curve(3u, c.b))); }
         default: { return c; }
     }
 }
@@ -266,6 +320,7 @@ fn f_scalar(v: f32, blurred: f32) -> f32 {
         case 12u: { return hist_scan(v); }
         case 13u: { return v - blurred + 0.5; }
         case 14u: { return pow(max((v - 0.5) * P.p0.y + 0.5 + P.p0.x, 0.0), 1.0 / max(P.p0.z, 0.01)); }
+        case 17u: { return curve(0u, v); }
         default: { return v; }
     }
 }

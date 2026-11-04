@@ -1,7 +1,7 @@
 use glam::{Mat4, Vec3};
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct OrbitCamera {
     pub target: [f32; 3],
     pub yaw: f32,
@@ -11,11 +11,15 @@ pub struct OrbitCamera {
     /// Orthographic projection (same framing as the perspective one).
     #[serde(default)]
     pub ortho: bool,
+    /// Lens shift (normalized device units): the target shows off the
+    /// view's center (the packshot studio centers it between the panels).
+    #[serde(skip)]
+    pub shift: [f32; 2],
 }
 
 impl Default for OrbitCamera {
     fn default() -> Self {
-        Self { target: [0.0; 3], yaw: 0.6, pitch: 0.25, distance: 3.0, fov_y: 40f32.to_radians(), ortho: false }
+        Self { target: [0.0; 3], yaw: 0.6, pitch: 0.25, distance: 3.0, fov_y: 40f32.to_radians(), ortho: false, shift: [0.0; 2] }
     }
 }
 
@@ -36,12 +40,13 @@ impl OrbitCamera {
 
     pub fn proj(&self, aspect: f32) -> Mat4 {
         let (n, f) = self.near_far();
+        let shift = Mat4::from_translation(Vec3::new(self.shift[0], self.shift[1], 0.0));
         if self.ortho {
             let h = self.distance * (self.fov_y * 0.5).tan();
             let w = h * aspect.max(1e-3);
-            return Mat4::orthographic_rh(-w, w, -h, h, n, f);
+            return shift * Mat4::orthographic_rh(-w, w, -h, h, n, f);
         }
-        Mat4::perspective_rh(self.fov_y, aspect.max(1e-3), n, f)
+        shift * Mat4::perspective_rh(self.fov_y, aspect.max(1e-3), n, f)
     }
 
     /// World units per pixel at the target distance (ortho: everywhere).

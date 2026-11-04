@@ -276,6 +276,24 @@ impl TextureSetGpu {
         true
     }
 
+    /// Sets baked mesh map `i` (the order of the set settings' MESH MAPS:
+    /// normal, world normal, ID, AO, curvature, position, thickness) to the
+    /// constant of an unbaked map. Position and world normal place the
+    /// tri-planar projections: they are never cleared.
+    pub fn clear_map(&self, q: &wgpu::Queue, i: usize) {
+        let (t, v): (&Tex, &[f32]) = match i {
+            0 => (&self.baked_normal, &[0.0, 0.0, 1.0, 1.0]),
+            2 => (&self.baked_id, &[0.0, 0.0, 0.0, 1.0]),
+            3 => (&self.baked_ao, &[1.0]),
+            4 => (&self.baked_curvature, &[0.5]),
+            6 => (&self.baked_thickness, &[0.5]),
+            _ => return,
+        };
+        let n = (t.width * t.height) as usize;
+        let data: Vec<f32> = (0..n).flat_map(|_| v.iter().copied()).collect();
+        t.write_bytes(q, &texture::f32_to_f16_bytes(&data));
+    }
+
     /// Gives the baked mesh maps their full size (before writing a bake).
     /// With a queue, maps that grow keep their constant value (callers that
     /// write only some of them); without, they start zeroed.

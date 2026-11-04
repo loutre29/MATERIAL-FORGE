@@ -157,12 +157,21 @@ pub struct Shelf {
     previewer_flat: Option<Previewer>,
     /// Texture materials, lit by the viewport's environment.
     previewer_mat: Option<Previewer>,
+    /// Fill layer row balls (studio lit, like the library).
+    previewer_layer: Option<Previewer>,
     /// Environment the material thumbnails were lit by.
     thumb_env: String,
     loaded: bool,
     list_view: bool,
+    /// Grid thumbnail size: 0 small, 1 medium, 2 large.
+    thumb_size: u8,
     pub(super) source: Source,
     builtin_brushes: std::collections::HashSet<String>,
+    /// Downloaded materials (Muse's ambientCG scans, out of the library):
+    /// shown only in the Project category of a project that uses them.
+    scans: Vec<Item>,
+    /// The scans the open project uses, by name.
+    project_mats: std::collections::HashSet<String>,
     /// Key of the highlighted asset.
     selected: Option<String>,
     /// Procedurals: Painter's shelf folder shown (None: all).
@@ -200,11 +209,15 @@ impl Default for Shelf {
             previewer_box: None,
             previewer_flat: None,
             previewer_mat: None,
+            previewer_layer: None,
             thumb_env: String::new(),
             loaded: false,
             list_view: false,
+            thumb_size: 1,
             source: Source::All,
             builtin_brushes: Default::default(),
+            scans: Vec::new(),
+            project_mats: Default::default(),
             selected: None,
             proc_folder: None,
             mat_folder: None,
@@ -252,18 +265,36 @@ impl Shelf {
                 v.into_iter().map(|r| Item::ProjectTexture(r.id, r.name.clone())).collect()
             })
             .unwrap_or_default();
+        // A scan is the project's when its maps are among the project's
+        // resources ("<name> color.jpg").
+        self.project_mats = self
+            .scans
+            .iter()
+            .filter_map(|it| match it {
+                Item::TexMaterial(m) => Some(m),
+                _ => None,
+            })
+            .filter(|m| {
+                let color = m.map("color").and_then(|p| p.extension().map(|x| x.to_string_lossy().into_owned())).unwrap_or_default();
+                let name = format!("{} color.{color}", m.name);
+                doc.is_some_and(|d| d.resources.values().any(|r| r.name == name))
+            })
+            .map(|m| m.name.clone())
+            .collect();
+        let mut project = project;
+        project.extend(self.scans.iter().filter(|it| matches!(it, Item::TexMaterial(m) if self.project_mats.contains(&m.name))).cloned());
         let get = |c: Category| self.items.get(&c).cloned().unwrap_or_default();
         let mut items: Vec<Item> = match self.category {
             Category::All => {
                 let mut v: Vec<Item> = Category::ALL.iter().flat_map(|c| get(*c)).collect();
-                v.extend(project.iter().cloned());
+                v.extend(project.iter().filter(|it| matches!(it, Item::ProjectTexture(..))).cloned());
                 v
             }
             Category::Project => project.clone(),
             Category::Textures => {
                 let mut v = get(Category::Textures);
                 v.extend(get(Category::Procedurals));
-                v.extend(project.iter().cloned());
+                v.extend(project.iter().filter(|it| matches!(it, Item::ProjectTexture(..))).cloned());
                 v
             }
             c => get(c),
@@ -308,6 +339,9 @@ impl Shelf {
                     Source::Starter
                 }
             }
+            // Downloaded by Muse: only ever shown as the project's.
+            Item::TexMaterial(m) if self.project_mats.contains(&m.name) && m.dir.starts_with(crate::ambientcg::scans_dir()) => Source::Project,
+            Item::TexMaterial(m) if m.dir.starts_with(&user_dir) => Source::User,
             Item::Material(..) | Item::TexMaterial(_) | Item::Alpha(_) | Item::Procedural(_) | Item::Filter(_) => Source::Starter,
         }
     }
@@ -338,12 +372,33 @@ impl Shelf {
     /// material): a sphere lit by the scene's environment and graded like
     /// the viewport (`look`), so it looks like the layer on the model.
     pub(super) fn preview(&mut self, engine: &crate::engine::Engine, tree: &LayerTree, resources: &HashMap<u64, Resource>, look: crate::preview::Look, set: Option<&SetSettings>) -> crate::engine::Tex {
-        let pv = self.previewer_mat.get_or_insert_with(|| Previewer::new_material(engine));
+        let pv = self.previewer_layer.get_or_insert_with(|| Previewer::new_layer(engine));
         pv.render_fill(engine, tree, resources, look, set)
     }
 
     pub fn refresh(&mut self) {
         self.loaded = false;
+    }
+
+    /// The library's scanned materials, plain presets and smart materials
+    /// (Muse chooses among them).
+    pub(super) fn material_names(&mut self) -> (Vec<library::TexMaterial>, Vec<String>, Vec<String>) {
+        self.load();
+        let names = |c: Category| self.items.get(&c).map(|v| v.iter().map(Item::name).collect()).unwrap_or_default();
+        let mats = self.items.get(&Category::Materials).cloned().unwrap_or_default();
+        let tex = mats.iter().filter_map(|i| if let Item::TexMaterial(m) = i { Some((**m).clone()) } else { None }).collect();
+        let presets = mats.iter().filter(|i| matches!(i, Item::Material(..))).map(Item::name).collect();
+        (tex, presets, names(Category::SmartMaterials))
+    }
+
+    /// A material or smart material of the library by name.
+    pub(super) fn material_item(&mut self, name: &str) -> Option<Item> {
+        self.load();
+        [Category::SmartMaterials, Category::Materials]
+            .iter()
+            .flat_map(|c| self.items.get(c).into_iter().flatten())
+            .find(|i| i.name().eq_ignore_ascii_case(name.trim()))
+            .cloned()
     }
 
     fn load(&mut self) {
@@ -355,6 +410,7 @@ impl Shelf {
         // Texture materials (starter assets); the procedural presets when
         // the folder is missing.
         let tex: Vec<Item> = library::texture_materials().into_iter().map(|m| Item::TexMaterial(Box::new(m))).collect();
+        self.scans = library::scan_materials().into_iter().map(|m| Item::TexMaterial(Box::new(m))).collect();
         m.insert(
             Category::Materials,
             if tex.is_empty() { library::materials().into_iter().map(|x| Item::Material(x.name.into(), x.fill)).collect() } else { tex },
@@ -598,10 +654,26 @@ impl RetroApp {
                             self.shelf.refresh();
                         }
                     });
+                    // The view: a list, or thumbnails of three sizes.
                     let lv = self.shelf.list_view;
-                    if icons::button(ui, if lv { Icon::List } else { Icon::Grid }, false, 26.0, "Thumbnails / list").clicked() {
-                        self.shelf.list_view = !lv;
+                    let b = icons::button(ui, if lv { Icon::List } else { Icon::Grid }, false, 26.0, "Thumbnail size / list");
+                    super::mark(ctx, "library view", b.rect);
+                    let pid = egui::Id::new("library view menu");
+                    if b.clicked() {
+                        ui.memory_mut(|m| m.toggle_popup(pid));
                     }
+                    super::widgets::popup_below(ui, pid, &b, egui::PopupCloseBehavior::CloseOnClick, |ui| {
+                        ui.set_min_width(150.0);
+                        for (k, name) in ["Small thumbnails", "Medium thumbnails", "Large thumbnails"].into_iter().enumerate() {
+                            if ui.selectable_label(!lv && self.shelf.thumb_size == k as u8, name).clicked() {
+                                self.shelf.list_view = false;
+                                self.shelf.thumb_size = k as u8;
+                            }
+                        }
+                        if ui.selectable_label(lv, "List").clicked() {
+                            self.shelf.list_view = true;
+                        }
+                    });
                 }, filters);
                 for k in std::mem::take(&mut gone) {
                     match k {
@@ -753,7 +825,8 @@ impl RetroApp {
                         }
                         let w = ui.available_width();
                         let list = self.shelf.list_view;
-                        let cols = if list { 1 } else { ((w / 66.0).floor() as usize).max(2) };
+                        let min_tile = [52.0, 66.0, 104.0][self.shelf.thumb_size.min(2) as usize];
+                        let cols = if list { 1 } else { ((w / min_tile).floor() as usize).max(2) };
                         let gap = 4.0;
                         let tile = if list { 30.0 } else { ((w - gap * (cols as f32 - 1.0)) / cols as f32).floor() };
                         let row_h = if list { 32.0 } else { tile + 14.0 };
@@ -916,6 +989,37 @@ impl RetroApp {
             }
         }
         p.text(r.center_bottom() + egui::vec2(0.0, 11.0), egui::Align2::CENTER_CENTER, item.name(), egui::FontId::proportional(11.0), Color32::WHITE);
+    }
+
+    /// The layers a material or smart material adds (its textures imported
+    /// into the project), None for other items.
+    pub(super) fn item_tree(&mut self, item: Item) -> Option<LayerTree> {
+        let fill_tree = |name: String, fill: FillDesc| LayerTree { desc: LayerDesc::new(0, name, LayerKind::Fill(Box::new(fill))), children: Vec::new() };
+        match item {
+            Item::TexMaterial(m) => {
+                let fill = self.tex_material_fill(&m)?;
+                Some(fill_tree(m.name.clone(), fill))
+            }
+            Item::Material(name, mut fill) => {
+                fill.material = Some(name.clone());
+                Some(fill_tree(name, fill))
+            }
+            Item::SmartMaterial(name, mut tree, dir, textures) => {
+                let doc = self.doc.as_mut()?;
+                if let Some(dir) = dir {
+                    let mut map = HashMap::new();
+                    for (old, file) in textures {
+                        if let Ok(id) = doc.import_resource(&self.engine, &dir.join(&file), ResKind::Texture) {
+                            map.insert(old, id);
+                        }
+                    }
+                    library::remap_resources(&mut tree, &map);
+                }
+                tree.desc.name = name.trim_end_matches(" (user)").to_string();
+                Some(tree)
+            }
+            _ => None,
+        }
     }
 
     pub(super) fn apply_item(&mut self, item: Item) {
@@ -1116,7 +1220,9 @@ impl RetroApp {
         doc.insert_layer(set, l);
     }
 
-    /// Renders up to two missing thumbnails per frame.
+    /// Makes missing thumbnails: files decode on several worker threads
+    /// (every finished one shows the same frame), at most two GPU renders
+    /// per frame.
     pub(super) fn generate_thumbnails(&mut self, ctx: &egui::Context) {
         // Material spheres are lit by the environment: a new one renders
         // them again.
@@ -1134,7 +1240,11 @@ impl RetroApp {
             return;
         }
         let empty = HashMap::new();
-        for _ in 0..1 {
+        // Waiting for a decoder (or this frame's render budget): back in the queue.
+        let mut later = Vec::new();
+        let mut renders = 0;
+        let max_dec = std::thread::available_parallelism().map_or(2, |n| n.get().saturating_sub(1).clamp(2, 8));
+        for _ in 0..32 {
             let Some(item) = self.shelf.wanted.pop() else { break };
             let key = item.key();
             if self.shelf.thumbs.contains_key(&key) {
@@ -1147,9 +1257,9 @@ impl RetroApp {
             let job: Option<Job> = match &item {
                 Item::AlphaFile(p) | Item::Texture(p) | Item::Environment(p) => {
                     let p = p.clone();
-                    Some(Box::new(move || load_image_any(&p)))
+                    Some(Box::new(move || load_image_any(&p).map(|i| image::imageops::thumbnail(&i, THUMB, THUMB))))
                 }
-                Item::TexMaterial(m) => m.preview().map(|p| Box::new(move || load_image_any(&p)) as Job),
+                Item::TexMaterial(m) => m.preview().map(|p| Box::new(move || load_image_any(&p).map(|i| image::imageops::thumbnail(&i, THUMB, THUMB))) as Job),
                 Item::Brush(b) => {
                     let b = b.clone();
                     Some(Box::new(move || Some(b.thumbnail(THUMB))))
@@ -1172,7 +1282,7 @@ impl RetroApp {
                         }
                     }
                     None => {
-                        if !self.shelf.decoding.contains(&key) && self.shelf.decoding.len() < 2 {
+                        if !self.shelf.decoding.contains(&key) && self.shelf.decoding.len() < max_dec {
                             self.shelf.decoding.insert(key.clone());
                             let (out, key) = (self.shelf.decoded_img.clone(), key.clone());
                             std::thread::spawn(move || {
@@ -1182,24 +1292,26 @@ impl RetroApp {
                                 }
                             });
                         }
-                        self.shelf.wanted.insert(0, item);
-                        ctx.request_repaint_after(std::time::Duration::from_millis(30));
-                        return;
+                        later.push(item);
+                        continue;
                     }
                 }
                 continue;
             }
+            if renders >= 2 {
+                later.push(item);
+                continue;
+            }
+            renders += 1;
             if let Item::TexMaterial(m) = &item {
                 // Lit by the real environment: wait until it is loaded.
                 if self.env_loading.is_some() {
-                    self.shelf.wanted.insert(0, item);
-                    ctx.request_repaint_after(std::time::Duration::from_millis(50));
-                    return;
+                    later.push(item);
+                    continue;
                 }
                 let ready = self.shelf.decoded.lock().ok().and_then(|mut d| d.remove(&key));
                 let Some(maps) = ready else {
-                    // At most two decoders at a time.
-                    if !self.shelf.decoding.contains(&key) && self.shelf.decoding.len() < 2 {
+                    if !self.shelf.decoding.contains(&key) && self.shelf.decoding.len() < max_dec {
                         self.shelf.decoding.insert(key.clone());
                         let (m, out, key) = (m.clone(), self.shelf.decoded.clone(), key.clone());
                         std::thread::spawn(move || {
@@ -1216,9 +1328,8 @@ impl RetroApp {
                         });
                     }
                     // Back in the queue until its maps are decoded.
-                    self.shelf.wanted.insert(0, item);
-                    ctx.request_repaint_after(std::time::Duration::from_millis(30));
-                    return;
+                    later.push(item);
+                    continue;
                 };
                 self.shelf.decoding.remove(&key);
                 self.shelf.wanted_keys.remove(&key);
@@ -1249,7 +1360,7 @@ impl RetroApp {
                 if !files.is_empty() {
                     let ready = self.shelf.decoded_files.lock().ok().and_then(|mut d| d.remove(&key));
                     let Some(maps) = ready else {
-                        if !self.shelf.decoding.contains(&key) && self.shelf.decoding.len() < 2 {
+                        if !self.shelf.decoding.contains(&key) && self.shelf.decoding.len() < max_dec {
                             self.shelf.decoding.insert(key.clone());
                             let (dir, files, out, key) = (dir.clone(), files.clone(), self.shelf.decoded_files.clone(), key.clone());
                             std::thread::spawn(move || {
@@ -1266,9 +1377,8 @@ impl RetroApp {
                                 }
                             });
                         }
-                        self.shelf.wanted.insert(0, item);
-                        ctx.request_repaint_after(std::time::Duration::from_millis(30));
-                        return;
+                        later.push(item);
+                        continue;
                     };
                     self.shelf.decoding.remove(&key);
                     self.shelf.wanted_keys.remove(&key);
@@ -1365,7 +1475,15 @@ impl RetroApp {
                 self.shelf.thumbs.insert(key, egui::TextureId::default());
             }
         }
-        ctx.request_repaint();
+        let waiting = !later.is_empty();
+        for it in later.into_iter().rev() {
+            self.shelf.wanted.insert(0, it);
+        }
+        if waiting {
+            ctx.request_repaint_after(std::time::Duration::from_millis(15));
+        } else {
+            ctx.request_repaint();
+        }
     }
 }
 
