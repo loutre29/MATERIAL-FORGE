@@ -1,4 +1,4 @@
-Material Forge 0.3.0 (test build)
+Material Forge 0.4.0 (test build)
 =================================
 
 A PBR 3D texture painter in the spirit of Substance 3D Painter.
@@ -20,6 +20,11 @@ Getting started
   or the wheel zooms. F frames the mesh. F1 / F2 / F3: 3D + 2D, 3D only,
   2D only. In the 2D view, Alt + left drag turns the view.
 - Typed numbers can go past the end of a slider (click the value box).
+- Claude: texture the model by chatting with Claude. In the Claude card
+  (top right), click Add to Claude app (or Add to Claude Code), restart
+  Claude, then ask it for example "In Material Forge, texture the model
+  as an old brass lantern". Keep Material Forge open while it works; the
+  card hides while Claude is connected (Window > Panels > Claude).
 
 Requirements
 - Windows 10 / 11, 64-bit, with a DirectX 12 or Vulkan capable GPU.
