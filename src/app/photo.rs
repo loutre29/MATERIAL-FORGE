@@ -35,6 +35,9 @@ pub struct Found {
     pub quad: [[f32; 2]; 4],
     pub share: f32,
     pub fill: f32,
+    /// Light, nearly colorless flat areas on the object, four-cornered
+    /// (paper labels, the usual print sources), largest first.
+    pub labels: Vec<[[f32; 2]; 4]>,
 }
 
 /// Grows (`on` true) or shrinks the mask by one pixel (3 x 3).
@@ -216,6 +219,46 @@ pub fn find_object(img: &RgbaImage) -> Option<Found> {
     if !(0.03..0.97).contains(&share) || edge as f32 > 0.33 * (2 * (w + h)) as f32 {
         return None;
     }
+    let (q, area) = quad_of(&m, w, h)?;
+    let fill = count as f32 / area.max(1.0);
+    let sx = fw as f32 / w as f32;
+    let sy = fh as f32 / h as f32;
+    let quad = corners_in_order(q.map(|p| Vec2::new(p.x * sx, p.y * sy)));
+    // Labels: light, nearly colorless areas inside the object (their
+    // printed text closed over), each filling its four corners.
+    let mut light: Vec<bool> = (0..w * h).map(|i| m[i] && lab[i][0] > 62.0 && (lab[i][1] * lab[i][1] + lab[i][2] * lab[i][2]).sqrt() < 12.0).collect();
+    for on in [true, true, false, false] {
+        light = morph(&light, w, h, on);
+    }
+    for i in 0..w * h {
+        light[i] &= m[i];
+    }
+    let (ids, sizes) = parts(&light, w, h);
+    let mut big: Vec<usize> = (1..sizes.len()).filter(|&i| sizes[i] as f32 > 0.03 * count as f32 && (sizes[i] as f32) < 0.9 * count as f32).collect();
+    big.sort_by_key(|&i| std::cmp::Reverse(sizes[i]));
+    let mut labels = Vec::new();
+    for i in big.into_iter().take(3) {
+        let part: Vec<bool> = ids.iter().map(|&l| l as usize == i).collect();
+        // On the object, not at its outline (a shadow on the ground is).
+        let mut ring = part.clone();
+        for _ in 0..3 {
+            ring = morph(&ring, w, h, true);
+        }
+        let (n, out) = (0..w * h).filter(|&k| ring[k] && !part[k]).fold((0usize, 0usize), |(n, o), k| (n + 1, o + usize::from(!m[k])));
+        if out as f32 > 0.08 * n as f32 {
+            continue;
+        }
+        if let Some((q, a)) = quad_of(&part, w, h) {
+            if sizes[i] as f32 / a.max(1.0) >= 0.75 {
+                labels.push(corners_in_order(q.map(|p| Vec2::new(p.x * sx, p.y * sy))));
+            }
+        }
+    }
+    Some(Found { quad, share, fill, labels })
+}
+
+/// The largest four-cornered shape inside a mask's outline, and its area.
+fn quad_of(m: &[bool], w: usize, h: usize) -> Option<([Vec2; 4], f32)> {
     let mut pts = Vec::new();
     for y in 0..h {
         let row = &m[y * w..(y + 1) * w];
@@ -228,11 +271,7 @@ pub fn find_object(img: &RgbaImage) -> Option<Found> {
     }
     let q = largest_quad(&hull(pts))?;
     let area = 0.5 * ((q[1] - q[0]).perp_dot(q[2] - q[0]).abs() + (q[2] - q[0]).perp_dot(q[3] - q[0]).abs());
-    let fill = count as f32 / area.max(1.0);
-    let sx = fw as f32 / w as f32;
-    let sy = fh as f32 / h as f32;
-    let quad = corners_in_order(q.map(|p| Vec2::new(p.x * sx, p.y * sy)));
-    Some(Found { quad, share, fill })
+    Some((q, area))
 }
 
 fn linear(c: u8) -> f32 {
@@ -434,9 +473,9 @@ pub struct SidePrint {
     pub img: RgbaImage,
     /// Width / height of the full print.
     pub aspect: f32,
-    /// A turn forced (by Muse), else the turns its proportions allow.
+    /// A turn forced (by Claude), else the turns its proportions allow.
     pub turn: Option<u32>,
-    /// The turn that puts its top where Muse says (its side's own up for
+    /// The turn that puts its top where Claude says (its side's own up for
     /// a wall), when the proportions allow it.
     pub up: Option<u32>,
     /// It may move to another side its proportions fit better.

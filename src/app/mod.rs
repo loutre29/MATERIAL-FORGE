@@ -2,6 +2,7 @@
 //! in the submodules (panels, viewport input, shelf, dialogs).
 
 mod autosave;
+mod demo;
 mod autouv;
 mod dialogs;
 mod dock;
@@ -14,7 +15,10 @@ mod polysel;
 mod uvgizmo;
 mod layers;
 mod layout;
+mod mcp;
+pub use mcp::bridge as mcp_bridge;
 mod muse;
+pub use muse::photo_facts;
 mod muse_light;
 mod photo;
 mod pieces;
@@ -32,7 +36,7 @@ mod widgets;
 
 pub use crawl::ui_crawl;
 pub use muse::view_shot as muse_view_shot;
-pub use uitest::{muse_test, ui_bench, ui_smoke};
+pub use uitest::{mcp_serve, muse_test, ui_bench, ui_smoke};
 
 /// Set by the headless UI tests: native file dialogs would block them.
 pub static HEADLESS: AtomicBool = AtomicBool::new(false);
@@ -256,6 +260,34 @@ pub enum Layout {
     Only2D,
 }
 
+/// Interface choices kept across sessions (`ui_prefs.json` next to the
+/// library): for now whether the view shows the tool's shortcuts.
+fn ui_prefs_path() -> std::path::PathBuf {
+    crate::library::library_dir().join("..").join("ui_prefs.json")
+}
+
+fn saved_show_tool_keys() -> bool {
+    std::fs::read(ui_prefs_path()).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()).and_then(|v| v["show_tool_keys"].as_bool()).unwrap_or(true)
+}
+
+/// Saves the shortcuts choice when it changed (the box in the view,
+/// Preferences or View settings).
+fn persist_show_tool_keys(show: bool) {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static LAST: AtomicU8 = AtomicU8::new(2);
+    if LAST.load(Ordering::Relaxed) == 2 {
+        LAST.store(saved_show_tool_keys() as u8, Ordering::Relaxed);
+    }
+    if LAST.swap(show as u8, Ordering::Relaxed) != show as u8 {
+        let p = ui_prefs_path();
+        let mut v = std::fs::read(&p).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()).filter(|v| v.is_object()).unwrap_or_else(|| serde_json::json!({}));
+        v["show_tool_keys"] = serde_json::Value::Bool(show);
+        if let Err(e) = std::fs::write(&p, serde_json::to_string_pretty(&v).unwrap_or_default()) {
+            eprintln!("ui_prefs.json not saved: {e}");
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ViewSettings {
     /// Channel shown by the 3D view.
@@ -329,7 +361,7 @@ impl Default for ViewSettings {
             uv_pan: [0.0, 0.0],
             uv_rot: 0.0,
             uv_wire: 0.35,
-            show_tool_keys: true,
+            show_tool_keys: saved_show_tool_keys(),
             wire_color: [0.85, 0.85, 0.9],
             wire_opacity: 0.35,
             show_assets: true,
@@ -613,6 +645,8 @@ pub struct RetroApp {
     studio_queue: Vec<(crate::camera::OrbitCamera, crate::studio::Studio, PathBuf)>,
     /// The packshot being rendered.
     studio_job: Option<studio_panel::StudioJob>,
+    /// A scripted showcase session (MF_DEMO).
+    demo: Option<Box<demo::Director>>,
     /// The view's field of view while the studio's lens replaces it.
     studio_fov: Option<f32>,
     /// Frames left to center the model in the studio's frame (entering it).
@@ -689,7 +723,7 @@ pub struct RetroApp {
     layout_saved: (Instant, String),
     /// The Texture Set Settings tab was drawn this frame (mesh map thumbnails).
     set_settings_visible: bool,
-    /// The Muse panel: texturing by prompt (Meta Model API).
+    /// The Claude panel: texturing by prompt (Anthropic Messages API).
     muse: muse::Muse,
     /// Logo texture for the start screen.
     logo_tex: Option<egui::TextureHandle>,
@@ -798,7 +832,7 @@ impl RetroApp {
         // Before anything reads the library (thumbnails, material stats).
         let scans = crate::ambientcg::move_scans_out_of_library();
         if scans > 0 {
-            eprintln!("{scans} Muse scans moved out of the library");
+            eprintln!("{scans} Claude scans moved out of the library");
         }
         style::apply(ctx);
         RetroApp {
@@ -879,6 +913,7 @@ impl RetroApp {
             studio_prev: None,
             studio_queue: Vec::new(),
             studio_job: None,
+            demo: demo::Director::from_env(),
             studio_fov: None,
             studio_recenter: 0,
             show_set_settings: false,
@@ -1582,7 +1617,7 @@ impl RetroApp {
         let env = &self.engine.env;
         let v = &self.view;
         let (mut disp, disp_kind) = v.display.code();
-        // Muse's pieces over the material view.
+        // Claude's pieces over the material view.
         let pieces = v.display == Display::Material && self.muse.piece_tex(0).is_some();
         if pieces {
             disp = 13.0;
@@ -2534,10 +2569,16 @@ pub fn apply_bake(engine: &Engine, s: &mut TextureSet, r: &bake::BakeResult) {
 
 impl eframe::App for RetroApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.demo.is_some() {
+            self.lock_cursor = false;
+        }
         self.ui_frame(ctx);
+        persist_show_tool_keys(self.view.show_tool_keys);
+        self.demo_frame(ctx);
     }
 
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
+        self.demo_input(ctx, raw);
         self.filter_input(ctx, raw);
     }
 }
@@ -2573,6 +2614,7 @@ impl RetroApp {
         self.saving_notice(ctx);
         self.run_pending_save(ctx);
         self.poll_bake();
+        self.mcp_tick(ctx);
         if self.env_loading.as_ref().is_some_and(|h| h.is_finished()) {
             if let Some(Some((p, w, h, px))) = self.env_loading.take().and_then(|h| h.join().ok()) {
                 let name = p.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -2619,10 +2661,7 @@ impl RetroApp {
         }
         let dropped = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect::<Vec<_>>());
         for p in &dropped {
-            // Images dropped on the Muse panel are references for Muse.
-            if !self.muse_drop(ctx, p) {
-                self.open_path(p);
-            }
+            self.open_path(p);
         }
 
         let history_len_before = self.history.version;

@@ -444,6 +444,12 @@ src/selftest.rs          headless end-to-end test and bench
   layouts are not read, so the new default shows; not in tests).
   `MF_UITEST_ONLY=panels` and the crawl state "library at the bottom"
   check it.
+- NOW CLAUDE (v67, 2026-11-06): the panel below was built on Meta's Muse
+  for the hackathon and now runs on Claude, ONLY through the Claude app or
+  Claude Code (MCP, v68); the API key mode was removed in v69; since v70
+  the panel is a small connect card that hides while Claude is linked. Code names
+  (`Muse`, `muse.rs`, `Tab::Muse`, MF_MUSE_*, the `muse/` data folder) are
+  kept; everything the user reads says Claude.
 - Muse panel (`app/muse.rs`, for the Meta Global AI Developer Hackathon,
   submissions due 2026-11-04): texturing by prompt with Meta's Muse
   models on the Meta Model API (`https://api.meta.ai/v1`, Bearer key from
@@ -1421,6 +1427,119 @@ Path tracer: ~700 samples per second at 960 x 600 on simple scenes.
   coordinate descent (SP cmp/fit.py, 120 renders) on the ADP photo:
   distance 0.121 to 0.064 (key 0.83 at az -60 el 12, sheen scrim 4.0
   wide, fill el 20, back 0.45, strip right az 147, top 0.23).
+- v67 (2026-11-06) CLAUDE REPLACES MUSE (user: "muse was for the hackaton.
+  But claude is better"; not pushed). `muse.rs` calls Anthropic's
+  Messages API: POST api.anthropic.com/v1/messages, `x-api-key`,
+  `anthropic-version: 2026-10-21`, beta `server-side-fallback-2026-07-01`;
+  body (`request_body`) model `claude-opus-5-5`, max_tokens 64000,
+  streamed, top-level `system`, thinking adaptive, `output_config.effort`
+  "high" (`EFFORT`), `fallbacks: "default"` (a declined request reruns on
+  the model Anthropic picks), top-level `cache_control` ephemeral (later
+  turns and the self check reuse the cached prompt and images).
+  `image_block` turns the internal data URLs into base64 image blocks
+  (re-encoded as JPEG past 5 MB). `read_stream` reads the SSE: text
+  deltas, a `fallback` block restarts the text, stop_reason `refusal` is
+  an error, `max_tokens` with no text too; `ask` retries 429/500/529 twice
+  (10 s, 20 s); read timeout 300 s between events. Key: ANTHROPIC_API_KEY
+  or `<data dir>/claude_key.txt` (the old muse_key.txt is no longer read);
+  the connect card opens platform.claude.com/settings/keys and checks a
+  key with GET /v1/models (free). No image generation: `texture_prompt`
+  is gone from the instructions and the self check; an old plan holding
+  one gets a note and the layer is skipped. All user-facing "Muse" text
+  and comments say Claude (tab, panel header, statuses, notes, folder
+  names "Claude: ..."). `claude_api_check` (in MF_UITEST_ONLY=studiomuse)
+  checks the body, image block and a canned stream with a fallback,
+  offline; crawl state "claude panel" shows the connect card. Also in
+  this build (demo work, 2026-11-05): `app/demo.rs` scripted showcase
+  player (MF_DEMO=<script.json>, MF_DEMO_OUT=<mp4> via ffmpeg),
+  `photo::Found.labels` (light low-chroma quads on the object, given to
+  Claude as "paper labels: the quad to print from"), `--photofacts`,
+  MF_MUSE_DELAY for replays. Never tested live: no Anthropic key here.
+- v68 (2026-11-06) CLAUDE THROUGH THE CLAUDE APP (MCP), no API key (user:
+  "can it work without API and only claude connected", chose MCP; not
+  pushed). `app/mcp.rs`: `material_forge --mcp` is a stdio MCP server
+  (JSON-RPC, protocol 2025-06-18 or the client's) the Claude app or
+  Claude Code starts; it forwards tool calls to the OPEN window over
+  127.0.0.1 (`<data dir>/mcp.json`: port, token, pid; written by
+  `mcp::serve` on the first frame, not in tests unless MF_MCP_SERVE). It
+  never starts the app (the Claude Desktop Store build would run it in
+  its package: settings virtualized). Tools: texture (message, images =
+  file paths, texture_sets, style, new_conversation, resend_instructions),
+  answer, wait, look, status, open. A texture call runs `mcp_texture`
+  (muse.rs), i.e. `muse_send` as if typed; `run()` sees
+  `mcp::turn_active()` and calls `mcp::ask_app` instead of the API: the
+  last message (instructions on the first) goes back as the tool result,
+  split in parts (60k chars, 700 KB of base64 images, 4 images each;
+  "call wait" for the next) and Claude's `answer` call resumes the
+  worker. Self check and lighting check go the same way. `mcp_tick`
+  (every ui_frame) ends the turn when nothing is busy, compositing or
+  baking: DONE + panel notes + `muse_shot` render. Tool calls wait 45 s,
+  then say "still on it, call wait"; the bridge sends progress every 8 s
+  and hello every 15 s (`mcp::linked()` for 60 s: the panel opens without
+  a key, chip "Claude app", composer replaced by a hint, images dropped
+  there go with the next request). Connect card: "Add to the Claude app"
+  (`claude_app_config`: %LOCALAPPDATA%\Claude-Data\claude_*\ for the Store
+  build, else Packages\Claude_*\LocalCache\Roaming\Claude, else
+  %APPDATA%\Claude; merges mcpServers.material-forge = exe --mcp, .bak
+  first, refuses broken JSON) and "Add to Claude Code" (`claude mcp add -s
+  user`). HEADLESS: both redirect / refuse (the crawl clicks every button:
+  it once wrote the user's real configs, restored the same day). Tests:
+  `mcp::self_check` in studiomuse; end to end `--mcpserve <mesh> <dir>`
+  (headless app with the socket, stops on `<dir>/stop`) driven by SP
+  `mcp_client.py <exe> <dir>/data <out>` through the real bridge, canned
+  answers. Also: "Don't show shortcuts" is remembered (`ui_prefs.json`,
+  `persist_show_tool_keys`, checked in MF_UITEST_ONLY=panels).
+- v69 (2026-11-06) NO API KEY MODE (user: "can you get rid of the API key
+  mode ?"). Gone: the Messages API calls (`request_body`, `read_stream`,
+  `ask`, the model / version / effort / fallback constants), the key
+  (ANTHROPIC_API_KEY, claude_key.txt, `Muse.key`, `Request.key`), the key
+  part of the connect card, the Disconnect chip, the panel's message box,
+  Send and EXAMPLES, `muse_test_key`, `claude_api_check`. `run()` answers
+  only through `mcp::ask_app` during a Claude app turn, else "Claude
+  answers in the Claude app or Claude Code: ask there."; MF_MUSE_PLAN
+  replays still work (tests, `--musetest` is replay-only now). The panel
+  (`muse_ready`: linked, or a conversation to show) shows the chat, a
+  "Claude app" dot (green when linked) and an images box (attach for the
+  next request). The connect card: "Add (again) to the Claude app" /
+  "Claude Code", says when Material Forge is already a connector
+  (`mcp::added`, reads the settings every 3 s) and when the entry starts
+  another copy of the app. `image_block` stays: questions are built as
+  message blocks and `ask_app` turns them into MCP content.
+- v70 (2026-11-08) SMALL CLAUDE CARD + TOOLTIP SHADOW (user: "simplify a
+  lot the claude panel so it's top right in the default layout but a small
+  layout that eventualy disappear when connected and reappear when not
+  connected"; then "when hovering a button ... a weird curve under the
+  selection"). The Claude panel is now only a card: header "Claude / Not
+  connected", one line (or the last add result), "Add to Claude app"
+  (accent) and "Add to Claude Code" side by side. Fixed height `MUSE_H`
+  (150) in its column (`place()`: the others share the rest; no split
+  grip next to it), top right above properties by default. Hidden while
+  `mcp::linked()` (a hello in the last 60 s, or a turn), back when the
+  link is gone (`canvas_ui`: `shown[MUSE] &= !linked`). Gone: the chat
+  view, the "Claude app" dot, style combo, Pieces chip, texture set chips,
+  the images box / + Image, dropping images on the window for Claude
+  (`muse_drop`, drops open files again), Cancel (`muse_cancel`),
+  `muse_ready`, `muse_body`, `bubble`, `chip`, `ref_row`, `Style::hint`,
+  `Ref.thumb`, `ChatLine.refs`. `mcp_tick` now polls the work every frame
+  (`muse_poll` left the panel); `mcp_texture` no longer opens the panel.
+  Images reach Claude only through the texture tool's `images` paths.
+  The streak: `popup_shadow` was `shadow(2)` (blur 40) and a tooltip is
+  ~28 px tall, so epaint's shadow mesh folded into a dark diagonal under
+  every tooltip. New `style::shadow(3)` (offset 6, blur 16) for popups,
+  tooltips and the panel drag tag; keep a shadow's blur under the height
+  of what it shadows. New debug mode: `MF_CRAWL_HOVER=<dir>` with
+  `--uicrawl` hovers each widget of the scenario (tooltips on) and saves
+  crops. The panels uitest checks the card hides while linked
+  (`mcp::set_linked`).
+- v71 (2026-11-08) (user: "when going inside the windows - claude : I'm
+  unable to set it visible"). Window > Panels > Claude now shows the card
+  even while Claude is linked (`Muse.peek`, set by `focus_tab`; the card
+  then says "Connected"). Unticking it or its close button while linked
+  only drops `peek` (the card comes back by itself once the link is gone);
+  while not linked they close it for good (`dock.muse = false`, Window
+  menu brings it back). A new link (`was_linked` rising edge in
+  `canvas_ui`) drops `peek`, so it hides again on each connection.
+  `tab_open(Muse)` is what is really shown, so the menu tick matches.
 
 ## Tested meshes
 

@@ -244,7 +244,7 @@ impl RetroApp {
         }
         // Leave the panels' resize grips (a few points on each side) to them.
         let resp = ui.allocate_rect(rect.shrink2(egui::vec2(6.0, 0.0)), Sense::click_and_drag());
-        // While Muse checks its first pass, the view as it was before: the
+        // While Claude checks its first pass, the view as it was before: the
         // user sees one result, the final one.
         let held = self.muse_hold_tex();
         ui.painter().image(held.unwrap_or(self.vp_tex.unwrap()), rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
@@ -2393,7 +2393,7 @@ impl RetroApp {
                 });
             if hide {
                 self.view.show_tool_keys = false;
-                self.toast("Shortcuts hidden: View settings shows them again.".into());
+                self.toast("Shortcuts hidden, also next time: View settings or Preferences show them again.".into());
             }
             return;
         }

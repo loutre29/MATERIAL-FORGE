@@ -530,6 +530,7 @@ fn scenarios() -> Vec<Scenario> {
         },
         Scenario { name: "display settings", setup: |app| app.show_view_settings = true },
         Scenario { name: "packshot studio", setup: |app| app.toggle_studio() },
+        Scenario { name: "claude panel", setup: |app| app.focus_tab(dock::Tab::Muse) },
         Scenario { name: "preferences", setup: |app| app.show_prefs = true },
         Scenario { name: "history", setup: |app| app.show_history = true },
         Scenario { name: "log", setup: |app| app.show_log = true },
@@ -827,6 +828,24 @@ pub fn ui_crawl(out: &Path) -> anyhow::Result<usize> {
         d.idle(&mut app, 2).map_err(anyhow::Error::msg)?;
         let stable = d.digest() == base.digest;
         base.digest = d.digest();
+        // MF_CRAWL_HOVER=<dir>: each widget hovered, a crop around it saved
+        // (to look at the hover look); no clicks.
+        if let Ok(dir) = std::env::var("MF_CRAWL_HOVER") {
+            let dir = PathBuf::from(dir);
+            std::fs::create_dir_all(&dir)?;
+            d.ctx.style_mut(|s| s.interaction.tooltip_delay = 0.0);
+            let full = dir.join("full.png");
+            for (k, w) in d.widgets().into_iter().enumerate().take(80) {
+                d.frame(&mut app, vec![Event::PointerMoved(w.rect.center())]).map_err(anyhow::Error::msg)?;
+                d.idle(&mut app, 20).map_err(anyhow::Error::msg)?;
+                d.screenshot(&app, &full, &[])?;
+                let img = image::open(&full)?.to_rgba8();
+                let r = w.rect.expand2(egui::vec2(60.0, 70.0)).intersect(Rect::from_min_size(Pos2::ZERO, d.size));
+                let c = image::imageops::crop_imm(&img, r.min.x as u32, r.min.y as u32, r.width() as u32, r.height() as u32).to_image();
+                c.save(dir.join(format!("{si}_{k:02}.png")))?;
+            }
+            continue;
+        }
         if !stable {
             println!("  warning: '{}' does not render the same frame twice", sc.name);
         }

@@ -1,11 +1,12 @@
-//! The Muse panel: texturing by prompt with Meta's Muse models (Meta Model
-//! API, https://api.meta.ai/v1). Muse Spark sees the model split into
+//! The Claude panel: texturing by conversation with Claude, which works in
+//! the Claude app or Claude Code (Material Forge is its MCP connector,
+//! `mcp.rs`; the panel shows the conversation). Claude sees the model split into
 //! pieces (`pieces`: its connected mesh pieces, alike ones grouped), each in
 //! its own color with its number, rendered here on the CPU, with each
 //! piece's size and place (part names are often meaningless), and writes
 //! looks: a layer stack for a list of pieces (fills with color, patterns,
 //! every channel, glass transmission and IOR; library and ambientCG
-//! materials; generated textures from Muse Image; masks from generators and
+//! materials; masks from generators and
 //! patterns; blend modes; filters). The app builds each look in a folder
 //! masked to its pieces' polygons. It is a conversation: later messages
 //! change only the looks asked for.
@@ -22,11 +23,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
-const API: &str = "https://api.meta.ai/v1";
-pub(super) const TEXT_MODEL: &str = "muse-spark-1.3";
-const IMAGE_MODEL: &str = "muse-image-1.0";
 
-/// Part colors in the views Muse sees (and the swatches in the panel).
+/// Part colors in the views Claude sees (and the swatches in the panel).
 const PALETTE: [([u8; 3], &str); 12] = [
     ([230, 25, 75], "red"),
     ([60, 180, 75], "green"),
@@ -52,7 +50,7 @@ fn part_color(i: usize) -> ([u8; 3], String) {
     }
 }
 
-/// A part of the object Muse textures: one object of a texture set, or the
+/// A part of the object Claude textures: one object of a texture set, or the
 /// whole set when it holds a single object.
 #[derive(Clone)]
 pub struct Part {
@@ -72,16 +70,15 @@ enum Msg {
 #[derive(Clone)]
 struct Ref {
     name: String,
-    /// What Muse gets (a JPEG data URL, at most 1024 px).
+    /// What Claude gets (a JPEG data URL, at most 1024 px).
     url: String,
     /// A copy in `muse/refs` (a layer can use it as a texture).
     path: std::path::PathBuf,
-    thumb: egui::TextureHandle,
     /// An image the user imported into the project (sent by itself).
     project: bool,
 }
 
-/// A message sent and Muse's answer as it remembers it.
+/// A message sent and Claude's answer as it remembers it.
 #[derive(Clone)]
 struct Turn {
     user: String,
@@ -102,7 +99,7 @@ struct First {
     pieces: Vec<pieces::Piece>,
 }
 
-/// One turn's result: Muse's answer and what it needs (generated textures,
+/// One turn's result: Claude's answer and what it needs (generated textures,
 /// downloaded ambientCG materials).
 struct TurnOut {
     first: Option<Box<First>>,
@@ -121,8 +118,6 @@ struct ChatLine {
     user: bool,
     text: String,
     notes: Vec<String>,
-    /// The reference images sent with it.
-    refs: Vec<egui::TextureHandle>,
 }
 
 /// Pieces with one layer stack: a folder per texture set they are in.
@@ -134,14 +129,14 @@ struct Look {
     folders: Vec<(usize, u64)>,
 }
 
-/// The conversation: what Muse saw first, what was said, and what is
+/// The conversation: what Claude saw first, what was said, and what is
 /// applied now (the looks).
 struct Convo {
-    /// The style Muse chose (the panel's on Auto).
+    /// The style Claude chose (the panel's on Auto).
     style: Option<Style>,
     /// The document it belongs to (`doc_key`).
     doc: String,
-    /// Numbered as in the views Muse sees.
+    /// Numbered as in the views Claude sees.
     pieces: Vec<pieces::Piece>,
     system: String,
     /// The views, as a data URL (sent with the first message).
@@ -161,21 +156,19 @@ struct Convo {
 #[derive(Default)]
 pub struct Muse {
     prompt: String,
-    key: String,
-    /// The key being typed in the connect card.
-    key_draft: String,
-    /// Connect: the key page was opened (the paste step shows).
-    connect_opened: bool,
-    /// Connect: why the last key was not taken.
-    connect_msg: String,
-    /// A key being checked with Meta, and the answer to come.
-    connecting: Option<(String, mpsc::Receiver<Result<(), String>>)>,
+    /// Connect: what adding Material Forge to Claude gave.
+    app_msg: String,
+    /// The card shown from the Window menu while Claude is linked (it
+    /// otherwise hides then); dropped when it is closed or Claude links again.
+    pub(super) peek: bool,
+    /// Claude was linked last frame.
+    pub(super) was_linked: bool,
     /// The numbered pieces shown on the model.
     pieces_on: bool,
     piece_view: Option<PieceView>,
     /// The labels' places for one camera (its hash).
     label_cache: std::cell::RefCell<Option<(u64, Vec<(usize, (f32, f32))>)>>,
-    /// The texture sets Muse works on (checked in the panel; all at first).
+    /// The texture sets Claude works on (checked in the panel; all at first).
     sets_on: Vec<bool>,
     status: String,
     chat: Vec<ChatLine>,
@@ -196,17 +189,17 @@ pub struct Muse {
     files_sent: Vec<u64>,
     /// The texturing style asked in the panel.
     style: Style,
-    /// While Muse checks its first pass: the view as it was before (shown
-    /// instead of the live one) and Muse's answer, so the user sees one
+    /// While Claude checks its first pass: the view as it was before (shown
+    /// instead of the live one) and Claude's answer, so the user sees one
     /// result, the final one.
     hold: Option<(crate::engine::Tex, egui::TextureId)>,
     pending: Option<ChatLine>,
-    /// The studio render of the lighting Muse set, waiting to go back to
+    /// The studio render of the lighting Claude set, waiting to go back to
     /// it (its path, the user's request).
     light_check: Option<(std::path::PathBuf, String)>,
     /// The light measures of the photos sent with the last lighting request.
     light_facts: String,
-    /// The texture sets to prepare (2048 px, baked mesh maps) once Muse
+    /// The texture sets to prepare (2048 px, baked mesh maps) once Claude
     /// answers with looks: a lighting request alone needs neither.
     prepare: Option<Vec<usize>>,
     /// The request in flight asks for the lighting alone: looks in the
@@ -214,14 +207,14 @@ pub struct Muse {
     light_only: bool,
     /// The light profile of the photo given for the lighting.
     light_photo: Option<crate::studio::Profile>,
-    /// Muse's first lighting, before its check corrects it: the studio, the
+    /// Claude's first lighting, before its check corrects it: the studio, the
     /// camera's pitch and how far its render is from the photo.
     light_first: Option<(crate::studio::Studio, f32, f32)>,
     /// The render of the corrected lighting, compared with the first one.
     light_verify: Option<std::path::PathBuf>,
     /// What the app chose for a print layer of the turn (by layer name):
     /// a face's photo and turn, a wrap's band and arc. Written into the
-    /// stored looks, so Muse sees it and the same layer gives the same.
+    /// stored looks, so Claude sees it and the same layer gives the same.
     resolved: HashMap<String, serde_json::Map<String, Value>>,
 }
 
@@ -245,15 +238,6 @@ impl Style {
             Style::Product => "Product",
             Style::Realistic => "Realistic",
             Style::Stylized => "Stylized",
-        }
-    }
-
-    fn hint(self) -> &'static str {
-        match self {
-            Style::Auto => "Muse chooses the style from the object and your request",
-            Style::Product => "A product as in its official photos: brand new, flawless, every color and print exactly as your images show",
-            Style::Realistic => "A real object in use: photoreal, with the wear of its age and life",
-            Style::Stylized => "A game or cartoon look: clean or hand-painted colors",
         }
     }
 
@@ -336,11 +320,6 @@ fn piece_label_spots(tris: &[([glam::Vec3; 3], u16)], m: glam::Mat4, aspect: f32
         .collect()
 }
 
-/// Where Meta gives Model API keys (the connect card opens it).
-const KEYS_URL: &str = "https://dev.meta.ai/";
-
-/// Prompts the empty conversation offers.
-const EXAMPLES: [&str; 4] = ["An old brass street lantern, clear glass, slightly aged", "Weathered dark wood and black wrought iron", "Match the attached photo as closely as possible", "I want the lighting of the attached photo for my packshot"];
 
 /// A self check to send once the result is on screen.
 struct Check {
@@ -351,15 +330,9 @@ struct Check {
     user: String,
 }
 
-/// Where the API key is kept (this computer only, next to the library).
-fn key_path() -> std::path::PathBuf {
-    crate::library::library_dir().join("..").join("muse_key.txt")
-}
-
 impl Muse {
     pub fn new() -> Self {
-        let key = std::env::var("MODEL_API_KEY").ok().filter(|k| !k.trim().is_empty()).or_else(|| std::fs::read_to_string(key_path()).ok()).map(|k| k.trim().to_string()).unwrap_or_default();
-        Muse { key, ..Default::default() }
+        Muse::default()
     }
 }
 
@@ -435,7 +408,7 @@ fn draw_number(img: &mut image::RgbaImage, cx: i32, cy: i32, n: usize) {
     }
 }
 
-/// What Muse sees: the model from four sides, each piece flat in its
+/// What Claude sees: the model from four sides, each piece flat in its
 /// palette color with its number on it (lit from the upper left), the rest
 /// gray; and a line per piece on what it is, its size and place.
 fn look_at(mesh: &crate::mesh::MeshData, pieces: &[pieces::Piece]) -> (image::RgbaImage, String) {
@@ -1211,7 +1184,7 @@ fn decal_fit(mesh: &crate::mesh::MeshData, tris: &[([glam::Vec3; 3], glam::Vec3)
 /// straightens it; "arc" (degrees of the circumference that part shows)
 /// unrolls a part wrapped around a round surface (a label on a bottle,
 /// squeezed toward its sides in the photo). Coordinates are the image's
-/// pixels as Muse sees it (longest side 1024). None when the source asks
+/// pixels as Claude sees it (longest side 1024). None when the source asks
 /// for none of these.
 fn cut_print(path: &std::path::Path, src: &Value) -> Option<anyhow::Result<std::path::PathBuf>> {
     let pt = |v: &Value| Some([v[0].as_f64()? as f32, v[1].as_f64()? as f32]);
@@ -1230,7 +1203,7 @@ fn cut_print(path: &std::path::Path, src: &Value) -> Option<anyhow::Result<std::
         let (w, h) = img.dimensions();
         let k = (w.max(h) as f32 / 1024.0).max(1.0);
         let q = quad.map(|p| [p[0] * k, p[1] * k]);
-        // The corners Muse gives are a few pixels off: each side moves onto
+        // The corners Claude gives are a few pixels off: each side moves onto
         // the strongest edge near it (the label's border).
         let q = if src["snap"].as_bool() == Some(false) { q } else { snap_quad(&img, q, 0.25) };
         let out = cut_quad(&img, q, arc)?;
@@ -1391,7 +1364,7 @@ fn bilinear(img: &image::RgbaImage, x: f32, y: f32) -> image::Rgba<u8> {
 
 /// A print image cropped to what it shows (its opaque pixels, or those
 /// unlike its corners: a label on a plain background), saved once next to
-/// Muse's files. The original when there is nothing to crop.
+/// Claude's files. The original when there is nothing to crop.
 fn trimmed(path: &std::path::Path) -> std::path::PathBuf {
     let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
     let dest = muse_dir().join("prints").join(format!("{stem}.png"));
@@ -1949,7 +1922,7 @@ fn uv_groups(fit: &UvFit) -> Vec<(f32, Vec<(usize, Vec<u32>)>)> {
     groups.into_iter().map(|g| (g.0, g.2)).collect()
 }
 
-/// The UV facts of every piece for Muse, and what they allow.
+/// The UV facts of every piece for Claude, and what they allow.
 fn uv_facts(mesh: &crate::mesh::MeshData, pieces: &[pieces::Piece]) -> String {
     let long = (mesh.bbox_max - mesh.bbox_min).max_element().max(1e-6);
     let mut out = String::from("UV LAYOUT of each piece (measured):\n");
@@ -2076,7 +2049,7 @@ impl Surface {
 /// The SURFACES image: the main UV islands of the pieces, each flattened
 /// and upright, at one scale, with what sits in front of it (buttons in
 /// their holes) dimmed, a grid every 5% of the model's longest side and
-/// its number. Returns the image, the surfaces and their facts for Muse.
+/// its number. Returns the image, the surfaces and their facts for Claude.
 fn surfaces_of(mesh: &crate::mesh::MeshData, pieces: &[pieces::Piece]) -> (image::RgbaImage, Vec<Surface>, String) {
     use glam::{Vec2, Vec3};
     const W: f32 = 1536.0;
@@ -2498,7 +2471,7 @@ fn uv_sheet_of(path: &std::path::Path, sets: &[(String, &crate::bake::UvRaster)]
 }
 
 /// Text rendered as a print image (its color, transparent around it),
-/// saved once next to Muse's files. `font`: a family name from
+/// saved once next to Claude's files. `font`: a family name from
 /// `text_fonts`, `bold` its bold face when it has one.
 fn text_image(text: &str, font: &str, bold: bool, color: [f32; 3]) -> anyhow::Result<std::path::PathBuf> {
     use ab_glyph::{Font, FontVec, PxScale, ScaleFont};
@@ -2601,29 +2574,27 @@ fn text_fonts() -> Vec<(String, std::path::PathBuf, Option<std::path::PathBuf>)>
 
 // ------------------------------------------------------------------ the API
 
-/// A JSON request to the Meta Model API.
-pub(super) fn post(key: &str, path: &str, body: Value) -> anyhow::Result<Value> {
-    let r = ureq::post(&format!("{API}{path}"))
-        .set("Authorization", &format!("Bearer {key}"))
-        .set("Content-Type", "application/json")
-        .timeout(Duration::from_secs(300))
-        .send_string(&body.to_string());
-    let read = |resp: ureq::Response| {
-        let mut s = String::new();
-        std::io::Read::read_to_string(&mut resp.into_reader(), &mut s).map(|_| s)
-    };
-    match r {
-        Ok(resp) => Ok(serde_json::from_str(&read(resp)?)?),
-        Err(ureq::Error::Status(code, resp)) => {
-            let text = read(resp).unwrap_or_default();
-            let msg = serde_json::from_str::<Value>(&text).ok().and_then(|v| v["error"]["message"].as_str().map(String::from)).unwrap_or(text);
-            anyhow::bail!("Meta Model API error {code}: {}", msg.chars().take(300).collect::<String>())
+/// A data URL (`data:image/png;base64,...`) as an image block of a
+/// message (base64; past 5 MB a picture goes as a JPEG instead).
+pub(super) fn image_block(url: &str) -> Value {
+    let b64 = &base64::engine::general_purpose::STANDARD;
+    let (head, data) = url.split_once(',').unwrap_or(("", url));
+    let mut media = head.trim_start_matches("data:").trim_end_matches(";base64").to_string();
+    let mut data = data.to_string();
+    let known = matches!(media.as_str(), "image/png" | "image/jpeg" | "image/gif" | "image/webp");
+    if !known || data.len() / 4 * 3 > 4_800_000 {
+        if let Some(img) = b64.decode(&data).ok().and_then(|b| image::load_from_memory(&b).ok()) {
+            let mut jpg = Vec::new();
+            if image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpg, 85).encode_image(&image::DynamicImage::ImageRgb8(img.to_rgb8())).is_ok() {
+                media = "image/jpeg".into();
+                data = b64.encode(&jpg);
+            }
         }
-        Err(e) => Err(e.into()),
     }
+    serde_json::json!({"type": "image", "source": {"type": "base64", "media_type": media, "data": data}})
 }
 
-/// The patterns Muse may use: all but the normal map generators.
+/// The patterns Claude may use: all but the normal map generators.
 fn pattern_names() -> Vec<&'static str> {
     ProcKind::ALL.iter().filter(|k| !k.is_normal()).map(|k| k.name()).collect()
 }
@@ -2661,7 +2632,7 @@ PRINTS (labels, logos, printed text, markings, a screen image). A print layer's 
 - "surface": k, "box": [x0, y0, x1, y1]: the box the print fills on surface k of the SURFACES image (pixels of that image). The precise way, use it whenever the face is on that image: each surface is shown flat, upright and to scale, with its holes, edges and what sits in front of it, so put each print exactly where it is on the real object relative to those features (under that slot, left of those buttons), at its real size (the grid gives the scale). Never over what sits in front of the surface (its list gives the boxes): a print there is hidden. The print goes into the texture there once, upright, its blank border cropped, its proportions kept inside the box; it may run onto neighboring surfaces that continue the same face.
 - "surface": k, "near": "4b", "side": "above", "size": 6: a print beside something listed in front of surface k (a button, knob, switch, port, handle, hinge, slot or door: its name from that list, or a piece number for all its parts); the app puts it centered "above", "below", "left" or "right" of it, "size" pixels of the SURFACES image tall (its width follows), "gap" pixels away (default half the size). The exact way for the label of a control: every label naming a control or part (button, knob, switch, port, slot, gauge) is placed with near, one print per control as the reference shows them (not one line of words for several controls).
 - "side": "+x" (a side of the SIDES facts): the print covers that whole face of the product, on every piece seen there with its folds and flaps (the panels of a box or a carton, the covers of a book, the back of a phone): THE way for a product photographed face by face, one print per face, never surface boxes for those. With a reference and no crop or quad, the app finds the face on the photo's background itself, straightens it, takes out the photo's color cast ("balance": false keeps its colors), and turns it (or trades it with the photo you gave the opposite side) so the prints meet across the product's edges as on the real one; Say which way each face stands: "up": "top", "right", "bottom" or "left", the edge of the photo that is at the top of that face on the real product as it stands: the edge the tops of its letters point to (text running down the photo, read from its top to its bottom, has its letters' tops toward the right edge; text running up the photo, toward the left); for the top and bottom sides also "toward": the side that edge touches ("+z"). Your stacks then give "turned": the turn the app applied (clockwise, from the photo); change "up" to fix a face, or force a turn with "rotate": 0, 90, 180 or 270. Give each photo to the side with its proportions (the photo facts give each face's proportions, the SIDES facts each side's; opposite sides share them): a face 0.41 wide for 1 tall goes on a side of 2.41 or 0.41. Photos of the whole object at an angle show which faces touch which: use them to choose the sides, not as prints. "area": [x0, y0, x1, y1] (0 to 1 of the side, from its top left) puts a print on part of a side instead, its proportions kept ("stretch": true fills the area).
-- "wrap": {{"facing": "-z", "from": 0.3, "to": 0.75, "arc": 140}}: the print goes around a round body (a label on a bottle, a jar, a can, a tube, a candle, a cup), on every piece of the look there, whatever their UVs: its middle facing that side, between "from" and "to" along the body's axis (0 its bottom, 1 its top, read on the views), over "arc" degrees of its circumference (360 all around). Leave out "to" or "arc" and the app takes it from the print's proportions; leave out "from" and "to" and it covers the straight part of the body. A label cut from a photo of the product: "crop" or "quad" plus the source's "arc" (unrolled first), then "wrap" with the same arc. Prefer it to surface boxes for labels on round bodies.
+- "wrap": {{"facing": "-z", "from": 0.3, "to": 0.75, "arc": 140}}: the print goes around a round body (a label on a bottle, a jar, a can, a tube, a candle, a cup), on every piece of the look there, whatever their UVs: its middle facing that side, between "from" and "to" along the body's axis (0 its bottom, 1 its top, read on the views), over "arc" degrees of its circumference (360 all around). Leave out "to" or "arc" and the app takes it from the print's proportions; leave out "from" and "to" and it covers the straight part of the body. A label cut from a photo of the product: "crop" or "quad" plus the source's "arc" (unrolled first), then "wrap" with the same arc. Prefer it to surface boxes for labels painted on a round body; a label that is a piece of its own (a paper label piece on the body) is printed on that piece's surface instead, in a box covering its whole surface with "stretch": true.
 - "decal": [x0, y0, x1, y1]: a box on the NUMBERED VIEWS image instead (its pixels; never the self check render), only for a face no surface shows. Drawn tight around where the print is, in the view that shows that face best; put there once, upright as that view shows it.
 - "uv_sheet": true: only for artwork the message says fits inside the UV islands of a texture set, made for that UV map (never a photo or a logo): it goes on exactly as it is.
 - Part of an image as the print, when no artwork file gives it (a label, a logo or a printed panel taken from a product photo): add to the source "crop": [x0, y0, x1, y1] (a box on Rn, its pixels as you see it), or "quad": [[x, y], [x, y], [x, y], [x, y]], its four corners top left, top right, bottom right, bottom left, exactly on the part's edges, for a part seen at an angle: the app straightens it to a flat rectangle at its real proportions. Add "arc": degrees when that part wraps around a round surface in the photo (a label on a bottle or a can: the share of the circumference you see of it, often 100 to 150): the app unrolls it so it is not squeezed at its sides. The app moves each side onto the part's edge in the photo when it is a few pixels off ("snap": false keeps your corners exactly). Then place it like any print: a whole label goes in a surface box covering the label's surface with "stretch": true (it fills the box exactly, as the real label covers its piece). Take the whole label in one print, its corners on its edges, never one print per word.
@@ -2710,7 +2681,6 @@ A layer:
         or {{"color": "#RRGGBB"}}
         or {{"pattern": "<pattern>", "color": "#RRGGBB", "color2": "#RRGGBB", "scale": 4, "contrast": 1.0, "balance": 0.5, "warp": 0.0, "seed": 0, "invert": false}}
         or {{"smart_material": "<exact library name>"}}
-        or {{"texture_prompt": "a seamless texture to generate"}}
         or {{"reference": 1}}{acg_source},
  "roughness": 0.4, "metallic": 1.0, "height": 0.5, "emissive": "#RRGGBB", "opacity": 1.0,
  "roughness_pattern": {{"pattern": "<pattern>", "scale": 8, "min": 0.3, "max": 0.45, "contrast": 1, "seed": 0}}, (also metallic_pattern, height_pattern)
@@ -2742,8 +2712,7 @@ HOW TO WORK, for a photoreal result.
 3. Physically based values. Metals: metallic 1, color from real reflectance: clean polished iron and steel #C4C7C7, aged or forged iron #5A5C5E to #3C3C3C (roughness 0.55 to 0.75), aluminium #F5F6F6, chrome #C8CACB, silver #FBF8F2, gold #FFD58A, copper #F7C1A6, brass #E3C27C, bronze #C49A6C, blackened iron #3C3C3C; roughness 0.15 to 0.3 polished, 0.35 to 0.6 worn. Non-metals: metallic 0, color never darker than #282828 or brighter than #F0F0F0, real-world colors are muted; roughness 0.4 to 0.9 for most surfaces.
 4. Glass, crystal, liquids, gems: a base giving color near white (a faint tint), metallic 0, roughness 0.02 to 0.08, transmission 1, ior (glass 1.5, water 1.33, crystal 1.6, diamond 2.4), absorption 0.05 to 0.3 for a colored thickness tint. Transmission shows the environment through the glass, never the pieces behind it: glass covering a screen, a dial or a print is not see-through here; put the screen's image on that glass itself ("fit": true, glowing) over a dark glossy base (roughness 0.05). Made glass is smooth: no height layer. Only hand blown glass gets one layer giving ONLY height: seeds (Gaussian Spots, scale 25 to 40, range 0 to 0.03, Linear dodge); the set's height_scale left at 0.02.
 5. KEEP IT SIMPLE: 1 to 3 layers per look. The base material, then at most one or two subtle layers when they clearly help: a roughness or height breakup on a plain color base, a subtle color variation. Everyday wear (grime in crevices, dust, smudges, fine scratches, rubbed edges) comes from the look's finish, never from your own layers; add your own only for heavier damage the user asks for or the reference clearly shows (rust, stains, bleaching, deep scratches), thin and subtle (layer_opacity 0.2 to 0.5). No layer may change a material's overall color or value: the piece must still read as the material you chose. Never stack layers that only repeat what the scan already has (grain, pores, roughness variation). Never make hammer marks, dents or pores with Cells or Voronoi patterns: their cell borders read as a network of cracks; choose a scan that already has that surface (ambientCG: "metal hammered", "metal forged").
-6. The looks of one object share one coherent story (same age, same environment). Do not invent bright colors, glow or patterns the user did not ask for; emissive only for real light sources.
-7. texture_prompt only for printed graphics, labels or ornaments that nothing above can make."##,
+6. The looks of one object share one coherent story (same age, same environment). Do not invent bright colors, glow or patterns the user did not ask for; emissive only for real light sources."##,
         patterns = pattern_names().join(", "),
         fonts = text_fonts().iter().map(|f| f.0.clone()).collect::<Vec<_>>().join(", "),
         finishes = FINISHES,
@@ -2752,7 +2721,7 @@ HOW TO WORK, for a photoreal result.
     )
 }
 
-/// A plan layer's source (Muse sometimes writes its keys on the layer itself).
+/// A plan layer's source (Claude sometimes writes its keys on the layer itself).
 fn source(l: &Value) -> &Value {
     if l["source"].is_object() {
         &l["source"]
@@ -2761,12 +2730,12 @@ fn source(l: &Value) -> &Value {
     }
 }
 
-/// Muse's text without long dashes (the panel never shows them).
+/// Claude's text without long dashes (the panel never shows them).
 fn no_dashes(s: &str) -> String {
     s.replace(" \u{2014} ", ", ").replace(['\u{2014}', '\u{2013}'], ", ")
 }
 
-/// Where Muse keeps its files (views, plans, generated textures).
+/// Where Claude keeps its files (views, plans, generated textures).
 pub(super) fn muse_dir() -> std::path::PathBuf {
     crate::library::library_dir().join("..").join("muse")
 }
@@ -2782,11 +2751,11 @@ struct FirstTurn {
     smart: Vec<String>,
 }
 
-/// The material list Muse reads: one line per category, each scan with
+/// The material list Claude reads: one line per category, each scan with
 /// its number on the material sheet, its average color and roughness
 /// ("Metal: 12 Brushed Steel (#8a8986, rough 0.35, metal), ..."), then the
 /// plain presets; and the sheet itself: every scan's preview sphere with
-/// its number, so Muse chooses by eye.
+/// its number, so Claude chooses by eye.
 fn material_lines(tex: &[crate::library::TexMaterial], presets: &[String]) -> (Vec<String>, image::RgbaImage) {
     let stats = crate::library::material_stats(tex);
     let mut lines = Vec::new();
@@ -2828,7 +2797,6 @@ fn material_lines(tex: &[crate::library::TexMaterial], presets: &[String]) -> (V
 }
 
 struct Request {
-    key: String,
     first: Option<FirstTurn>,
     system: String,
     view: String,
@@ -2844,19 +2812,18 @@ struct Request {
     user: String,
     /// Reference images sent with it (data URLs).
     refs: Vec<String>,
-    /// A self check (Muse looking at its result), not a user message.
+    /// A self check (Claude looking at its result), not a user message.
     check: bool,
     /// The ambientCG scans of the looks applied now: (query, asset id).
     scans: Vec<(String, String)>,
 }
 
 /// The work off the UI thread: (first turn) the views and instructions,
-/// Muse Spark's answer, then Muse Image's textures and ambientCG's
-/// materials.
+/// Claude's answer, then ambientCG's materials.
 fn run(mut req: Request, tx: &mpsc::Sender<Msg>, stop: &AtomicBool) -> anyhow::Result<TurnOut> {
     let b64 = &base64::engine::general_purpose::STANDARD;
     let mut notes = Vec::new();
-    let _ = tx.send(Msg::Status("Muse Spark is looking at the model...".into()));
+    let _ = tx.send(Msg::Status("Claude is looking at the model...".into()));
     // ambientCG's catalog (on disk after the first time; MF_MUSE_OFFLINE:
     // none, for checks).
     let catalog = match std::env::var_os("MF_MUSE_OFFLINE").map_or_else(crate::ambientcg::catalog, |_| Err(anyhow::anyhow!("offline"))) {
@@ -2888,7 +2855,7 @@ fn run(mut req: Request, tx: &mpsc::Sender<Msg>, stop: &AtomicBool) -> anyhow::R
         view.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)?;
         req.view = format!("data:image/png;base64,{}", b64.encode(&png));
         let vocab = catalog.as_ref().map(|c| crate::ambientcg::vocabulary(c, 300));
-        let _ = tx.send(Msg::Status("Muse Spark is reading the materials...".into()));
+        let _ = tx.send(Msg::Status("Claude is reading the materials...".into()));
         let (mats, sheet) = material_lines(&f.tex, &f.presets);
         let _ = sheet.save(dir.join("material_sheet.png"));
         let mut jpg = Vec::new();
@@ -2899,15 +2866,24 @@ fn run(mut req: Request, tx: &mpsc::Sender<Msg>, stop: &AtomicBool) -> anyhow::R
     }
     anyhow::ensure!(!stop.load(Ordering::Relaxed), "Cancelled.");
     // MF_MUSE_PLAN=<json>: replays a saved plan (`muse/last_plan.json`)
-    // instead of asking Muse Spark (texturing work without API calls);
+    // instead of asking Claude (texturing work without API calls);
     // "a.json;b.json": one per turn.
     let plan: Value = if let Some(p) = std::env::var("MF_MUSE_PLAN").ok() {
         let files: Vec<&str> = p.split(';').filter(|f| !f.is_empty()).collect();
         let f = files.get(req.turns.len()).or(files.last()).copied().unwrap_or_default();
+        // MF_MUSE_DELAY=<s>: Claude's answer takes that long (showcase
+        // replays of a real session).
+        if let Some(d) = std::env::var("MF_MUSE_DELAY").ok().and_then(|d| d.parse::<f64>().ok()) {
+            let _ = tx.send(Msg::Status("Claude is thinking...".into()));
+            let t = Instant::now();
+            while t.elapsed().as_secs_f64() < d && !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
         parse_answer(&std::fs::read_to_string(f)?)?
     } else {
-        let _ = tx.send(Msg::Status("Muse Spark is thinking...".into()));
-        let mut msgs = vec![serde_json::json!({"role": "system", "content": req.system})];
+        let _ = tx.send(Msg::Status("Claude is thinking...".into()));
+        let mut msgs = Vec::new();
         let n = req.turns.len();
         for i in 0..=n {
             let (text, refs) = if i < n {
@@ -2920,39 +2896,44 @@ fn run(mut req: Request, tx: &mpsc::Sender<Msg>, stop: &AtomicBool) -> anyhow::R
             // The views go with the first message, references with theirs.
             let mut content = vec![serde_json::json!({"type": "text", "text": text})];
             if i == 0 {
-                content.push(serde_json::json!({"type": "image_url", "image_url": {"url": req.view}}));
+                content.push(image_block(&req.view));
                 if !req.sheet.is_empty() {
-                    content.push(serde_json::json!({"type": "image_url", "image_url": {"url": req.sheet}}));
+                    content.push(image_block(&req.sheet));
                 }
                 if !req.surf.is_empty() {
-                    content.push(serde_json::json!({"type": "image_url", "image_url": {"url": req.surf}}));
+                    content.push(image_block(&req.surf));
                 }
             }
             for r in refs {
-                content.push(serde_json::json!({"type": "image_url", "image_url": {"url": r}}));
+                content.push(image_block(r));
             }
             msgs.push(serde_json::json!({"role": "user", "content": content}));
             if i < n {
-                msgs.push(serde_json::json!({"role": "assistant", "content": req.turns[i].reply}));
+                let reply = if req.turns[i].reply.trim().is_empty() { "(no reply)" } else { req.turns[i].reply.as_str() };
+                msgs.push(serde_json::json!({"role": "assistant", "content": reply}));
             }
         }
-        let v = post(&req.key, "/chat/completions", serde_json::json!({"model": TEXT_MODEL, "messages": msgs}))?;
+        // Claude answers in the Claude app (MCP), where the request came from.
+        let reply = |msgs: &[Value], first: bool| {
+            anyhow::ensure!(super::mcp::turn_active(), "Claude answers in the Claude app or Claude Code: ask there.");
+            let _ = tx.send(Msg::Status("Claude is answering in the Claude app...".into()));
+            super::mcp::ask_app(&req.system, msgs, first, stop)
+        };
+        let text = reply(&msgs, n == 0)?;
         anyhow::ensure!(!stop.load(Ordering::Relaxed), "Cancelled.");
-        let text = v["choices"][0]["message"]["content"].as_str().unwrap_or_default().to_string();
-        // Muse's answer as written (muse/last_answer.txt), before reading it.
+        // Claude's answer as written (muse/last_answer.txt), before reading it.
         let _ = std::fs::write(dir.join("last_answer.txt"), &text);
         match parse_answer(&text) {
             Ok(plan) => plan,
-            // Not readable even repaired: Muse is asked once to send it again.
+            // Not readable even repaired: Claude is asked once to send it again.
             Err(e) => {
-                let _ = tx.send(Msg::Status("Muse's answer was not valid JSON: asking it again...".into()));
+                let _ = tx.send(Msg::Status("Claude's answer was not valid JSON: asking it again...".into()));
                 msgs.push(serde_json::json!({"role": "assistant", "content": text}));
                 msgs.push(serde_json::json!({"role": "user", "content": format!("Your answer is not valid JSON ({e}). Send the same answer again as one valid JSON object, nothing else.")}));
-                let v = post(&req.key, "/chat/completions", serde_json::json!({"model": TEXT_MODEL, "messages": msgs}))?;
+                let text = reply(&msgs, false)?;
                 anyhow::ensure!(!stop.load(Ordering::Relaxed), "Cancelled.");
-                let text = v["choices"][0]["message"]["content"].as_str().unwrap_or_default().to_string();
                 let _ = std::fs::write(dir.join("last_answer.txt"), &text);
-                parse_answer(&text).map_err(|e| anyhow::anyhow!("Muse's answer was not valid JSON, even sent again ({e}); it is in muse/last_answer.txt"))?
+                parse_answer(&text).map_err(|e| anyhow::anyhow!("Claude's answer was not valid JSON, even sent again ({e}); it is in muse/last_answer.txt"))?
             }
         }
     };
@@ -2962,29 +2943,11 @@ fn run(mut req: Request, tx: &mpsc::Sender<Msg>, stop: &AtomicBool) -> anyhow::R
     let file = if req.check { format!("turn_{}_check.json", req.turns.len()) } else { format!("turn_{}.json", req.turns.len() + 1) };
     let _ = std::fs::create_dir_all(dir.join("plans")).and_then(|_| std::fs::write(dir.join("plans").join(file), &text));
     let layers: Vec<Value> = plan["looks"].as_array().or_else(|| plan["parts"].as_array()).into_iter().flatten().flat_map(|p| p["layers"].as_array().cloned().unwrap_or_default()).collect();
-    // The textures it asked for.
-    let mut images = HashMap::new();
-    let prompts: Vec<String> = layers.iter().filter_map(|l| source(l)["texture_prompt"].as_str().map(String::from)).collect();
-    for (i, t) in prompts.iter().enumerate() {
-        anyhow::ensure!(!stop.load(Ordering::Relaxed), "Cancelled.");
-        if images.contains_key(t) {
-            continue;
-        }
-        let _ = tx.send(Msg::Status(format!("Muse Image is painting texture {} of {}...", i + 1, prompts.len())));
-        let img = post(
-            &req.key,
-            "/images/generations",
-            serde_json::json!({
-                "model": IMAGE_MODEL,
-                "prompt": format!("{t}. Seamless tileable texture filling the whole frame, seen straight on, flat even lighting, no shadows, no perspective, no objects, no text."),
-                "n": 1,
-                "size": "1024x1024",
-                "response_format": "b64_json",
-                "output_format": "png",
-            }),
-        )?;
-        let data = img["data"][0]["b64_json"].as_str().ok_or_else(|| anyhow::anyhow!("Muse Image returned no image"))?;
-        images.insert(t.clone(), image::load_from_memory(&b64.decode(data)?)?.to_rgba8());
+    // Generated textures (a plan saved by an image model): Claude makes no
+    // images, so such a layer is left out.
+    let images = HashMap::new();
+    if layers.iter().any(|l| !source(l)["texture_prompt"].is_null()) {
+        notes.push("A layer asked for a generated texture, which Claude cannot make: it was left out.".into());
     }
     // The ambientCG materials it asked for.
     let mut downloads = HashMap::new();
@@ -3016,7 +2979,7 @@ fn run(mut req: Request, tx: &mpsc::Sender<Msg>, stop: &AtomicBool) -> anyhow::R
 
 // ------------------------------------------------------------------ the plan
 
-/// Muse's answer as a plan: its JSON object (a plain answer is a reply
+/// Claude's answer as a plan: its JSON object (a plain answer is a reply
 /// without changes). The slips a model makes in long JSON are repaired
 /// when it does not read as it is: comments, missing or trailing commas,
 /// a bracket closed with the wrong kind, an answer cut short.
@@ -3029,7 +2992,7 @@ pub(super) fn parse_answer(text: &str) -> anyhow::Result<Value> {
         Ok(v) => Ok(v),
         // A bracket of the wrong kind: a missing closer, or one too many.
         // The reading whose looks hold the most layers (with their pieces)
-        // is the one Muse meant.
+        // is the one Claude meant.
         Err(e) => {
             let score = |v: &Value| -> usize {
                 v["looks"].as_array().into_iter().flatten().filter(|l| l["pieces"].is_array()).map(|l| l["layers"].as_array().map_or(0, |a| a.len()) + 1).sum()
@@ -3217,7 +3180,7 @@ fn average_color(path: &std::path::Path) -> Option<[f32; 3]> {
     Some(sum.map(|s| s / n))
 }
 
-/// A channel by the name Muse uses.
+/// A channel by the name Claude uses.
 fn channel_index(name: &str) -> Option<usize> {
     match name.trim().to_lowercase().as_str() {
         "color" | "base color" | "basecolor" | "albedo" => Some(CH_COLOR),
@@ -3288,7 +3251,7 @@ fn mask_step(v: &Value, first: bool) -> Option<MaskEffect> {
         d.contrast = num(v, "contrast").unwrap_or(d.contrast);
         d.invert = v["invert"].as_bool().unwrap_or(false);
         // (The library defaults reach 0.5, which spreads wear and dirt
-        // far past edges and cavities; Muse sets it when it wants more.
+        // far past edges and cavities; Claude sets it when it wants more.
         // Position cuts keep none.)
         d.noise = num(v, "noise").unwrap_or(d.noise.min(0.1)).clamp(0.0, 1.0);
         d.noise_scale = num(v, "noise_scale").unwrap_or(d.noise_scale).clamp(0.5, 200.0);
@@ -3524,7 +3487,7 @@ fn give_ids(doc: &mut Document, l: &mut Layer) {
     }
 }
 
-/// The settings of texture sets Muse can change, as it reads them.
+/// The settings of texture sets Claude can change, as it reads them.
 fn sets_text(doc: &Document, sets: &[usize]) -> String {
     sets.iter()
         .map(|&s| {
@@ -3543,8 +3506,8 @@ fn sets_text(doc: &Document, sets: &[usize]) -> String {
 }
 
 /// An image file as a reference: copied to `muse/refs`, sent as a JPEG of
-/// at most 1024 px, with a thumbnail for the panel.
-fn load_ref(ctx: &egui::Context, path: &std::path::Path) -> anyhow::Result<Ref> {
+/// at most 1024 px.
+fn load_ref(path: &std::path::Path) -> anyhow::Result<Ref> {
     let img = image::open(path)?;
     let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "image".into());
     let dir = muse_dir().join("refs");
@@ -3556,12 +3519,15 @@ fn load_ref(ctx: &egui::Context, path: &std::path::Path) -> anyhow::Result<Ref> 
     let mut jpg = Vec::new();
     image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpg, 85).encode_image(&small.to_rgb8())?;
     let url = format!("data:image/jpeg;base64,{}", base64::engine::general_purpose::STANDARD.encode(&jpg));
-    let t = img.thumbnail(128, 128).to_rgba8();
-    let thumb = ctx.load_texture(format!("muse ref {stamp}"), egui::ColorImage::from_rgba_unmultiplied([t.width() as usize, t.height() as usize], t.as_raw()), Default::default());
-    Ok(Ref { name, url, path: copy, thumb, project: false })
+    Ok(Ref { name, url, path: copy, project: false })
 }
 
-/// What Muse should know of an attached image: its size as Muse sees it
+/// What Claude should know of an attached image: its size as Claude sees it
+/// `--photofacts <image>`: what Claude is told of a photo.
+pub fn photo_facts(path: &std::path::Path) -> String {
+    image_facts(path, false)
+}
+
 /// (at most 1024 px), where it comes from, black and white, transparency.
 fn image_facts(path: &std::path::Path, project: bool) -> String {
     let Ok(img) = image::open(path) else { return String::new() };
@@ -3572,7 +3538,7 @@ fn image_facts(path: &std::path::Path, project: bool) -> String {
         out += ", project file";
     }
     // A photo of a product: the object on its background (its corners in
-    // the pixels Muse sees), and a color cast on its white areas.
+    // the pixels Claude sees), and a color cast on its white areas.
     if !project {
         let seen = img.thumbnail(1024, 1024).to_rgba8();
         if let Some(f) = photo::find_object(&seen) {
@@ -3589,6 +3555,11 @@ fn image_facts(path: &std::path::Path, project: bool) -> String {
                 );
             } else {
                 out += &format!(", shows an object on a background over {:.0}% of the photo (not one flat face: a view of the object)", f.share * 100.0);
+            }
+            // Its labels: the quad of a print taken from the photo.
+            if !f.labels.is_empty() {
+                let l: Vec<String> = f.labels.iter().map(|q| format!("[{}]", q.iter().map(|p| format!("[{:.0}, {:.0}]", p[0], p[1])).collect::<Vec<_>>().join(", "))).collect();
+                out += &format!(", light flat areas on it (paper labels: the quad to print from, exact): {}", l.join(" and "));
             }
         }
         if let Some((_, l)) = photo::paper_of(&seen) {
@@ -3655,7 +3626,7 @@ fn gray_image(path: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
     Ok(out)
 }
 
-/// A material from a region of an image (pixels as Muse sees it, at most
+/// A material from a region of an image (pixels as Claude sees it, at most
 /// 1024 px): cut out, its light falloff evened out (`flatten`), made
 /// seamless (a copy shifted by half cross-fades over its borders), cached
 /// in `muse/prints`.
@@ -3759,7 +3730,7 @@ fn solve6(mut a: [[f64; 6]; 6], mut b: [f64; 6]) -> Option<[f64; 6]> {
     Some(x)
 }
 
-/// Image files Muse takes as references.
+/// Image files Claude takes as references.
 pub(super) fn is_image(path: &std::path::Path) -> bool {
     let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
     matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp" | "bmp" | "tga" | "tif" | "tiff")
@@ -3784,7 +3755,7 @@ fn scans_of(c: &Convo) -> Vec<(String, String)> {
     out
 }
 
-/// The looks applied now, as Muse reads them (JSON).
+/// The looks applied now, as Claude reads them (JSON).
 fn stacks_text(c: &Convo) -> String {
     let v: Vec<Value> = c.looks.iter().map(|l| serde_json::json!({"pieces": l.pieces, "what": l.what, "layers": l.layers})).collect();
     if v.is_empty() {
@@ -3794,355 +3765,87 @@ fn stacks_text(c: &Convo) -> String {
     }
 }
 
-/// A chat message: the user's on the right, Muse's on the left.
-fn bubble(ui: &mut Ui, line: &ChatLine) {
-    let w = ui.available_width();
-    let layout = egui::Layout::top_down(if line.user { egui::Align::Max } else { egui::Align::Min });
-    ui.with_layout(layout, |ui| {
-        let fill = if line.user { crate::style::ACCENT.gamma_multiply(0.3) } else { Color32::from_gray(40) };
-        egui::Frame::none().fill(fill).rounding(8.0).inner_margin(egui::Margin::symmetric(10.0, 7.0)).show(ui, |ui| {
-            ui.set_max_width(w * 0.86);
-            ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
-                ui.label(&line.text);
-                if !line.refs.is_empty() {
-                    ui.add_space(4.0);
-                    ref_row(ui, &line.refs, 64.0, "Reference sent with this message");
-                }
-                for n in &line.notes {
-                    ui.label(RichText::new(n).small().weak());
-                }
-            });
-        });
-    });
-    ui.add_space(6.0);
-}
-
-/// A small rounded toggle: tinted with the accent when on.
-fn chip(ui: &mut Ui, text: &str, on: bool) -> egui::Response {
-    let (fill, stroke, color) = if on {
-        (crate::style::ACCENT.gamma_multiply(0.25), egui::Stroke::new(1.0f32, crate::style::ACCENT), Color32::WHITE)
-    } else {
-        (crate::style::FIELD, egui::Stroke::NONE, Color32::from_gray(185))
-    };
-    ui.add(egui::Button::new(RichText::new(text).small().color(color)).fill(fill).stroke(stroke).rounding(10.0))
-}
-
-/// Reference thumbnails in rows of fixed height (a bigger one on hover);
-/// the index of the one clicked.
-fn ref_row(ui: &mut Ui, thumbs: &[egui::TextureHandle], size: f32, tip: &str) -> Option<usize> {
-    let per_row = ((ui.available_width() + 6.0) / (size + 6.0)).floor().max(1.0) as usize;
-    let mut clicked = None;
-    for (r, chunk) in thumbs.chunks(per_row).enumerate() {
-        ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), size), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
-            for (k, t) in chunk.iter().enumerate() {
-                let resp = ui.add(egui::Image::new(t).fit_to_exact_size(egui::vec2(size, size)).maintain_aspect_ratio(true).rounding(4.0).sense(egui::Sense::click()));
-                let resp = resp.on_hover_ui(|ui| {
-                    ui.label(tip);
-                    ui.add(egui::Image::new(t).max_size(egui::vec2(320.0, 320.0)).rounding(4.0));
-                });
-                if resp.clicked() {
-                    clicked = Some(r * per_row + k);
-                }
-            }
-        });
-    }
-    clicked
-}
-
 impl RetroApp {
-    /// The Muse panel (top right by default): a conversation with Muse
-    /// about the texturing.
+    /// The Claude panel (a small card top right by default): shown only
+    /// while no Claude app or Claude Code is linked, to add Material Forge
+    /// to their connectors. The conversation itself happens there.
     pub(super) fn muse_panel(&mut self, ui: &mut Ui) {
-        self.muse_poll(ui.ctx());
-        self.muse_connect_poll(ui.ctx());
         self.muse.rect = Some(ui.max_rect());
         // MF_MUSE_ATTACH=<img;img>: attached at start (UI checks).
         static DEMO: std::sync::Once = std::sync::Once::new();
         DEMO.call_once(|| {
             for p in std::env::var("MF_MUSE_ATTACH").unwrap_or_default().split(';').filter(|p| !p.is_empty()) {
-                self.muse_attach(ui.ctx(), std::path::Path::new(p));
+                self.muse_attach(std::path::Path::new(p));
             }
             if std::env::var_os("MF_MUSE_PIECES").is_some() {
                 self.muse.pieces_on = true;
             }
         });
-        // Images dragged over the window go to Muse while its panel is open.
-        let hovering = ui.ctx().input(|i| i.raw.hovered_files.iter().any(|f| f.path.as_deref().map_or(true, is_image)));
-        if hovering && !self.muse.key.is_empty() {
-            let r = ui.max_rect().shrink(4.0);
-            let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("muse drop")));
-            painter.rect(r, 8.0f32, Color32::from_black_alpha(170), egui::Stroke::new(2.0f32, crate::style::ACCENT));
-            painter.text(r.center(), egui::Align2::CENTER_CENTER, "Drop images for Muse", egui::FontId::proportional(18.0), Color32::WHITE);
-        }
         let mut close = false;
-        panel_header(ui, "Muse", "Texture by conversation", |ui| close = icons::button(ui, Icon::Close, false, 24.0, "Close").clicked());
+        let linked = super::mcp::linked();
+        let tip = if linked { "Close (it hides while Claude is connected; Window > Panels shows it again)" } else { "Close (Window > Panels shows it again)" };
+        panel_header(ui, "Claude", if linked { "Connected" } else { "Not connected" }, |ui| close = icons::button(ui, Icon::Close, false, 24.0, tip).clicked());
         if close {
-            self.dock.get_or_insert_with(Default::default).muse = false;
-            self.muse.pieces_on = false;
+            self.hide_muse_card();
         }
-        egui::Frame::none().inner_margin(egui::Margin::symmetric(12.0, 4.0)).show(ui, |ui| {
-            if self.muse.key.is_empty() {
-                self.muse_connect_card(ui);
-            } else {
-                self.muse_body(ui);
-            }
+        egui::Frame::none().inner_margin(egui::Margin::symmetric(12.0, 6.0)).show(ui, |ui| {
+            egui::ScrollArea::vertical().id_salt("claude connect").auto_shrink([false, true]).show(ui, |ui| self.muse_connect_card(ui));
         });
         self.muse_update_pieces();
     }
 
-    /// Not connected yet: one button to get a key, one to paste it.
+    /// Closes the card: while Claude is linked it only hides again (it
+    /// comes back when the link is gone); otherwise it stays closed.
+    pub(super) fn hide_muse_card(&mut self) {
+        if self.muse.peek && super::mcp::linked() {
+            self.muse.peek = false;
+        } else {
+            self.dock.get_or_insert_with(Default::default).muse = false;
+            self.muse.peek = false;
+        }
+        self.muse.pieces_on = false;
+    }
+
+    /// Adds Material Forge to the Claude app's or Claude Code's connectors.
     fn muse_connect_card(&mut self, ui: &mut Ui) {
-        let checking = self.muse.connecting.is_some();
-        ui.add_space(24.0);
-        ui.vertical_centered(|ui| {
-            ui.label(RichText::new("Connect Muse").size(18.0).strong());
-            ui.add_space(4.0);
-            ui.label(RichText::new("Muse textures your model from a description or a photo. It runs on your Meta Model API account.").weak());
-            ui.add_space(14.0);
-            if !self.muse.connect_opened {
-                let b = egui::Button::new(RichText::new("Connect Muse").color(Color32::WHITE).strong()).fill(crate::style::ACCENT).min_size(egui::vec2(200.0, 34.0)).rounding(8.0);
-                if ui.add(b).on_hover_text("Opens Meta's API key page in your browser").clicked() {
-                    let _ = std::process::Command::new("explorer").arg(KEYS_URL).spawn();
-                    self.muse.connect_opened = true;
-                }
-                ui.add_space(8.0);
-                if ui.small_button("I already have a key").clicked() {
-                    self.muse.connect_opened = true;
-                }
-            } else {
-                ui.label("In the page that opened: sign in, open API keys,\ncreate a key and copy it. Then:");
-                ui.add_space(10.0);
-                let b = egui::Button::new(RichText::new("Paste key and connect").color(Color32::WHITE).strong()).fill(crate::style::ACCENT).min_size(egui::vec2(220.0, 34.0)).rounding(8.0);
-                if ui.add_enabled(!checking, b).clicked() {
-                    match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
-                        Ok(t) if !t.trim().is_empty() && !t.trim().contains(char::is_whitespace) => self.muse_connect(t.trim().to_string()),
-                        _ => self.muse.connect_msg = "Nothing that looks like a key is copied. Copy the key, then click again.".into(),
-                    }
-                }
-                ui.add_space(10.0);
-                ui.label(RichText::new("or type it").small().weak());
-                ui.horizontal(|ui| {
-                    let r = ui.add_enabled(!checking, egui::TextEdit::singleline(&mut self.muse.key_draft).password(true).hint_text("Key").desired_width(ui.available_width() - 80.0));
-                    let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    let draft = self.muse.key_draft.trim().to_string();
-                    if (ui.add_enabled(!checking && !draft.is_empty(), egui::Button::new("Connect")).clicked() || enter) && !draft.is_empty() {
-                        self.muse_connect(draft);
-                    }
-                });
-                ui.add_space(6.0);
-                if ui.small_button("Open the key page again").clicked() {
-                    let _ = std::process::Command::new("explorer").arg(KEYS_URL).spawn();
-                }
-            }
-            ui.add_space(10.0);
-            if checking {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label("Checking the key...");
-                });
-            } else if !self.muse.connect_msg.is_empty() {
-                ui.label(RichText::new(&self.muse.connect_msg).color(Color32::from_rgb(230, 140, 120)));
-            }
-            ui.add_space(10.0);
-            ui.label(RichText::new("The key stays on this computer.").small().weak());
-        });
-    }
-
-    /// Checks a key with Meta (a free call) before keeping it.
-    fn muse_connect(&mut self, key: String) {
-        let (tx, rx) = mpsc::channel();
-        self.muse.connect_msg.clear();
-        let k = key.clone();
-        std::thread::spawn(move || {
-            let r = match ureq::get(&format!("{API}/models")).set("Authorization", &format!("Bearer {k}")).timeout(Duration::from_secs(20)).call() {
-                Ok(_) => Ok(()),
-                Err(ureq::Error::Status(401 | 403, _)) => Err("Meta refused this key. Copy it again from the API keys page.".to_string()),
-                Err(ureq::Error::Status(code, _)) => Err(format!("Meta answered with an error ({code}). Try again in a moment.")),
-                Err(e) => Err(format!("Meta could not be reached ({e}).")),
-            };
-            let _ = tx.send(r);
-        });
-        self.muse.connecting = Some((key, rx));
-    }
-
-    fn muse_connect_poll(&mut self, ctx: &egui::Context) {
-        let Some((key, rx)) = &self.muse.connecting else { return };
-        ctx.request_repaint_after(Duration::from_millis(100));
-        let Ok(r) = rx.try_recv() else { return };
-        let key = key.clone();
-        self.muse.connecting = None;
-        match r {
-            Ok(()) => {
-                let path = key_path();
-                if let Err(e) = std::fs::create_dir_all(path.parent().unwrap_or(&path)).and_then(|_| std::fs::write(&path, &key)) {
-                    self.toast(format!("Muse is connected, but the key could not be saved ({e}): it is kept until you close the app."));
-                }
-                self.muse.key = key;
-                self.muse.key_draft.clear();
-                self.muse.connect_opened = false;
-            }
-            Err(m) => self.muse.connect_msg = m,
+        let exe = std::env::current_exe().unwrap_or_default();
+        let (app, code) = super::mcp::added();
+        let names: Vec<&str> = [(app.is_some(), "the Claude app"), (code.is_some(), "Claude Code")].iter().filter(|x| x.0).map(|x| x.1).collect();
+        if !self.muse.app_msg.is_empty() {
+            ui.label(RichText::new(&self.muse.app_msg).small());
+        } else if super::mcp::linked() {
+            ui.label(RichText::new("Claude is connected: ask it in the Claude app or Claude Code to texture your model in Material Forge.").small().weak());
+        } else if names.is_empty() {
+            ui.label(RichText::new("Texture your model by chatting with Claude in the Claude app or Claude Code.").small().weak());
+        } else {
+            ui.label(RichText::new(format!("Added to {}: open it and ask Claude to texture your model in Material Forge.", names.join(" and "))).small().weak());
         }
-    }
-
-    fn muse_body(&mut self, ui: &mut Ui) {
-        let Some(doc) = self.doc.as_ref() else {
-            ui.label(RichText::new("Open a project to texture it with Muse.").weak());
-            return;
-        };
-        // Another document: a new conversation.
-        let key = doc_key(doc);
-        if self.muse.convo.as_ref().is_some_and(|c| c.doc != key) && self.muse.job.is_none() {
-            self.muse.convo = None;
-            self.muse.chat.clear();
+        if app.iter().chain(code.iter()).any(|c| std::path::Path::new(c) != exe.as_path()) {
+            ui.label(RichText::new("It starts another copy of Material Forge: add it again to use this one.").small().color(Color32::from_rgb(230, 180, 120)));
         }
-        let set_names: Vec<String> = doc.sets.iter().map(|s| s.name.clone()).collect();
-        if self.muse.sets_on.len() != set_names.len() {
-            self.muse.sets_on = vec![true; set_names.len()];
-        }
-        let all = parts(doc);
-        let busy = self.muse.job.is_some() || self.muse.check.is_some() || self.muse.light_check.is_some() || self.muse.light_verify.is_some();
-        let started = self.muse.convo.is_some();
-
-        // The bar: pieces on the model, a new conversation, the connection.
-        ui.horizontal(|ui| {
-            if chip(ui, "Pieces", self.muse.pieces_on).on_hover_text("Show the numbered pieces on the model (name them in your messages: \"make piece 3 dark wood\")").clicked() {
-                self.muse.pieces_on = !self.muse.pieces_on;
-            }
-            let chosen = self.muse.convo.as_ref().and_then(|c| c.style).filter(|_| self.muse.style == Style::Auto);
-            let shown = match chosen {
-                Some(s) => format!("Style: Auto ({})", s.name()),
-                None => format!("Style: {}", self.muse.style.name()),
-            };
-            egui::ComboBox::from_id_salt("muse style").selected_text(RichText::new(shown).small()).width(110.0).show_ui(ui, |ui| {
-                for s in Style::ALL {
-                    ui.selectable_value(&mut self.muse.style, s, s.name()).on_hover_text(s.hint());
-                }
-            })
-            .response
-            .on_hover_text(self.muse.style.hint());
-            if ui.add_enabled(!busy && !self.muse.chat.is_empty(), egui::Button::new(RichText::new("New conversation").small()).small()).on_hover_text("Start over (the layers stay)").clicked() {
-                self.muse.convo = None;
-                self.muse.chat.clear();
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let chip = ui.add(egui::Button::new(RichText::new("\u{25CF} Connected").small().color(Color32::from_rgb(120, 200, 140))).frame(false)).on_hover_text("Muse account");
-                let pid = ui.id().with("muse account");
-                if chip.clicked() {
-                    ui.memory_mut(|m| m.toggle_popup(pid));
-                }
-                super::widgets::popup_below(ui, pid, &chip, egui::PopupCloseBehavior::CloseOnClick, |ui| {
-                    ui.set_min_width(150.0);
-                    if ui.button("Disconnect Muse").clicked() {
-                        let _ = std::fs::remove_file(key_path());
-                        self.muse.key.clear();
-                        self.muse.pieces_on = false;
-                    }
-                });
-            });
-        });
-        if self.muse.key.is_empty() {
-            return;
-        }
-        // The texture sets to texture, chosen before the conversation starts.
-        if set_names.len() > 1 {
-            ui.add_space(2.0);
-            if started {
-                let on: Vec<&str> = set_names.iter().zip(&self.muse.sets_on).filter(|(_, b)| **b).map(|(n, _)| n.as_str()).collect();
-                ui.label(RichText::new(format!("Texturing {}", on.join(", "))).small().weak());
-            } else {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("Texture").small().weak());
-                    for (i, n) in set_names.iter().enumerate() {
-                        let on = self.muse.sets_on[i];
-                        if ui.add_enabled_ui(!busy, |ui| chip(ui, n, on)).inner.on_hover_text("Click to include or leave out this texture set").clicked() {
-                            self.muse.sets_on[i] = !on;
-                        }
-                    }
-                });
-            }
-        }
-        let on = self.muse.sets_on.clone();
-        let scope: Vec<usize> = (0..all.len()).filter(|&i| on.get(all[i].set).copied().unwrap_or(true)).collect();
         ui.add_space(6.0);
-        // The message box at the bottom (as tall as its content), the
-        // conversation scrolling in the room above it.
-        let mut send = false;
-        let can_send = !busy && !self.muse.prompt.trim().is_empty() && (started || !scope.is_empty());
-        egui::TopBottomPanel::bottom(ui.id().with("muse composer")).frame(egui::Frame::none().inner_margin(egui::Margin { top: 6.0, bottom: 8.0, ..Default::default() })).show_separator_line(false).resizable(false).show_inside(ui, |ui| {
-            egui::Frame::none().fill(crate::style::FIELD).rounding(10.0).inner_margin(egui::Margin::symmetric(8.0, 6.0)).show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                // The images going with the message (a click removes one).
-                if !self.muse.attach.is_empty() {
-                    let thumbs: Vec<egui::TextureHandle> = self.muse.attach.iter().map(|r| r.thumb.clone()).collect();
-                    if let Some(k) = ref_row(ui, &thumbs, 48.0, "Sent with your message (click to remove)") {
-                        self.muse.attach.remove(k);
-                    }
-                    ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            let b = egui::Button::new(RichText::new("Add to Claude app").color(Color32::WHITE).strong()).fill(crate::style::ACCENT);
+            let tip = if app.is_some() { "Already added: adds it again (the Claude app's settings file is backed up first)" } else { "Adds Material Forge to the Claude desktop app's connectors (its settings file is backed up first)" };
+            if ui.add(b).on_hover_text(tip).clicked() {
+                let path = super::mcp::claude_app_config();
+                self.muse.app_msg = match super::mcp::add_to_config(&path, &exe) {
+                    Ok(()) => "Added. Quit the Claude app completely (also from the tray), open it again and ask it to texture your model in Material Forge.".into(),
+                    Err(e) => e,
+                };
+                super::mcp::forget_added();
+            }
+            if super::mcp::claude_code().is_some() {
+                let tip = if code.is_some() { "Already added: adds it again (claude mcp add, for every folder)" } else { "Adds Material Forge to Claude Code for every folder (claude mcp add)" };
+                if ui.button("Add to Claude Code").on_hover_text(tip).clicked() {
+                    self.muse.app_msg = match super::mcp::add_to_claude_code(&exe) {
+                        Ok(()) => "Added to Claude Code. Start a new session there and ask it to texture your model in Material Forge.".into(),
+                        Err(e) => e,
+                    };
+                    super::mcp::forget_added();
                 }
-                let hint = if started { "Ask for a change: make piece 3 dark wood, frosted glass..." } else { "Describe the look, or drop a reference photo" };
-                let r = ui.add(
-                    egui::TextEdit::multiline(&mut self.muse.prompt)
-                        .hint_text(hint)
-                        .frame(false)
-                        .desired_rows(2)
-                        .desired_width(f32::INFINITY)
-                        .return_key(Some(egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, egui::Key::Enter))),
-                );
-                send |= r.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift) && can_send;
-                ui.horizontal(|ui| {
-                    if ui.add_enabled(!busy, egui::Button::new(RichText::new("+ Image").small()).small()).on_hover_text("Attach reference photos (or drop them anywhere on the window)").clicked() {
-                        let files = file_dialog().and_then(|d| d.add_filter("Images", &["png", "jpg", "jpeg", "webp", "bmp", "tga", "tif", "tiff"]).pick_files());
-                        for f in files.unwrap_or_default() {
-                            self.muse_attach(ui.ctx(), &f);
-                        }
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let b = egui::Button::new(RichText::new("Send").color(Color32::WHITE).strong()).fill(if can_send { crate::style::ACCENT } else { Color32::from_gray(70) }).rounding(6.0);
-                        send |= ui.add_enabled(can_send, b).on_hover_text("Enter (Shift+Enter: new line)").clicked();
-                    });
-                });
-            });
+            }
         });
-        egui::CentralPanel::default().frame(egui::Frame::none()).show_inside(ui, |ui| {
-            egui::ScrollArea::vertical().id_salt("muse chat").auto_shrink([false, false]).stick_to_bottom(!self.muse.chat.is_empty()).show(ui, |ui| {
-                if self.muse.chat.is_empty() {
-                    ui.add_space(4.0);
-                    ui.label(RichText::new("What should it look like?").strong());
-                    ui.label(RichText::new("Describe it, or attach a photo of the real thing. Then keep talking to change any piece; only what you ask for changes.").small().weak());
-                    ui.add_space(8.0);
-                    for ex in EXAMPLES {
-                        if chip(ui, ex, false).on_hover_text("Use this").clicked() {
-                            self.muse.prompt = ex.to_string();
-                        }
-                        ui.add_space(2.0);
-                    }
-                }
-                for line in &self.muse.chat {
-                    bubble(ui, line);
-                }
-                if busy {
-                    egui::Frame::none().fill(Color32::from_gray(36)).rounding(8.0).inner_margin(egui::Margin::symmetric(10.0, 8.0)).show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.label(RichText::new(&self.muse.status).small());
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.small_button("Cancel").clicked() {
-                                    self.muse_cancel();
-                                }
-                            });
-                        });
-                    });
-                }
-            });
-        });
-        if send {
-            let ctx = ui.ctx().clone();
-            self.muse_project_files(&ctx);
-            self.muse_send(all, scope);
-        }
     }
 
     /// Keeps the pieces shown on the model up to date (the conversation's
@@ -4327,19 +4030,18 @@ impl RetroApp {
         }
         let _ = std::fs::write(muse_dir().join("last_message.txt"), &user);
         let urls: Vec<String> = attach.iter().map(|r| r.url.clone()).collect();
-        let thumbs: Vec<egui::TextureHandle> = attach.iter().map(|r| r.thumb.clone()).collect();
         c.refs.extend(attach);
-        let req = Request { key: self.muse.key.clone(), first, system: c.system.clone(), view: c.view.clone(), sheet: c.sheet.clone(), surf: c.surf.clone(), turns: c.turns.clone(), stacks: stacks_text(c), sets, user, refs: urls, check: false, scans: scans_of(c) };
-        self.muse.chat.push(ChatLine { user: true, text, notes: Vec::new(), refs: thumbs });
+        let req = Request { first, system: c.system.clone(), view: c.view.clone(), sheet: c.sheet.clone(), surf: c.surf.clone(), turns: c.turns.clone(), stacks: stacks_text(c), sets, user, refs: urls, check: false, scans: scans_of(c) };
+        self.muse.chat.push(ChatLine { user: true, text, notes: Vec::new() });
         self.muse.prompt.clear();
-        self.muse.status = "Muse Spark is looking at the model...".into();
+        self.muse.status = "Claude is looking at the model...".into();
         self.muse_spawn(req);
     }
 
-    /// The images the user imported into the project go to Muse with the
+    /// The images the user imported into the project go to Claude with the
     /// next message, once each, as references it can use like any other
     /// (made for this model: masks, UV sheets, logos, photos).
-    pub(super) fn muse_project_files(&mut self, ctx: &egui::Context) {
+    pub(super) fn muse_project_files(&mut self) {
         if self.muse.convo.is_none() {
             self.muse.files_sent.clear();
         }
@@ -4362,7 +4064,7 @@ impl RetroApp {
             if std::fs::write(&path, r.encoded.as_slice()).is_err() {
                 continue;
             }
-            if let Ok(mut x) = load_ref(ctx, &path) {
+            if let Ok(mut x) = load_ref(&path) {
                 x.name = name;
                 x.project = true;
                 new.push((r.id, Some(x)));
@@ -4374,7 +4076,7 @@ impl RetroApp {
         }
     }
 
-    /// Before Muse's first look at the model: its texture sets get at least
+    /// Before Claude's first look at the model: its texture sets get at least
     /// 2048 texels (small prints and details stay sharp) and their mesh
     /// maps baked (the finishes' grime, dust and edges read them).
     fn muse_prepare(&mut self, sets: &[usize]) {
@@ -4396,28 +4098,27 @@ impl RetroApp {
             self.history.clear();
             self.engine.compositor.trim();
             self.engine.procgen.trim();
-            self.message(format!("Muse: {} raised to 2048 px for sharper details.", raised.join(", ")));
+            self.message(format!("Claude: {} raised to 2048 px for sharper details.", raised.join(", ")));
         }
         let Some(doc) = self.doc.as_ref() else { return };
         let which: Vec<bool> = (0..doc.sets.len()).map(|i| sets.contains(&i) && !doc.sets[i].baked).collect();
         if which.iter().any(|&b| b) && self.bake_job.is_none() {
             let st = doc.bake_settings.clone();
             self.start_bake(st, which);
-            self.message("Muse: baking the mesh maps (grime, dust and worn edges read them).".to_string());
+            self.message("Claude: baking the mesh maps (grime, dust and worn edges read them).".to_string());
         }
     }
 
-    /// `--musetest`: starts Muse on the texture sets named (all when none),
+    /// `--musetest`: starts Claude on the texture sets named (all when none),
     /// or (`next`) continues the conversation.
-    pub(super) fn muse_test_send(&mut self, ctx: &egui::Context, prompt: &str, sets: &[String]) -> anyhow::Result<()> {
+    pub(super) fn muse_test_send(&mut self, prompt: &str, sets: &[String]) -> anyhow::Result<()> {
         let doc = self.doc.as_ref().ok_or_else(|| anyhow::anyhow!("no project"))?;
         let all = parts(doc);
         let on: Vec<bool> = doc.sets.iter().map(|s| sets.is_empty() || sets.iter().any(|n| n.eq_ignore_ascii_case(&s.name))).collect();
         let scope: Vec<usize> = (0..all.len()).filter(|&i| on[all[i].set]).collect();
         anyhow::ensure!(!scope.is_empty(), "no texture set named {sets:?}");
-        anyhow::ensure!(!self.muse.key.is_empty(), "no Meta Model API key (MODEL_API_KEY)");
         self.muse.prompt = prompt.to_string();
-        self.muse_project_files(ctx);
+        self.muse_project_files();
         self.muse_send(all, scope);
         Ok(())
     }
@@ -4427,35 +4128,17 @@ impl RetroApp {
         self.muse.convo.as_ref().map_or(0, |c| c.turns.len())
     }
 
-    /// A key for checks that replay Muse's answers (no API call).
-    pub(super) fn muse_test_key(&mut self) {
-        if self.muse.key.is_empty() {
-            self.muse.key = "test".into();
-        }
-    }
-
     /// `--musetest`: (still working, the last message's text and notes).
     pub(super) fn muse_test_state(&self) -> (bool, Vec<String>) {
-        // Muse's lines since the last message (the answer and its check).
+        // Claude's lines since the last message (the answer and its check).
         let from = self.muse.chat.iter().rposition(|l| l.user).map_or(0, |i| i + 1);
         let last = self.muse.chat[from..].iter().flat_map(|l| std::iter::once(l.text.clone()).chain(l.notes.iter().cloned())).collect();
         (self.muse.job.is_some() || self.muse.check.is_some() || self.muse.light_check.is_some() || self.muse.light_verify.is_some(), last)
     }
 
-    /// Stops the current answer: nothing is applied (a request already sent
-    /// finishes in the background and is dropped).
-    fn muse_cancel(&mut self) {
-        self.muse.check = None;
-        if let Some(c) = self.muse.cancel.take() {
-            c.store(true, Ordering::Relaxed);
-        }
-        self.muse.job = None;
-        self.muse_turn_failed("Cancelled.".into());
-    }
-
     /// A turn that gave nothing: said in the chat; a conversation that never
     /// got its first answer starts over.
-    /// The view as it is now, shown instead of the live one while Muse
+    /// The view as it is now, shown instead of the live one while Claude
     /// works on its result (`muse_release` lets the live view back).
     fn muse_hold(&mut self) {
         let out = self.engine.viewport.output();
@@ -4468,7 +4151,7 @@ impl RetroApp {
         self.muse.hold = Some((t, id));
     }
 
-    /// The final result shows: the live view back, Muse's answer in the chat.
+    /// The final result shows: the live view back, Claude's answer in the chat.
     fn muse_release(&mut self) {
         if let Some(line) = self.muse.pending.take() {
             self.muse.chat.push(line);
@@ -4478,7 +4161,7 @@ impl RetroApp {
         }
     }
 
-    /// The held view, while Muse works on its result.
+    /// The held view, while Claude works on its result.
     pub(super) fn muse_hold_tex(&self) -> Option<egui::TextureId> {
         self.muse.hold.as_ref().map(|h| h.1)
     }
@@ -4491,7 +4174,7 @@ impl RetroApp {
                 self.muse.attach = c.refs;
             }
         }
-        self.muse.chat.push(ChatLine { user: false, text: why, notes: Vec::new(), refs: Vec::new() });
+        self.muse.chat.push(ChatLine { user: false, text: why, notes: Vec::new() });
     }
 
     pub(super) fn muse_poll(&mut self, ctx: &egui::Context) {
@@ -4519,7 +4202,7 @@ impl RetroApp {
     }
 
     /// Fixes what is known to look wrong in a plan before it is applied
-    /// (the plan is changed, so Muse remembers what is really there): a
+    /// (the plan is changed, so Claude remembers what is really there): a
     /// scan tinted far from its own color gives way to the closest scan of
     /// its category; cell patterns carved as height on a scanned look (they
     /// read as a network of cracks) are dropped; a look keeps at most
@@ -4611,7 +4294,7 @@ impl RetroApp {
     }
 
     /// The model as it looks now (the viewport's look and lighting, the
-    /// material display) from two sides, rendered off screen: what Muse's
+    /// material display) from two sides, rendered off screen: what Claude's
     /// self check sees.
 
     fn muse_shot(&mut self) -> Option<image::RgbaImage> {
@@ -4734,7 +4417,7 @@ impl RetroApp {
             .collect()
     }
 
-    /// Waits until the turn's layers are composited, then sends Muse a
+    /// Waits until the turn's layers are composited, then sends Claude a
     /// render of the result to check against the request and references.
     fn muse_check_tick(&mut self, ctx: &egui::Context) {
         ctx.request_repaint();
@@ -4777,7 +4460,7 @@ impl RetroApp {
         let sets = self.doc.as_ref().map(|d| sets_text(d, &sets)).unwrap_or_default();
         let refs = if c.refs.is_empty() { String::new() } else { " and with the reference images".to_string() };
         let user = format!(
-            "SELF CHECK (automatic, not written by the user). The first image is a render of the model as it looks now in the app (its lighting) with the looks you just applied: the top row the whole model from the front and the back, the bottom row close-ups of its most detailed areas at full texture resolution. Compare it with what the user asked (\"{}\"){refs}. Your answer stays as it is unless the render shows a clear defect: the wrong material (each ambientCG layer of your stacks says in \"got\" which scan the app found for your query: is that scan really this material? leaves scattered on the ground are not a leaf, a wall is not a floor), a color or darkness clearly off, the wrong shine, a texture far too big or too small for the object, visible tiling, stretching or seams, a print broken or misplaced. Choices that work are not defects: never retune a tint, scale, age or pattern that already looks fine, and never redo a look to try a variation. For each look you return, write in \"problem\" the defect you see in the render, and give its complete layers: every layer that is fine exactly as it was, only the layers that fix the problem changed. A scan or image is never replaced by plain colors: when a scan is the wrong material, ask for another scan (a different ambientcg query, with minus words for the tags of the wrong one, or a library material), or a \"texture_prompt\" when no scan library has this material (a living leaf, skin, a painted pattern). Never drop a print (a reference image layer) the user asked for: if one is misplaced, keep it and correct its box (surface boxes are in the SURFACES image, decal boxes in the numbered views image). A face print (\"side\") upside down, sideways or on the wrong face (compare with the photos of the whole object at an angle): correct its \"up\" (the photo edge its letters' tops point to; your stacks give in \"turned\" the turn the app applied) or its side. A wrapped label too high, low, wide or narrow: correct its \"from\", \"to\" or \"arc\" (your stacks give what the app took). The app took the color cast of the light out of face photos (paper made neutral): that is not a defect. Most of the time nothing is clearly wrong: then return no looks. \"reply\": one short sentence on what you corrected, or that it looks right.",
+            "SELF CHECK (automatic, not written by the user). The first image is a render of the model as it looks now in the app (its lighting) with the looks you just applied: the top row the whole model from the front and the back, the bottom row close-ups of its most detailed areas at full texture resolution. Compare it with what the user asked (\"{}\"){refs}. Your answer stays as it is unless the render shows a clear defect: the wrong material (each ambientCG layer of your stacks says in \"got\" which scan the app found for your query: is that scan really this material? leaves scattered on the ground are not a leaf, a wall is not a floor), a color or darkness clearly off, the wrong shine, a texture far too big or too small for the object, visible tiling, stretching or seams, a print broken or misplaced. Choices that work are not defects: never retune a tint, scale, age or pattern that already looks fine, and never redo a look to try a variation. For each look you return, write in \"problem\" the defect you see in the render, and give its complete layers: every layer that is fine exactly as it was, only the layers that fix the problem changed. A scan or image is never replaced by plain colors: when a scan is the wrong material, ask for another scan (a different ambientcg query, with minus words for the tags of the wrong one, or a library material). Never drop a print (a reference image layer) the user asked for: if one is misplaced, keep it and correct its box (surface boxes are in the SURFACES image, decal boxes in the numbered views image). A face print (\"side\") upside down, sideways or on the wrong face (compare with the photos of the whole object at an angle): correct its \"up\" (the photo edge its letters' tops point to; your stacks give in \"turned\" the turn the app applied) or its side. A wrapped label too high, low, wide or narrow: correct its \"from\", \"to\" or \"arc\" (your stacks give what the app took). The app took the color cast of the light out of face photos (paper made neutral): that is not a defect. Most of the time nothing is clearly wrong: then return no looks. \"reply\": one short sentence on what you corrected, or that it looks right.",
             ch.user
         );
         let style = if self.muse.style == Style::Auto { c.style } else { Some(self.muse.style) };
@@ -4794,8 +4477,8 @@ impl RetroApp {
             user
         };
         let refs: Vec<String> = std::iter::once(url).chain(now_url).collect();
-        let req = Request { key: self.muse.key.clone(), first: None, system: c.system.clone(), view: c.view.clone(), sheet: c.sheet.clone(), surf: c.surf.clone(), turns: c.turns.clone(), stacks: stacks_text(c), sets, user, refs, check: true, scans: scans_of(c) };
-        self.muse.status = "Muse is checking the result...".into();
+        let req = Request { first: None, system: c.system.clone(), view: c.view.clone(), sheet: c.sheet.clone(), surf: c.surf.clone(), turns: c.turns.clone(), stacks: stacks_text(c), sets, user, refs, check: true, scans: scans_of(c) };
+        self.muse.status = "Claude is checking the result...".into();
         self.muse_spawn(req);
     }
 
@@ -4855,7 +4538,7 @@ impl RetroApp {
             notes.push(no_dashes(a));
         }
         let mut plan = t.plan;
-        // A first pass that Muse will check: the view stays as it was until
+        // A first pass that Claude will check: the view stays as it was until
         // the final result.
         // Replays skip it, unless MF_MUSE_CHECK asks (its plan: the next
         // file of MF_MUSE_PLAN).
@@ -4878,7 +4561,7 @@ impl RetroApp {
         apply_finishes(&mut plan);
         self.guard_plan(&mut plan, &mut notes);
         // A request for the lighting alone keeps the materials, whatever
-        // Muse sent.
+        // Claude sent.
         if self.muse.light_only {
             let mut dropped = false;
             for k in ["looks", "parts"] {
@@ -4906,7 +4589,7 @@ impl RetroApp {
             }
         }
         notes.extend(t.notes);
-        // What Muse remembers of its answer: the reply and what it changed
+        // What Claude remembers of its answer: the reply and what it changed
         // (the stacks themselves come with the next message).
         let memory = if changed.is_empty() { reply.clone() } else { format!("{reply} [Changed: {}]", changed.join(", ")) };
         // A self check is remembered without its render (it is not resent).
@@ -4916,7 +4599,7 @@ impl RetroApp {
         if t.check {
             // One message for the turn: the answer, and what the check
             // refined in it.
-            let mut line = self.muse.pending.take().unwrap_or(ChatLine { user: false, text: reply.clone(), notes: Vec::new(), refs: Vec::new() });
+            let mut line = self.muse.pending.take().unwrap_or(ChatLine { user: false, text: reply.clone(), notes: Vec::new() });
             if !changed.is_empty() {
                 line.notes.push(format!("Refined after looking at the result: {reply}"));
             } else if lit.is_some() {
@@ -4941,16 +4624,16 @@ impl RetroApp {
             self.muse_release();
             return;
         }
-        let line = ChatLine { user: false, text: reply, notes, refs: Vec::new() };
-        // After a turn that changed the model, Muse looks at the result once
+        let line = ChatLine { user: false, text: reply, notes };
+        // After a turn that changed the model, Claude looks at the result once
         // (not after a check, nor when replaying a saved plan).
         if will_check && !changed.is_empty() {
             self.muse.pending = Some(line);
             let user = t.user.lines().next().unwrap_or_default().to_string();
             self.muse.check = Some(Check { frames: 0, quiet: 0, user });
-            self.muse.status = "Muse is checking its result...".into();
+            self.muse.status = "Claude is checking its result...".into();
         } else if will_check && lit.is_some() && self.studio_job_idle() {
-            // The lighting alone: a render of it goes back to Muse.
+            // The lighting alone: a render of it goes back to Claude.
             self.muse.pending = Some(line);
             let path = muse_dir().join("lighting_check.png");
             let mut s = self.doc.as_ref().map(|d| d.studio.clone()).unwrap_or_default();
@@ -4958,14 +4641,14 @@ impl RetroApp {
             self.studio_queue.clear();
             self.render_studio_shot(self.camera, &s, path.clone());
             self.muse.light_check = Some((path, t.user.lines().next().unwrap_or_default().to_string()));
-            self.muse.status = "Muse is rendering its lighting to check it...".into();
+            self.muse.status = "Claude is rendering its lighting to check it...".into();
         } else {
             self.muse.chat.push(line);
             self.muse_release();
         }
     }
 
-    /// Muse's lighting onto the studio (entered, the model centered, when it
+    /// Claude's lighting onto the studio (entered, the model centered, when it
     /// is off); before its first answer of a turn the lighting is kept for
     /// "Back to my lights". The number of lights.
     fn muse_lighting(&mut self, l: &Value, check: bool) -> usize {
@@ -4991,8 +4674,8 @@ impl RetroApp {
         n
     }
 
-    /// The studio render of Muse's lighting is saved (`path`): it goes back
-    /// to Muse, who corrects the lighting. False: not that render.
+    /// The studio render of Claude's lighting is saved (`path`): it goes back
+    /// to Claude, who corrects the lighting. False: not that render.
     pub(super) fn muse_light_saved(&mut self, path: &std::path::Path) -> bool {
         if self.muse.light_verify.as_deref() == Some(path) {
             self.muse.light_verify = None;
@@ -5005,7 +4688,7 @@ impl RetroApp {
         let (_, asked) = self.muse.light_check.take().unwrap();
         let img = image::open(path).ok();
         let render = img.as_ref().and_then(crate::studio::photo_light).unwrap_or_default();
-        // How far the first lighting is from the photo, to judge Muse's
+        // How far the first lighting is from the photo, to judge Claude's
         // correction against.
         let d = img.as_ref().and_then(crate::studio::photo_profile).zip(self.muse.light_photo.as_ref()).map(|(r, p)| crate::studio::profile_distance(p, &r));
         self.muse.light_first = d.and_then(|d| Some((self.doc.as_ref()?.studio.clone(), self.camera.pitch, d)));
@@ -5021,14 +4704,14 @@ impl RetroApp {
             s
         };
         let sets = self.doc.as_ref().map(|d| sets_text(d, &sets)).unwrap_or_default();
-        let req = Request { key: self.muse.key.clone(), first: None, system: c.system.clone(), view: c.view.clone(), sheet: c.sheet.clone(), surf: c.surf.clone(), turns: c.turns.clone(), stacks: stacks_text(c), sets, user: super::muse_light::check_text(&asked, &self.muse.light_facts, &render), refs: vec![url], check: true, scans: scans_of(c) };
-        self.muse.status = "Muse is comparing the render with your photo...".into();
+        let req = Request { first: None, system: c.system.clone(), view: c.view.clone(), sheet: c.sheet.clone(), surf: c.surf.clone(), turns: c.turns.clone(), stacks: stacks_text(c), sets, user: super::muse_light::check_text(&asked, &self.muse.light_facts, &render), refs: vec![url], check: true, scans: scans_of(c) };
+        self.muse.status = "Claude is comparing the render with your photo...".into();
         self.muse_spawn(req);
         true
     }
 
     /// The corrected lighting's render is saved: the lighting closer to the
-    /// photo stays (Muse's first one back when the correction moved away).
+    /// photo stays (Claude's first one back when the correction moved away).
     fn muse_light_verified(&mut self, path: &std::path::Path) {
         let first = self.muse.light_first.take();
         let now = image::open(path).ok().as_ref().and_then(crate::studio::photo_profile);
@@ -5062,7 +4745,7 @@ impl RetroApp {
         self.muse_release();
     }
 
-    /// The studio render was cancelled: Muse's answer shows as it was.
+    /// The studio render was cancelled: Claude's answer shows as it was.
     pub(super) fn muse_light_cancelled(&mut self) {
         if self.muse.light_verify.take().is_some() {
             self.muse.light_first = None;
@@ -5075,24 +4758,12 @@ impl RetroApp {
         }
     }
 
-    /// Attaches an image file to the message being typed.
-    pub(super) fn muse_attach(&mut self, ctx: &egui::Context, path: &std::path::Path) {
-        match load_ref(ctx, path) {
+    /// Attaches an image file to the next request.
+    pub(super) fn muse_attach(&mut self, path: &std::path::Path) {
+        match load_ref(path) {
             Ok(r) => self.muse.attach.push(r),
             Err(e) => self.toast(format!("{} could not be attached: {e:#}", path.display())),
         }
-    }
-
-    /// A file dropped while the Muse panel is open: an image becomes a
-    /// reference (anywhere on the window: Windows gives no pointer position
-    /// during a file drag).
-    pub(super) fn muse_drop(&mut self, ctx: &egui::Context, path: &std::path::Path) -> bool {
-        let open = self.dock.as_ref().is_some_and(|d| d.muse);
-        if !(open && is_image(path)) {
-            return false;
-        }
-        self.muse_attach(ctx, path);
-        true
     }
 
     /// The layer with the reference images its mask steps and channel maps
@@ -5744,7 +5415,7 @@ impl RetroApp {
         // The self check refines the turn: one undo step for both.
         if !user.starts_with("SELF CHECK") {
             let short: String = user.chars().take(40).collect();
-            self.checkpoint(&format!("Muse: {short}"));
+            self.checkpoint(&format!("Claude: {short}"));
         }
         // Texture set settings (the sets of the conversation only).
         for t in settings {
@@ -5845,7 +5516,7 @@ impl RetroApp {
             let mut folders = Vec::new();
             for set in sets {
                 let paint = MaskEffect { id: 0, enabled: true, blend: MaskBlend::Normal, opacity: 1.0, kind: MaskEffectKind::Paint };
-                let mut folder = LayerTree { desc: LayerDesc::new(0, format!("Muse: {what}"), LayerKind::Folder), children: children.clone() };
+                let mut folder = LayerTree { desc: LayerDesc::new(0, format!("Claude: {what}"), LayerKind::Folder), children: children.clone() };
                 folder.desc.mask = Some(MaskDesc { enabled: true, base: 0.0, effects: vec![paint] });
                 let doc = self.doc.as_mut().unwrap();
                 let mut l = doc.instantiate(&self.engine, set, &folder);
@@ -5855,7 +5526,7 @@ impl RetroApp {
                 let split_ids: Vec<(u64, Vec<(usize, Vec<u32>)>)> = l.children.iter().zip(&splits).flat_map(|(ch, sp)| ch.children.iter().zip(sp.iter()).map(|(cc, isl)| (cc.desc.id, isl.clone()))).collect();
                 // In the place of a freed folder of this set; otherwise on top
                 // of the whole stack, never inside the selected folder (layers
-                // above it would cover Muse's work).
+                // above it would cover Claude's work).
                 let mut l = Some(l);
                 let s = &mut doc.sets[set];
                 if let Some(k) = freed.iter().position(|f| f.0 == set) {
@@ -5897,7 +5568,7 @@ impl RetroApp {
                     s.dirty = true;
                 }
             }
-            // Each ambientCG layer remembers the scan it got ("got"): Muse
+            // Each ambientCG layer remembers the scan it got ("got"): Claude
             // sees its stacks with the next message and can judge the scan.
             let mut layers = p["layers"].clone();
             for l in layers.as_array_mut().into_iter().flatten() {
@@ -5931,7 +5602,7 @@ impl RetroApp {
         changed
     }
 
-    /// Masks a Muse folder to `keep` (pieces of `set`): its paint mask gets
+    /// Masks a Claude folder to `keep` (pieces of `set`): its paint mask gets
     /// a new texture (the undo history keeps the old one).
     fn muse_mask(&mut self, set: usize, folder: u64, pieces: &[pieces::Piece], keep: &[usize], owners: &mut HashMap<usize, Vec<u16>>) {
         let Some(doc) = self.doc.as_mut() else { return };
@@ -5949,8 +5620,156 @@ impl RetroApp {
     }
 }
 
-/// `--museview <project> <out.png>`: saves the views Muse gets of a
+/// `--museview <project> <out.png>`: saves the views Claude gets of a
 /// project (all its parts) and prints the part facts.
+// ------------------------------------------------- Claude app (MCP)
+
+impl RetroApp {
+    fn muse_busy(&self) -> bool {
+        self.muse.job.is_some() || self.muse.check.is_some() || self.muse.light_check.is_some() || self.muse.light_verify.is_some()
+    }
+
+    /// Every frame: the tool calls from the Claude app, and the end of a
+    /// request it made (once the result is on screen).
+    pub(super) fn mcp_tick(&mut self, ctx: &egui::Context) {
+        super::mcp::serve();
+        self.muse_poll(ctx);
+        for c in super::mcp::take_commands(ctx, &self.muse.status) {
+            let r = match c.tool.as_str() {
+                "texture" => self.mcp_texture(&c.args).map(|_| Vec::new()),
+                "status" => Ok(vec![super::mcp::text(self.mcp_status())]),
+                "look" => self.mcp_look(),
+                "open" => self.mcp_open(&c.args),
+                t => Err(format!("unknown tool {t}")),
+            };
+            let _ = c.reply.send(r);
+        }
+        if !super::mcp::turn_active() {
+            return;
+        }
+        ctx.request_repaint_after(Duration::from_millis(100));
+        let compositing = self.doc.as_ref().is_some_and(|d| d.sets.iter().any(|s| s.dirty || s.dirty_region.is_some()));
+        if !self.muse_busy() && !super::mcp::asking() && !compositing && self.bake_job.is_none() {
+            let (_, lines) = self.muse_test_state();
+            let mut out = vec![super::mcp::text(format!("DONE in Material Forge. What happened:\n{}", lines.iter().map(|l| format!("- {l}")).collect::<Vec<_>>().join("\n")))];
+            if let Some(img) = self.muse_shot() {
+                out.push(super::mcp::text("The model now (front and back on top, close-ups below):"));
+                out.extend(super::mcp::image(&image::DynamicImage::ImageRgba8(img)));
+            }
+            super::mcp::end_turn(out);
+        }
+    }
+
+    /// `texture`: a request from the Claude app.
+    fn mcp_texture(&mut self, a: &Value) -> Result<(), String> {
+        if self.muse_busy() {
+            return Err("Material Forge is still working on the last request: call wait.".into());
+        }
+        let Some(doc) = self.doc.as_ref() else {
+            return Err("No project is open in Material Forge: ask the user to open one (or use the open tool) first.".into());
+        };
+        let msg = a["message"].as_str().unwrap_or_default().trim().to_string();
+        if msg.is_empty() {
+            return Err("The message is empty.".into());
+        }
+        let key = doc_key(doc);
+        let names: Vec<String> = a["texture_sets"].as_array().into_iter().flatten().filter_map(|n| n.as_str().map(String::from)).collect();
+        let set_names: Vec<String> = doc.sets.iter().map(|s| s.name.clone()).collect();
+        let all = parts(doc);
+        let style = match a["style"].as_str() {
+            None => None,
+            Some(s) if s.eq_ignore_ascii_case("auto") => Some(Style::Auto),
+            Some(s) => Some(Style::from_word(s).ok_or_else(|| format!("Unknown style {s}: auto, product, realistic or stylized."))?),
+        };
+        for p in a["images"].as_array().into_iter().flatten() {
+            let p = std::path::Path::new(p.as_str().unwrap_or_default());
+            if !p.is_file() || !is_image(p) {
+                return Err(format!("{} is not an image file on this computer.", p.display()));
+            }
+        }
+        let on: Vec<bool> = if !names.is_empty() {
+            set_names.iter().map(|s| names.iter().any(|n| n.eq_ignore_ascii_case(s))).collect()
+        } else if self.muse.sets_on.len() == set_names.len() {
+            self.muse.sets_on.clone()
+        } else {
+            vec![true; set_names.len()]
+        };
+        if !on.iter().any(|&b| b) {
+            return Err(format!("No texture set is chosen. The texture sets are: {}.", set_names.join(", ")));
+        }
+        if a["new_conversation"].as_bool() == Some(true) || self.muse.convo.as_ref().is_some_and(|c| c.doc != key) {
+            self.muse.convo = None;
+            self.muse.chat.clear();
+        }
+        if a["resend_instructions"].as_bool() == Some(true) {
+            super::mcp::resend();
+        }
+        if let Some(s) = style {
+            self.muse.style = s;
+        }
+        self.muse.sets_on = on.clone();
+        for p in a["images"].as_array().into_iter().flatten() {
+            self.muse_attach(std::path::Path::new(p.as_str().unwrap_or_default()));
+        }
+        let scope: Vec<usize> = (0..all.len()).filter(|&i| on.get(all[i].set).copied().unwrap_or(true)).collect();
+        self.muse.prompt = msg;
+        self.muse_project_files();
+        super::mcp::begin_turn();
+        self.muse_send(all, scope);
+        if !self.muse_busy() {
+            super::mcp::cancel_turn();
+            return Err("The request could not start in Material Forge.".into());
+        }
+        Ok(())
+    }
+
+    fn mcp_status(&self) -> String {
+        let Some(doc) = self.doc.as_ref() else {
+            return "Material Forge is open with no project. Ask the user to open one, or use the open tool.".into();
+        };
+        let name = doc.path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| format!("{} (not saved yet)", doc.mesh_name));
+        let sets: Vec<String> = doc.sets.iter().map(|s| format!("{} ({} px)", s.name, s.resolution())).collect();
+        let convo = match &self.muse.convo {
+            Some(c) => format!("a texturing conversation of {} message(s)", c.turns.len()),
+            None => "no texturing conversation yet".into(),
+        };
+        let busy = if self.muse_busy() { format!(" It is working now: {}", self.muse.status) } else { String::new() };
+        let attach = if self.muse.attach.is_empty() { String::new() } else { format!(" {} image(s) are attached for the next request.", self.muse.attach.len()) };
+        format!("Project: {name}{}. Texture sets: {}. Style: {}. Texturing: {convo}.{busy}{attach}", if doc.modified { ", with unsaved changes" } else { "" }, sets.join(", "), self.muse.style.name())
+    }
+
+    fn mcp_look(&mut self) -> Result<Vec<Value>, String> {
+        if self.doc.is_none() {
+            return Err("No project is open in Material Forge.".into());
+        }
+        let img = self.muse_shot().ok_or("The render could not be made.")?;
+        Ok(std::iter::once(super::mcp::text("The model in Material Forge now: front and back on top, close-ups of its detailed areas below.")).chain(super::mcp::image(&image::DynamicImage::ImageRgba8(img))).collect())
+    }
+
+    fn mcp_open(&mut self, a: &Value) -> Result<Vec<Value>, String> {
+        let p = std::path::PathBuf::from(a["path"].as_str().unwrap_or_default());
+        if !p.is_file() {
+            return Err(format!("{} is not a file on this computer.", p.display()));
+        }
+        if self.muse_busy() {
+            return Err("Material Forge is working on a request: wait for it first.".into());
+        }
+        if self.doc.as_ref().is_some_and(|d| d.modified) {
+            return Err("The open project has unsaved changes: ask the user to save it in Material Forge first.".into());
+        }
+        let ext = p.extension().and_then(|e| e.to_str()).unwrap_or_default().to_ascii_lowercase();
+        if ext == "sprp" {
+            self.open_project_file(&p);
+        } else {
+            self.create_project(p.clone(), 2048).map_err(|e| format!("{} could not be opened: {e:#}", p.display()))?;
+        }
+        if self.doc.as_ref().is_none_or(|d| d.path.as_deref() != Some(p.as_path()) && ext == "sprp") {
+            return Err(format!("{} could not be opened: {}", p.display(), self.status));
+        }
+        Ok(vec![super::mcp::text(format!("Opened. {}", self.mcp_status()))])
+    }
+}
+
 pub fn view_shot(project: &std::path::Path, out: &std::path::Path) -> anyhow::Result<()> {
     let engine = crate::engine::Engine::headless()?;
     let (doc, _) = crate::project::load(&engine, project)?;

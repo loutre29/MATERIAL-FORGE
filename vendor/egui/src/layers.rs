@@ -207,6 +207,12 @@ impl GraphicLayers {
             .or_default()
     }
 
+    /// Every layer's [`PaintList`] (Material Forge: its showcase player
+    /// finds the widgets by their painted text).
+    pub fn layers(&self) -> impl Iterator<Item = (LayerId, &PaintList)> + '_ {
+        Order::ALL.iter().flat_map(move |&o| self.0[o as usize].iter().map(move |(id, l)| (LayerId::new(o, *id), l)))
+    }
+
     /// Get the [`PaintList`] for the given [`LayerId`].
     pub fn get(&self, layer_id: LayerId) -> Option<&PaintList> {
         self.0[layer_id.order as usize].get(&layer_id.id)

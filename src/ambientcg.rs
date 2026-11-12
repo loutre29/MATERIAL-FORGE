@@ -1,7 +1,7 @@
-//! ambientCG (https://ambientcg.com, CC0 scanned materials) for Muse: the
+//! ambientCG (https://ambientcg.com, CC0 scanned materials) for Claude: the
 //! material catalog (ids, tags, popularity; cached for a week), the best
 //! match for a few tag words, and the download of a material's 2K maps into
-//! Muse's own cache (`<data>/muse/scans/<category>/<id>`, the starter
+//! Claude's own cache (`<data>/muse/scans/<category>/<id>`, the starter
 //! assets' layout). A scan belongs to the projects that use it (they keep
 //! its maps as resources), not to the shared library.
 
@@ -106,7 +106,7 @@ pub fn catalog() -> Result<Vec<Asset>> {
     Ok(out)
 }
 
-/// The most used tags (words Muse can search with).
+/// The most used tags (words Claude can search with).
 pub fn vocabulary(cat: &[Asset], n: usize) -> Vec<String> {
     let mut count: HashMap<&str, usize> = HashMap::new();
     for a in cat {
@@ -182,7 +182,7 @@ pub fn best<'a>(cat: &'a [Asset], query: &str, avoid: &[String]) -> Option<&'a A
     cat.iter().filter(|a| (cutouts || !cutout(a)) && kind(a) && (wanted.is_empty() || is_material(a)) && !avoid.contains(&a.id) && !excluded(a)).map(|a| (score(a), a)).filter(|(s, _)| *s >= 2.0).max_by(|a, b| a.0.total_cmp(&b.0)).map(|(_, a)| a)
 }
 
-/// Downloads `a`'s 2K maps into Muse's cache (once) and returns its folder.
+/// Downloads `a`'s 2K maps into Claude's cache (once) and returns its folder.
 pub fn download(a: &Asset, stop: &AtomicBool) -> Result<PathBuf> {
     let dir = scans_dir().join(&a.category).join(&a.id);
     if dir.join("material.json").is_file() {

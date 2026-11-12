@@ -1503,7 +1503,7 @@ pub fn tex_material_at(dir: &Path) -> Option<TexMaterial> {
 /// Names are unique (their shelf key).
 /// Each texture material's average color (sRGB hex) and average roughness
 /// (None without a roughness map), read from its maps the first time and
-/// kept in `material_stats.json` (Muse picks the scan whose real look is
+/// kept in `material_stats.json` (Claude picks the scan whose real look is
 /// closest to what is asked).
 pub fn material_stats(mats: &[TexMaterial]) -> Vec<(Option<String>, Option<f32>)> {
     use rayon::prelude::*;
@@ -1558,7 +1558,7 @@ fn tex_materials_in(root: &Path, out: &mut Vec<TexMaterial>) {
     }
 }
 
-/// The scans Muse downloaded (ambientCG): project assets, shown only with
+/// The scans Claude downloaded (ambientCG): project assets, shown only with
 /// the projects that use them.
 pub fn scan_materials() -> Vec<TexMaterial> {
     let mut out = Vec::new();

@@ -95,6 +95,39 @@ pub fn ui_smoke(out: &Path) -> anyhow::Result<()> {
     }
     if std::env::var("MF_UITEST_ONLY").is_ok_and(|v| v == "panels") {
         panel_dock_check(&mut d, &mut app)?;
+        // The Claude card hides while a Claude app is linked.
+        app.focus_tab(dock::Tab::Muse);
+        let card = |d: &Driver| d.ctx.memory(|m| m.areas().visible_layer_ids().iter().any(|l| l.id == egui::Id::new(("panel", "muse"))));
+        d.idle(&mut app, 3);
+        anyhow::ensure!(card(&d), "the Claude card must show while no Claude app is linked");
+        super::mcp::set_linked(true);
+        d.idle(&mut app, 3);
+        anyhow::ensure!(!card(&d), "the Claude card must hide while a Claude app is linked");
+        // Window > Panels > Claude shows it anyway, and hides it again.
+        anyhow::ensure!(!app.tab_open(dock::Tab::Muse), "the menu must show the hidden card unticked");
+        app.toggle_tab(dock::Tab::Muse);
+        d.idle(&mut app, 3);
+        anyhow::ensure!(card(&d) && app.tab_open(dock::Tab::Muse), "the Window menu must show the card while linked");
+        app.toggle_tab(dock::Tab::Muse);
+        d.idle(&mut app, 3);
+        anyhow::ensure!(!card(&d), "unticking it while linked must hide the card");
+        app.toggle_tab(dock::Tab::Muse);
+        d.idle(&mut app, 3);
+        super::mcp::set_linked(false);
+        d.idle(&mut app, 3);
+        super::mcp::set_linked(true);
+        d.idle(&mut app, 3);
+        anyhow::ensure!(!card(&d), "a new link must hide the card shown from the menu");
+        super::mcp::set_linked(false);
+        d.idle(&mut app, 3);
+        anyhow::ensure!(card(&d), "the Claude card must come back when the link is gone");
+        println!("Claude card hides while linked OK");
+        // "Don't show shortcuts" is remembered (ui_prefs.json).
+        super::persist_show_tool_keys(false);
+        anyhow::ensure!(!ViewSettings::default().show_tool_keys, "hidden shortcuts must stay hidden next time");
+        super::persist_show_tool_keys(true);
+        anyhow::ensure!(ViewSettings::default().show_tool_keys, "shown shortcuts must show next time");
+        println!("shortcuts choice kept OK");
         println!("UITEST OK (panels only): {} frames in {:.1}s", d.frames, t0.elapsed().as_secs_f32());
         return Ok(());
     }
@@ -1701,9 +1734,44 @@ fn gizmo_check(d: &mut Driver, app: &mut RetroApp) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `--musetest <project> <dir> <prompt> [set,set]`: Muse textures a copy of
-/// the project headless (the key from MODEL_API_KEY; data in `<dir>/data`),
-/// then the viewport is saved as `<dir>/result.png` next to Muse's views
+/// `--mcpserve <project> <dir>`: the app headless with its MCP socket
+/// (data in `<dir>/data`, `mcp.json` there), for a client to drive through
+/// `--mcp`; it stops when `<dir>/stop` appears (or after 10 minutes), and
+/// saves the viewport as `<dir>/result.png`.
+pub fn mcp_serve(project: &Path, out: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(out)?;
+    std::env::set_var("MF_DATA_DIR", out.join("data"));
+    std::env::set_var("MF_MCP_SERVE", "1");
+    std::env::set_var("MF_MUSE_OFFLINE", "1");
+    HEADLESS.store(true, std::sync::atomic::Ordering::Relaxed);
+    let t0 = Instant::now();
+    let engine = Engine::headless()?;
+    let renderer = egui_wgpu::Renderer::new(&engine.device, wgpu::TextureFormat::Bgra8Unorm, None, 1, false);
+    let ctx = egui::Context::default();
+    let mesh = !project.extension().is_some_and(|e| e.eq_ignore_ascii_case("sprp"));
+    let mut app = RetroApp::build(engine, Arc::new(egui::mutex::RwLock::new(renderer)), &ctx, (!mesh).then(|| project.to_path_buf()));
+    app.persist_layout = false;
+    app.lock_cursor = false;
+    if mesh {
+        app.create_project(project.to_path_buf(), 1024)?;
+    }
+    let mut d = Driver { ctx, size: egui::vec2(1600.0, 950.0), frames: 0 };
+    d.idle(&mut app, 3);
+    anyhow::ensure!(app.doc.is_some(), "project not opened: {}", app.status);
+    println!("MCP serving");
+    while !out.join("stop").exists() && t0.elapsed().as_secs() < 600 {
+        d.idle(&mut app, 1);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    app.engine.device.poll(wgpu::Maintain::Wait);
+    crate::selftest::screenshot(&app.engine, app.engine.viewport.output(), &out.join("result.png"))?;
+    println!("MCP serve done: {} frames", d.frames);
+    Ok(())
+}
+
+/// `--musetest <project> <dir> <prompt> [set,set]`: Claude's saved answers
+/// (MF_MUSE_PLAN) replayed on a copy of the project headless (data in `<dir>/data`),
+/// then the viewport is saved as `<dir>/result.png` next to Claude's views
 /// and plan (`data/muse`). The project file is not written.
 pub fn muse_test(project: &Path, out: &Path, prompt: &str, sets: &[String]) -> anyhow::Result<()> {
     std::fs::create_dir_all(out)?;
@@ -1739,19 +1807,19 @@ pub fn muse_test(project: &Path, out: &Path, prompt: &str, sets: &[String]) -> a
     for (k, turn) in turns.iter().enumerate() {
         println!("> {turn}");
         // MF_MUSE_REFS=<image;image>: reference images with the first message.
-        if k == 0 {
-            for f in std::env::var("MF_MUSE_REFS").unwrap_or_default().split(';').filter(|f| !f.is_empty()) {
-                app.muse_attach(&d.ctx, Path::new(f));
-            }
+        // MF_MUSE_REFS_<n>: with the n-th message.
+        let refs = if k == 0 { std::env::var("MF_MUSE_REFS") } else { std::env::var(format!("MF_MUSE_REFS_{}", k + 1)) };
+        for f in refs.unwrap_or_default().split(';').filter(|f| !f.is_empty()) {
+            app.muse_attach(Path::new(f));
         }
-        app.muse_test_send(&d.ctx, turn, sets)?;
+        app.muse_test_send(turn, sets)?;
         loop {
             d.idle(&mut app, 1);
-            // Muse's first look may start a bake: the result waits for it.
+            // Claude's first look may start a bake: the result waits for it.
             if !app.muse_test_state().0 && app.bake_job.is_none() {
                 break;
             }
-            anyhow::ensure!(t0.elapsed().as_secs() < 1800, "Muse took more than 30 minutes");
+            anyhow::ensure!(t0.elapsed().as_secs() < 1800, "Claude took more than 30 minutes");
             std::thread::sleep(std::time::Duration::from_millis(250));
         }
         for l in app.muse_test_state().1 {
@@ -1763,7 +1831,7 @@ pub fn muse_test(project: &Path, out: &Path, prompt: &str, sets: &[String]) -> a
             shot(&app, &format!("turn{}.png", k + 1))?;
         }
     }
-    // The stack Muse built (MF_MUSE_DUMP=1).
+    // The stack Claude built (MF_MUSE_DUMP=1).
     if std::env::var_os("MF_MUSE_DUMP").is_some() {
         fn dump(l: &crate::document::Layer, depth: usize) {
             let d = &l.desc;
@@ -1813,9 +1881,10 @@ pub fn muse_test(project: &Path, out: &Path, prompt: &str, sets: &[String]) -> a
 /// the count removed), "The project file" saves the project and clears its
 /// modified flag, an unmodified project is never saved.
 /// Entering the studio centers the model in the frame, leaving it turns the
-/// render mode off; Muse's lighting from a photo (a saved answer, no API
+/// render mode off; Claude's lighting from a photo (a saved answer, no API
 /// call) is applied, checked with a render sent back, and applied again.
 fn studio_muse_check(d: &mut Driver, app: &mut RetroApp, out: &Path) -> anyhow::Result<()> {
+    super::mcp::self_check(out)?;
     if app.view.studio {
         app.toggle_studio();
     }
@@ -1839,7 +1908,7 @@ fn studio_muse_check(d: &mut Driver, app: &mut RetroApp, out: &Path) -> anyhow::
     app.toggle_studio();
     d.idle(app, 1);
     anyhow::ensure!(!app.view.studio && !app.view.path_trace, "leaving the studio must turn the render mode off");
-    // Muse's lighting in its conversation: two saved answers (the turn,
+    // Claude's lighting in its conversation: two saved answers (the turn,
     // then its check after a render), no API call.
     let turn = out.join("muse_light_turn.json");
     let check = out.join("muse_light_check.json");
@@ -1848,7 +1917,6 @@ fn studio_muse_check(d: &mut Driver, app: &mut RetroApp, out: &Path) -> anyhow::
     std::env::set_var("MF_MUSE_PLAN", format!("{};{}", turn.display(), check.display()));
     std::env::set_var("MF_MUSE_CHECK", "1");
     std::env::set_var("MF_MUSE_OFFLINE", "1");
-    app.muse_test_key();
     // A packshot photo: a blue product on white, its shadow on the right.
     let photo = out.join("packshot_photo.png");
     image::RgbaImage::from_fn(400, 400, |x, y| {
@@ -1862,10 +1930,10 @@ fn studio_muse_check(d: &mut Driver, app: &mut RetroApp, out: &Path) -> anyhow::
         image::Rgba([px[0], px[1], px[2], 255])
     })
     .save(&photo)?;
-    app.muse_attach(&d.ctx, &photo);
+    app.muse_attach(&photo);
     // MF_MUSE_PHOTOS=<img;img>: more photos.
     for p in std::env::var("MF_MUSE_PHOTOS").unwrap_or_default().split(';').filter(|p| !p.is_empty()) {
-        app.muse_attach(&d.ctx, Path::new(p));
+        app.muse_attach(Path::new(p));
     }
     let before = app.doc.as_ref().unwrap().studio.clone();
     let res_before: Vec<u32> = app.doc.as_ref().unwrap().sets.iter().map(|s| s.resolution()).collect();
@@ -1873,7 +1941,7 @@ fn studio_muse_check(d: &mut Driver, app: &mut RetroApp, out: &Path) -> anyhow::
     let stacks = |app: &RetroApp| -> Vec<Vec<String>> { app.doc.as_ref().unwrap().sets.iter().map(|s| s.layers.iter().map(|l| l.desc.name.clone()).collect()).collect() };
     let stacks_before = stacks(app);
     app.camera.pitch = 0.0;
-    app.muse_test_send(&d.ctx, "I want the lighting of the attached photo for my packshot", &[])?;
+    app.muse_test_send("I want the lighting of the attached photo for my packshot", &[])?;
     let t = Instant::now();
     d.idle(app, 1);
     while app.muse_test_state().0 && t.elapsed().as_secs() < 300 {
@@ -1883,35 +1951,35 @@ fn studio_muse_check(d: &mut Driver, app: &mut RetroApp, out: &Path) -> anyhow::
         std::env::remove_var(k);
     }
     let (busy, lines) = app.muse_test_state();
-    anyhow::ensure!(!busy, "Muse still working after 300 s");
-    anyhow::ensure!(lines.iter().any(|l| l.starts_with("Lighting refined after a render")), "Muse's lighting must be checked once with a render: {lines:?}");
-    anyhow::ensure!(app.view.studio, "Muse's lighting must open the studio");
+    anyhow::ensure!(!busy, "Claude still working after 300 s");
+    anyhow::ensure!(lines.iter().any(|l| l.starts_with("Lighting refined after a render")), "Claude's lighting must be checked once with a render: {lines:?}");
+    anyhow::ensure!(app.view.studio, "Claude's lighting must open the studio");
     anyhow::ensure!(app.studio_prev.as_ref().is_some_and(|p| p.lights == before.lights), "\"Back to my lights\" must return to the lighting before the request");
     let st = &app.doc.as_ref().unwrap().studio;
     let kinds: Vec<_> = st.lights.iter().map(|l| l.kind).collect();
-    anyhow::ensure!(kinds == [crate::studio::LightKind::Spot, crate::studio::LightKind::Strip], "Muse's lights: {kinds:?}");
-    anyhow::ensure!((st.background[0] - 236.0 / 255.0).abs() < 1e-3 && st.lights[0].azimuth == 70.0 && st.lights[1].color[2] < 0.95, "Muse's lighting was not applied as answered");
+    anyhow::ensure!(kinds == [crate::studio::LightKind::Spot, crate::studio::LightKind::Strip], "Claude's lights: {kinds:?}");
+    anyhow::ensure!((st.background[0] - 236.0 / 255.0).abs() < 1e-3 && st.lights[0].azimuth == 70.0 && st.lights[1].color[2] < 0.95, "Claude's lighting was not applied as answered");
     // The corrected lighting is rendered and compared with the photo: the
     // closer one stays.
     let kept_first = lines.iter().any(|l| l.contains("its first lighting was kept"));
     anyhow::ensure!(kept_first || lines.iter().any(|l| l.contains("The correction is closer to your photo")), "the corrected lighting must be compared with the photo: {lines:?}");
     let want = if kept_first { 0.3 } else { 0.25 };
     anyhow::ensure!((st.shadow_opacity - want).abs() < 1e-6, "the lighting kept is not the one said (shadow {}, kept first {kept_first})", st.shadow_opacity);
-    anyhow::ensure!(st.out_long == before.out_long && st.out_samples == before.out_samples, "Muse's lighting must keep the output settings");
-    anyhow::ensure!(st.lens_mm == 100.0 && (app.camera.pitch.to_degrees() - 9.0).abs() < 0.01, "Muse's camera (lens {}, pitch {:.1})", st.lens_mm, app.camera.pitch.to_degrees());
+    anyhow::ensure!(st.out_long == before.out_long && st.out_samples == before.out_samples, "Claude's lighting must keep the output settings");
+    anyhow::ensure!(st.lens_mm == 100.0 && (app.camera.pitch.to_degrees() - 9.0).abs() < 0.01, "Claude's camera (lens {}, pitch {:.1})", st.lens_mm, app.camera.pitch.to_degrees());
     let res: Vec<u32> = app.doc.as_ref().unwrap().sets.iter().map(|s| s.resolution()).collect();
     let baked: Vec<bool> = app.doc.as_ref().unwrap().sets.iter().map(|s| s.baked).collect();
     anyhow::ensure!(res == res_before && baked == baked_before && app.bake_job.is_none(), "a lighting answer must not bake or raise the texture sets ({res_before:?} -> {res:?})");
-    anyhow::ensure!(stacks(app) == stacks_before, "a request for the lighting alone must keep the materials, even when Muse sends looks");
+    anyhow::ensure!(stacks(app) == stacks_before, "a request for the lighting alone must keep the materials, even when Claude sends looks");
     anyhow::ensure!(lines.iter().any(|l| l.contains("Your materials were kept")), "the dropped looks must be said: {lines:?}");
     let msg = std::fs::read_to_string(crate::library::library_dir().join("..").join("muse").join("last_message.txt")).unwrap_or_default();
-    anyhow::ensure!(msg.contains("PACKSHOT STUDIO now:") && msg.contains("\"lights\""), "the message must give Muse the studio's lighting");
-    anyhow::ensure!(msg.contains("Light measures by the app: R1 background #FFFFFF") && msg.contains("ground shadow at its foot: right up to"), "the photo must be measured for Muse: {}", msg.lines().last().unwrap_or(""));
-    anyhow::ensure!(msg.contains("asks only for the packshot's lighting"), "the message must tell Muse the request is about the lighting only");
+    anyhow::ensure!(msg.contains("PACKSHOT STUDIO now:") && msg.contains("\"lights\""), "the message must give Claude the studio's lighting");
+    anyhow::ensure!(msg.contains("Light measures by the app: R1 background #FFFFFF") && msg.contains("ground shadow at its foot: right up to"), "the photo must be measured for Claude: {}", msg.lines().last().unwrap_or(""));
+    anyhow::ensure!(msg.contains("asks only for the packshot's lighting"), "the message must tell Claude the request is about the lighting only");
     let check_sent = app.muse_test_turns();
     anyhow::ensure!(check_sent == 2, "the turn and its check must be in the conversation ({check_sent} turns)");
     app.toggle_studio();
-    println!("studio centering, render off on leaving and Muse lighting OK");
+    println!("studio centering, render off on leaving and Claude lighting OK");
     Ok(())
 }
 

@@ -167,7 +167,7 @@ pub struct Shelf {
     thumb_size: u8,
     pub(super) source: Source,
     builtin_brushes: std::collections::HashSet<String>,
-    /// Downloaded materials (Muse's ambientCG scans, out of the library):
+    /// Downloaded materials (Claude's ambientCG scans, out of the library):
     /// shown only in the Project category of a project that uses them.
     scans: Vec<Item>,
     /// The scans the open project uses, by name.
@@ -339,7 +339,7 @@ impl Shelf {
                     Source::Starter
                 }
             }
-            // Downloaded by Muse: only ever shown as the project's.
+            // Downloaded by Claude: only ever shown as the project's.
             Item::TexMaterial(m) if self.project_mats.contains(&m.name) && m.dir.starts_with(crate::ambientcg::scans_dir()) => Source::Project,
             Item::TexMaterial(m) if m.dir.starts_with(&user_dir) => Source::User,
             Item::Material(..) | Item::TexMaterial(_) | Item::Alpha(_) | Item::Procedural(_) | Item::Filter(_) => Source::Starter,
@@ -381,7 +381,7 @@ impl Shelf {
     }
 
     /// The library's scanned materials, plain presets and smart materials
-    /// (Muse chooses among them).
+    /// (Claude chooses among them).
     pub(super) fn material_names(&mut self) -> (Vec<library::TexMaterial>, Vec<String>, Vec<String>) {
         self.load();
         let names = |c: Category| self.items.get(&c).map(|v| v.iter().map(Item::name).collect()).unwrap_or_default();

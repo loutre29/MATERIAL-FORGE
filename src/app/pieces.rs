@@ -1,7 +1,7 @@
-//! Muse's pieces: each part of the model split into its connected mesh
+//! Claude's pieces: each part of the model split into its connected mesh
 //! pieces (welded by position; a part made of a single piece splits into
 //! its UV islands instead), alike pieces grouped (chain links, rivets), so
-//! Muse gives materials to exact polygons instead of position cuts. Also the
+//! Claude gives materials to exact polygons instead of position cuts. Also the
 //! texture-space masks of pieces.
 
 use crate::mesh::MeshData;
@@ -12,7 +12,7 @@ use std::collections::HashMap;
 /// smallest of a part become one "small pieces" group.
 pub const MAX_PIECES: usize = 36;
 
-/// A group of alike mesh pieces of one part: what Muse calls piece N.
+/// A group of alike mesh pieces of one part: what Claude calls piece N.
 #[derive(Clone)]
 pub struct Piece {
     pub set: usize,

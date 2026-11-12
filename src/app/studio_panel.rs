@@ -57,7 +57,7 @@ impl RetroApp {
         self.view.path_trace = false;
     }
 
-    /// What Muse should know of the product and the camera to light it.
+    /// What Claude should know of the product and the camera to light it.
     pub(super) fn studio_facts(&self) -> String {
         let (Some(d), Some((_, s, _))) = (&self.doc, self.studio_bounds()) else { return String::new() };
         let e = (d.mesh.bbox_max - d.mesh.bbox_min) / s;
@@ -73,7 +73,7 @@ impl RetroApp {
         )
     }
 
-    /// No packshot render running (a Muse check can start one).
+    /// No packshot render running (a Claude check can start one).
     pub(super) fn studio_job_idle(&self) -> bool {
         self.studio_job.is_none()
     }
@@ -277,7 +277,7 @@ impl RetroApp {
                     }
                 }
                 ui.add_space(6.0);
-                ui.label(RichText::new("To light it like a photo: in the Muse panel, attach the photo and ask for its lighting.").size(11.0).color(crate::style::TEXT3));
+                ui.label(RichText::new("To light it like a photo: in the Claude panel, attach the photo and ask for its lighting.").size(11.0).color(crate::style::TEXT3));
                 ui.add_space(4.0);
                 ui.label(RichText::new("Lights").strong());
                 let mut remove = None;

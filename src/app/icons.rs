@@ -507,6 +507,7 @@ pub fn paint(p: &egui::Painter, r: Rect, icon: Icon, c: Color32) {
 /// Square icon button. `on` draws the active state.
 pub fn button(ui: &mut Ui, icon: Icon, on: bool, size: f32, tip: &str) -> Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), Sense::click());
+    super::demo::note_icon(tip, rect);
     let v = ui.visuals();
     let accent = v.selection.bg_fill;
     let bg = if on {

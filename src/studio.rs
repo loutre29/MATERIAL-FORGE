@@ -496,7 +496,7 @@ impl Studio {
 
 /// What a packshot photo shows of its light, measured: the background at
 /// the corners, the ground shadow beside the product (which side, how
-/// dark, how far), which side of the product is brighter. For Muse, who
+/// dark, how far), which side of the product is brighter. For Claude, who
 /// reads it more reliably than by eye, and for its check renders.
 pub fn photo_light(img: &image::DynamicImage) -> Option<String> {
     let img = img.thumbnail(512, 512).to_rgb8();
@@ -665,7 +665,7 @@ pub fn profile_distance(a: &Profile, b: &Profile) -> f32 {
     d(&a.0, &b.0) + 3.0 * d(&a.1, &b.1)
 }
 
-/// The product's brightness across it, in words for Muse: three heights,
+/// The product's brightness across it, in words for Claude: three heights,
 /// left to right in 8 steps (0 black, 255 white).
 fn profile_words(p: &Profile) -> String {
     let row = |band: usize| -> String {

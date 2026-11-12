@@ -1,6 +1,6 @@
 //! The canvas layout (docs/design/material_forge_design_system.html): the
 //! views fill the window; rounded panels dock over them, Painter style
-//! (by default layers top left, library bottom left, Muse top right and
+//! (by default layers top left, library bottom left, Claude top right and
 //! properties under it; a header carries a panel to the other column,
 //! or the library to the bottom); the tools live in one dock at the bottom
 //! of the free canvas with their options right above it;
@@ -36,7 +36,7 @@ impl Tab {
             Tab::TextureSets => "Texture sets",
             Tab::Layers => "Layers",
             Tab::SetSettings => "Texture set settings",
-            Tab::Muse => "Muse",
+            Tab::Muse => "Claude",
             Tab::Studio => "Packshot studio",
         }
     }
@@ -72,10 +72,10 @@ pub struct Panels {
     pub properties: bool,
     /// The texture set settings panel.
     pub set_settings: bool,
-    /// The Muse panel (texturing by prompt).
+    /// The Claude panel (texturing by prompt).
     pub muse: bool,
     /// Where each panel docks (layers, library, properties, set settings,
-    /// Muse, studio).
+    /// Claude, studio).
     pub slots: [Slot; NP],
     /// Their order in a column, top first.
     pub order: [u8; NP],
@@ -106,7 +106,7 @@ impl Default for Panels {
             set_settings: false,
             muse: true,
             // Layers top left, library bottom left (set settings between
-            // them when shown); Muse top right, properties under it.
+            // them when shown); Claude top right, properties under it.
             // The studio (while it is on) on top of the right column.
             slots: [Slot::Left, Slot::Left, Slot::Right, Slot::Left, Slot::Right, Slot::Right],
             order: [0, 2, 2, 1, 1, 0],
@@ -199,6 +199,8 @@ pub const BOTTOM_H: f32 = 280.0;
 const STACK_GAP: f32 = 8.0;
 /// The smallest height of a stacked panel.
 const MIN_PANEL_H: f32 = 120.0;
+/// The Claude card's height (it does not stretch).
+const MUSE_H: f32 = 150.0;
 
 /// Where the shown panels go on `screen`.
 pub(super) struct Placed {
@@ -226,11 +228,22 @@ pub(super) fn place(p: &Panels, screen: Rect, shown: [bool; NP]) -> Placed {
     let rcol = Rect::from_min_max(Pos2::new(screen.max.x - g - rw, rtop), Pos2::new(screen.max.x - g, bottom));
     let mut rects = [None; NP];
     for (col, ids) in [(lcol, &left), (rcol, &right)] {
-        let total: f32 = ids.iter().map(|&i| p.weights[i].max(0.05)).sum();
-        let room = col.height() - STACK_GAP * ids.len().saturating_sub(1) as f32;
+        // The Claude card keeps its small height; the others share the rest.
+        let flex: Vec<usize> = ids.iter().copied().filter(|&i| i != MUSE).collect();
+        let total: f32 = flex.iter().map(|&i| p.weights[i].max(0.05)).sum();
+        let fixed = if ids.contains(&MUSE) { MUSE_H } else { 0.0 };
+        let room = col.height() - STACK_GAP * ids.len().saturating_sub(1) as f32 - fixed;
         let mut y = col.min.y;
-        for (k, &i) in ids.iter().enumerate() {
-            let y1 = if k + 1 == ids.len() { col.max.y } else { (y + room * p.weights[i].max(0.05) / total).round() };
+        for &i in ids.iter() {
+            let y1 = if i == MUSE {
+                y + MUSE_H
+            } else if flex.last() == Some(&i) {
+                // The last one ends at the column's bottom (minus a card under it).
+                let under = ids.iter().skip_while(|&&j| j != i).skip(1).count();
+                col.max.y - if under > 0 { MUSE_H + STACK_GAP } else { 0.0 }
+            } else {
+                (y + room * p.weights[i].max(0.05) / total).round()
+            };
             rects[i] = Some(Rect::from_min_max(Pos2::new(col.min.x, y), Pos2::new(col.max.x, y1)));
             y = y1 + STACK_GAP;
         }
@@ -283,7 +296,7 @@ fn drop_target(p: &Panels, placed: &Placed, screen: Rect, i: usize, pos: Pos2) -
 /// While a panel's header is carried: a tag with its name under the
 /// pointer, and the place it would take when let go, highlighted.
 fn drop_preview(ctx: &egui::Context, p: &Panels, placed: &Placed, screen: Rect, shown: [bool; NP], i: usize, pos: Pos2) {
-    const NAMES: [&str; NP] = ["Layers", "Library", "Properties", "Texture set settings", "Muse", "Packshot studio"];
+    const NAMES: [&str; NP] = ["Layers", "Library", "Properties", "Texture set settings", "Claude", "Packshot studio"];
     let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("panel drop")));
     let target = drop_target(p, placed, screen, i, pos).and_then(|q| place(&q, screen, shown).rects[i]);
     if let Some(r) = target {
@@ -292,7 +305,7 @@ fn drop_preview(ctx: &egui::Context, p: &Panels, placed: &Placed, screen: Rect, 
     }
     let g = painter.layout_no_wrap(NAMES[i].to_string(), crate::style::bold(12.0), crate::style::TEXT);
     let tag = Rect::from_min_size(pos + egui::vec2(12.0, 8.0), g.size() + egui::vec2(24.0, 14.0));
-    painter.add(crate::style::shadow(2).as_shape(tag, crate::style::R_CONTROL));
+    painter.add(crate::style::shadow(3).as_shape(tag, crate::style::R_CONTROL));
     painter.rect(tag, crate::style::R_CONTROL, crate::style::PANEL, egui::Stroke::new(1.0f32, if target.is_some() { crate::style::ACCENT } else { crate::style::LINE }));
     painter.galley(tag.min + egui::vec2(12.0, 7.0), g, crate::style::TEXT);
 }
@@ -587,7 +600,7 @@ impl RetroApp {
             Tab::Layers => p.left && p.left_tab == 0,
             Tab::TextureSets => p.left && p.left_tab == 1,
             Tab::SetSettings => p.set_settings,
-            Tab::Muse => p.muse,
+            Tab::Muse => p.muse && (self.muse.peek || !super::mcp::linked()),
             Tab::Studio => self.view.studio,
         }
     }
@@ -621,6 +634,10 @@ impl RetroApp {
             Tab::Muse => p.muse = true,
             Tab::Studio => {}
         }
+        if tab == Tab::Muse {
+            // Asked for: it shows even while Claude is linked.
+            self.muse.peek = true;
+        }
     }
 
     /// Shows a hidden panel or hides a shown one.
@@ -631,6 +648,10 @@ impl RetroApp {
         }
         if tab == Tab::Studio {
             self.toggle_studio();
+            return;
+        }
+        if tab == Tab::Muse {
+            self.hide_muse_card();
             return;
         }
         let p = self.panels();
@@ -655,7 +676,7 @@ impl RetroApp {
         if !self.layout_loaded {
             self.layout_loaded = true;
             if self.persist_layout && self.dock.is_none() {
-                // (Layouts of before Muse are not read: the new default wins.)
+                // (Layouts of before Claude are not read: the new default wins.)
                 self.dock = read_layout();
                 if let Some(p) = &self.dock {
                     self.view.swap_views = p.swap_views;
@@ -690,6 +711,14 @@ impl RetroApp {
         let screen = ctx.screen_rect();
         let p = self.dock.clone().unwrap_or_default();
         let mut shown = if !self.ui_hidden && self.doc.is_some() { p.shown() } else { [false; NP] };
+        // The Claude card hides while a Claude app is linked (unless asked
+        // for from the Window menu since it linked).
+        let linked = super::mcp::linked();
+        if linked && !self.muse.was_linked {
+            self.muse.peek = false;
+        }
+        self.muse.was_linked = linked;
+        shown[MUSE] &= !linked || self.muse.peek;
         shown[STUDIO] = self.view.studio && !self.ui_hidden && self.doc.is_some();
         let placed = place(&p, screen, shown);
         // The free canvas between the panels: bars and overlays center on it.
@@ -756,7 +785,7 @@ impl RetroApp {
         }
         if !lock {
             for (col, ids) in placed.cols.iter() {
-                for w in ids.windows(2) {
+                for w in ids.windows(2).filter(|w| !w.contains(&MUSE)) {
                     let (ra, rb) = (placed.rects[w[0]].unwrap(), placed.rects[w[1]].unwrap());
                     let grip = Rect::from_min_max(Pos2::new(col.min.x + 20.0, ra.max.y), Pos2::new(col.max.x - 20.0, rb.min.y));
                     self.split_grip(ctx, grip, w[0], w[1], *col, ids);
@@ -817,8 +846,9 @@ impl RetroApp {
             }
             let dy = resp.drag_delta().y;
             let pm = self.panels();
-            let total: f32 = ids.iter().map(|&i| pm.weights[i].max(0.05)).sum();
-            let room = (col.height() - STACK_GAP * ids.len().saturating_sub(1) as f32).max(1.0);
+            let total: f32 = ids.iter().filter(|&&i| i != MUSE).map(|&i| pm.weights[i].max(0.05)).sum();
+            let card = if ids.contains(&MUSE) { MUSE_H } else { 0.0 };
+            let room = (col.height() - STACK_GAP * ids.len().saturating_sub(1) as f32 - card).max(1.0);
             let (wa, wb) = (pm.weights[a].max(0.05), pm.weights[b].max(0.05));
             let pair = wa + wb;
             let min = MIN_PANEL_H * total / room;

@@ -48,6 +48,11 @@ fn main() -> eframe::Result<()> {
     }));
 
     let args: Vec<String> = std::env::args().collect();
+    // `--mcp`: the MCP server the Claude app or Claude Code starts (stdio;
+    // it talks to the open Material Forge window).
+    if args.get(1).map(String::as_str) == Some("--mcp") {
+        app::mcp_bridge();
+    }
     if args.get(1).map(String::as_str) == Some("--bench") {
         #[cfg(windows)]
         {
@@ -138,6 +143,22 @@ fn main() -> eframe::Result<()> {
         }
         std::process::exit(0);
     }
+    if args.get(1).map(String::as_str) == Some("--mcpserve") {
+        #[cfg(windows)]
+        {
+            extern "system" {
+                fn AttachConsole(pid: u32) -> i32;
+            }
+            // SAFETY: plain Win32 call; failure just means no console output.
+            unsafe { AttachConsole(u32::MAX) };
+        }
+        let (Some(p), Some(out)) = (args.get(2), args.get(3)) else { std::process::exit(2) };
+        if let Err(e) = app::mcp_serve(std::path::Path::new(p), std::path::Path::new(out)) {
+            eprintln!("mcpserve: {e:#}");
+            std::process::exit(1);
+        }
+        std::process::exit(0);
+    }
     if args.get(1).map(String::as_str) == Some("--musetest") {
         #[cfg(windows)]
         {
@@ -208,7 +229,22 @@ fn main() -> eframe::Result<()> {
         }
         std::process::exit(0);
     }
-    // `--lightmeasure <image>`: what Muse is told of a photo's light.
+    // `--photofacts <image>...`: what Claude is told of a photo.
+    if args.get(1).map(String::as_str) == Some("--photofacts") {
+        #[cfg(windows)]
+        {
+            extern "system" {
+                fn AttachConsole(pid: u32) -> i32;
+            }
+            // SAFETY: plain Win32 call; failure just means no console output.
+            unsafe { AttachConsole(u32::MAX) };
+        }
+        for p in &args[2..] {
+            println!("{p}: {}", app::photo_facts(std::path::Path::new(p)));
+        }
+        std::process::exit(0);
+    }
+    // `--lightmeasure <image>`: what Claude is told of a photo's light.
     if args.get(1).map(String::as_str) == Some("--lightmeasure") {
         #[cfg(windows)]
         {
@@ -388,7 +424,7 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_title("Material Forge")
             .with_icon(std::sync::Arc::new(logo::icon_data()))
-            .with_inner_size([1600.0, 950.0])
+            .with_inner_size(if std::env::var_os("MF_DEMO").is_some() { [1920.0, 1080.0] } else { [1600.0, 950.0] })
             .with_min_inner_size([1000.0, 600.0])
             .with_drag_and_drop(true),
         renderer: eframe::Renderer::Wgpu,

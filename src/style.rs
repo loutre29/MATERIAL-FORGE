@@ -40,10 +40,13 @@ pub const fn warm(g: u8) -> Color32 {
     Color32::from_rgb(g, g, g.saturating_add(4))
 }
 
-/// Shadow of floating panels (elevation 1) and of the dock / menus (2).
+/// Shadow of floating panels (elevation 1), of the dock and windows (2),
+/// and of popups and tooltips (3: its blur stays under a tooltip's height,
+/// a wider one folds over itself into a dark streak under it).
 pub fn shadow(level: u8) -> egui::Shadow {
     match level {
         1 => egui::Shadow { offset: egui::vec2(0.0, 8.0), blur: 24.0, spread: 0.0, color: Color32::from_black_alpha(90) },
+        3 => egui::Shadow { offset: egui::vec2(0.0, 6.0), blur: 16.0, spread: 0.0, color: Color32::from_black_alpha(120) },
         _ => egui::Shadow { offset: egui::vec2(0.0, 14.0), blur: 40.0, spread: 0.0, color: Color32::from_black_alpha(140) },
     }
 }
@@ -110,7 +113,7 @@ pub fn apply(ctx: &egui::Context) {
     }
     v.window_rounding = Rounding::same(16.0);
     v.menu_rounding = Rounding::same(R_PANEL);
-    v.popup_shadow = shadow(2);
+    v.popup_shadow = shadow(3);
     v.window_shadow = shadow(2);
     v.slider_trailing_fill = true;
     ctx.set_visuals(v);

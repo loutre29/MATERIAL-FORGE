@@ -1,15 +1,15 @@
-//! Muse lights the packshot, in its texturing conversation: the user
+//! Claude lights the packshot, in its texturing conversation: the user
 //! attaches a photo and asks ("I want this lighting for my packshot");
-//! Muse Spark reads the photo's lighting (its shadows, highlights and
+//! Claude reads the photo's lighting (its shadows, highlights and
 //! background) and answers the studio's lights as JSON ("lighting" in its
 //! answer). The app applies them, renders a small check of the product in
-//! the studio and sends it back once, so Muse corrects what differs.
+//! the studio and sends it back once, so Claude corrects what differs.
 
 use crate::studio::{LightKind, Studio, StudioLight, MAX_LIGHTS};
 use base64::Engine as _;
 use serde_json::{json, Value};
 
-/// The section of Muse's instructions on lighting the packshot studio.
+/// The section of Claude's instructions on lighting the packshot studio.
 pub(super) const LIGHTING: &str = r##"
 
 PACKSHOT LIGHTING. The app has a packshot studio that renders the model with a path tracer. When the user asks for lighting (a photo's lighting, "I want this lighting for my packshot", a softer shadow, a darker background, a studio setup), you are a packshot photographer: read the reference photo's lighting precisely and rebuild it with the studio's lights, then add "lighting" to your answer (below) and return no looks unless the user also asks for texturing. A photo given for its lighting is never a print or a texture on the model. Match the lighting, not the product: the user's product may differ in shape and color. Each message gives the studio's lighting now (the same JSON) and the camera.
@@ -47,14 +47,14 @@ THE CAMERA. The photo's view matters as much as the lights: a ground shadow only
 
 THE LIGHTING IN YOUR ANSWER: "lighting": {"background": "#RRGGBB", "falloff": 0, "pool": 1.5, "ground_shadows": true, "shadow_opacity": 0.35, "floor_reflection": 0, "reflection_fade": 1, "room": 0.12, "lights": [ ... ], "camera": {"pitch": 9, "lens_mm": 100}}, next to "reply" in your JSON object. Always the complete lighting (every light, the background and the floor), not only what changes. "reply" then says in one or two short sentences the lighting you read and how you set it. Leave "lighting" out when the user does not ask about the lighting."##;
 
-/// The lighting check: a render of the product with Muse's lighting goes
+/// The lighting check: a render of the product with Claude's lighting goes
 /// back to it once.
 pub(super) fn check_text(asked: &str, photo: &str, render: &str) -> String {
     let measures = if photo.is_empty() { String::new() } else { format!(" LIGHT MEASURES by the app: the photo: {photo}. Your render: {render}. Make them agree (the background color, the shadow's side, darkness and reach, the brighter side).") };
     format!("LIGHTING CHECK (automatic, not written by the user). The image is a render of the product in the studio with the lighting you just set, from the user's camera. Compare it with the reference photo the user gave for the lighting (\"{asked}\"): the background's tone and falloff, the shadow's direction, length, softness and darkness, each highlight on the product (where, its shape, how bright), the contrast between the lit and the shadow side, the overall brightness and the light's color. Judge the lighting, not the product's own colors or shape.{measures} Send \"lighting\" corrected and complete (with \"camera\"), and no looks; \"reply\": one short sentence on what you changed, or that it matches.")
 }
 
-/// An image as Muse gets it: a JPEG data URL, at most 1024 px.
+/// An image as Claude gets it: a JPEG data URL, at most 1024 px.
 pub(super) fn jpeg_url(img: &image::DynamicImage) -> anyhow::Result<String> {
     let small = if img.width().max(img.height()) > 1024 { img.resize(1024, 1024, image::imageops::FilterType::Triangle) } else { img.clone() };
     let mut jpg = Vec::new();
@@ -77,7 +77,7 @@ fn num(v: &Value, lo: f32, hi: f32) -> Option<f32> {
     v.as_f64().map(|x| (x as f32).clamp(lo, hi)).filter(|x| x.is_finite())
 }
 
-/// One light of Muse's answer (None: no kind it knows).
+/// One light of Claude's answer (None: no kind it knows).
 fn light(v: &Value) -> Option<StudioLight> {
     let k = v["kind"].as_str()?.trim().to_lowercase();
     let kind = LightKind::ALL.into_iter().find(|x| format!("{x:?}").to_lowercase() == k || x.name().to_lowercase() == k)?;
@@ -107,20 +107,20 @@ fn light(v: &Value) -> Option<StudioLight> {
     Some(l)
 }
 
-/// The camera's pitch Muse asks (radians), if any.
+/// The camera's pitch Claude asks (radians), if any.
 pub(super) fn pitch(l: &Value) -> Option<f32> {
     num(&l["camera"]["pitch"], -10.0, 60.0).map(f32::to_radians)
 }
 
 /// Whether a message is about the lighting (the photos it brings are then
-/// measured for Muse).
+/// measured for Claude).
 pub(super) fn about_lighting(text: &str) -> bool {
     let t = text.to_lowercase();
     ["light", "lighting", "packshot", "pack shot", "shadow", "studio", "eclairage", "\u{e9}clairage", "lumi\u{e8}re", "ombre"].iter().any(|w| t.contains(w))
 }
 
 /// Whether a message asks for the lighting alone: about the lighting and
-/// saying nothing of textures, materials or colors. Muse then keeps every
+/// saying nothing of textures, materials or colors. Claude then keeps every
 /// material as it is.
 pub(super) fn lighting_only(text: &str) -> bool {
     let t = text.to_lowercase().replace("highlight", "");
@@ -128,7 +128,7 @@ pub(super) fn lighting_only(text: &str) -> bool {
         && !["textur", "materia", "mat\u{e9}ria", "mati\u{e8}re", "color", "colour", "couleur", "paint", "peint", "finish", "finition", "retexture", "label", "logo", "print"].iter().any(|w| t.contains(w))
 }
 
-/// Muse's lighting onto `st` (its angles and output kept; the lens when
+/// Claude's lighting onto `st` (its angles and output kept; the lens when
 /// it gives the camera). The number of lights it set.
 pub(super) fn apply(l: &Value, st: &mut Studio) -> usize {
     if let Some(c) = hex(&l["background"]) {
@@ -159,7 +159,7 @@ pub(super) fn apply(l: &Value, st: &mut Studio) -> usize {
     st.lights.len()
 }
 
-/// The studio's lighting in Muse's words (the same JSON it answers).
+/// The studio's lighting in Claude's words (the same JSON it answers).
 pub(super) fn to_json(st: &Studio) -> Value {
     let r = |x: f32| ((x as f64) * 100.0).round() / 100.0;
     let lights: Vec<Value> = st
@@ -174,7 +174,7 @@ pub(super) fn to_json(st: &Studio) -> Value {
         "floor_reflection": r(st.floor_reflection), "reflection_fade": r(st.reflection_fade), "room": r(st.room), "environment": r(st.environment), "lights": lights})
 }
 
-/// Muse's instructions on the studio: the rules, then the app's setups as
+/// Claude's instructions on the studio: the rules, then the app's setups as
 /// tuned starting points.
 pub(super) fn rules() -> String {
     let mut s = LIGHTING.to_string();
